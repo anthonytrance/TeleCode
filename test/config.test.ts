@@ -17,6 +17,8 @@ describe("loadConfig", () => {
     delete process.env.TELEGRAM_ALLOWED_USER_IDS;
     delete process.env.CODEX_API_KEY;
     delete process.env.CODEX_MODEL;
+    delete process.env.CODEX_BACKEND;
+    delete process.env.CODEX_APP_SERVER_PATH;
     delete process.env.CODEX_WORKSPACE;
     delete process.env.CODEX_SANDBOX_MODE;
     delete process.env.CODEX_APPROVAL_POLICY;
@@ -72,6 +74,8 @@ describe("loadConfig", () => {
       maxFileSize: 20 * 1024 * 1024,
       codexApiKey: "secret-key",
       codexModel: "o3",
+      codexBackend: "sdk",
+      codexAppServerPath: undefined,
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "on-request",
       launchProfiles: [
@@ -115,6 +119,8 @@ describe("loadConfig", () => {
 
     expect(config.codexApiKey).toBeUndefined();
     expect(config.codexModel).toBeUndefined();
+    expect(config.codexBackend).toBe("sdk");
+    expect(config.codexAppServerPath).toBeUndefined();
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
@@ -343,10 +349,23 @@ describe("loadConfig", () => {
     expect(config.streamAssistantText).toBe(false);
   });
 
+  it("parses CODEX_BACKEND and CODEX_APP_SERVER_PATH", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_BACKEND = "app-server";
+    process.env.CODEX_APP_SERVER_PATH = path.join(tempDir, "codex.exe");
+
+    const config = loadConfig();
+
+    expect(config.codexBackend).toBe("app-server");
+    expect(config.codexAppServerPath).toBe(path.join(tempDir, "codex.exe"));
+  });
+
   it("falls back to defaults for invalid optional enum values", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_BACKEND = "native";
     process.env.CODEX_SANDBOX_MODE = "unsafe";
     process.env.CODEX_APPROVAL_POLICY = "sometimes";
     process.env.TOOL_VERBOSITY = "loud";
@@ -354,11 +373,12 @@ describe("loadConfig", () => {
 
     const config = loadConfig();
 
+    expect(config.codexBackend).toBe("sdk");
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
     expect(config.toolVerbosity).toBe("summary");
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
-    expect(warnSpy).toHaveBeenCalledTimes(4);
+    expect(warnSpy).toHaveBeenCalledTimes(5);
   });
 
   it("parses explicit launch profiles and default selection", () => {

@@ -8,6 +8,14 @@ import type { ModelReasoningEffort } from "@openai/codex-sdk";
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 
 import {
+  probeCodexAppServer,
+  runCodexAppServerSteeredTurn,
+  runCodexAppServerTurn,
+  type AppServerProbeResult,
+  type AppServerSteerResult,
+  type AppServerTurnResult,
+} from "./app-server.js";
+import {
   buildFileInstructions,
   cleanupInbox,
   outboxPath,
@@ -25,8 +33,8 @@ import {
   type CodexPromptInput,
   type CodexSessionCallbacks,
   type CodexSessionInfo,
-  type CodexSessionService,
 } from "./codex-session.js";
+import type { CodexSessionRuntime } from "./codex-backend.js";
 import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "./codex-auth.js";
 import {
   findLaunchProfile,
@@ -34,7 +42,7 @@ import {
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
 import { getThread, getThreadByPrefix, readThreadHistory } from "./codex-state.js";
-import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
+import type { CodexBackend, TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
@@ -107,7 +115,7 @@ type RenderedChunk = RenderedText & {
 type QueuedPrompt = {
   ctx: Context;
   chatId: TelegramChatId;
-  session: CodexSessionService;
+  session: CodexSessionRuntime;
   userInput: CodexPromptInput;
 };
 
@@ -189,7 +197,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const getContextSession = async (
     ctx: Context,
     options?: { deferThreadStart?: boolean },
-  ): Promise<{ contextKey: TelegramContextKey; session: CodexSessionService } | null> => {
+  ): Promise<{ contextKey: TelegramContextKey; session: CodexSessionRuntime } | null> => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
       return null;
@@ -199,7 +207,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     return { contextKey, session };
   };
 
-  const updateSessionMetadata = (contextKey: TelegramContextKey, session: CodexSessionService): void => {
+  const updateSessionMetadata = (contextKey: TelegramContextKey, session: CodexSessionRuntime): void => {
     registry.updateMetadata(contextKey, session);
   };
 
@@ -257,7 +265,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     ctx: Context,
     contextKey: TelegramContextKey,
     chatId: TelegramChatId,
-    session: CodexSessionService,
+    session: CodexSessionRuntime,
     userInput: CodexPromptInput,
   ): Promise<void> => {
     const replaced = queuedPrompts.has(contextKey);
@@ -301,7 +309,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const ensureActiveThread = async (
     ctx: Context,
     contextKey: TelegramContextKey,
-    session: CodexSessionService,
+    session: CodexSessionRuntime,
   ): Promise<boolean> => {
     if (session.hasActiveThread()) {
       return true;
@@ -323,7 +331,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     ctx: Context,
     contextKey: TelegramContextKey,
     chatId: TelegramChatId,
-    session: CodexSessionService,
+    session: CodexSessionRuntime,
     userInput: CodexPromptInput,
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
@@ -851,7 +859,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     ctx: Context,
     contextKey: TelegramContextKey,
     chatId: TelegramChatId,
-    session: CodexSessionService,
+    session: CodexSessionRuntime,
     userInput: CodexPromptInput,
     options: {
       setSuccessReaction?: boolean;
@@ -1180,7 +1188,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const showWorkspacePicker = async (
     ctx: Context,
     contextKey: TelegramContextKey,
-    session: CodexSessionService,
+    session: CodexSessionRuntime,
   ): Promise<void> => {
     const workspaces = session.listWorkspaces();
     if (workspaces.length === 0) {
@@ -1198,7 +1206,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }));
     pendingWorkspaceButtons.set(contextKey, workspaceButtons);
     const keyboard = paginateKeyboard(workspaceButtons, 0, "ws");
-    const selectionMessage = renderWorkspaceSelectionMessage(workspaces, currentWorkspace);
+    const selectionMessage = renderWorkspaceSelectionMessage(workspaces, currentWorkspace, config.workspace);
 
     await safeReply(ctx, selectionMessage.html, {
       fallbackText: selectionMessage.plain,
@@ -1231,9 +1239,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const workspaces = session.listWorkspaces();
-    const workspace = resolveWorkspaceArgument(rawWorkspace, workspaces);
+    const workspace = resolveWorkspaceArgument(rawWorkspace, workspaces, config.workspace);
     if (!workspace) {
-      const selectionMessage = renderWorkspaceSelectionMessage(workspaces, session.getCurrentWorkspace());
+      const selectionMessage = renderWorkspaceSelectionMessage(workspaces, session.getCurrentWorkspace(), config.workspace);
       await safeReply(ctx, selectionMessage.html, { fallbackText: selectionMessage.plain });
       return true;
     }
@@ -1268,6 +1276,153 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await session.abort();
       await safeReply(ctx, escapeHTML("Aborted current operation"), {
         fallbackText: "Aborted current operation",
+      });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  });
+
+  bot.command("steer", async (ctx) => {
+    const prompt = getCommandArgument(ctx);
+    if (!prompt) {
+      await safeReply(ctx, escapeHTML("Usage: /steer <instruction>"), {
+        fallbackText: "Usage: /steer <instruction>",
+      });
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { session } = contextSession;
+    if (!session.steer) {
+      await safeReply(ctx, escapeHTML("Native steering requires the app-server backend. The live backend is still SDK."), {
+        fallbackText: "Native steering requires the app-server backend. The live backend is still SDK.",
+      });
+      return;
+    }
+
+    try {
+      await session.steer(prompt);
+      await safeReply(ctx, escapeHTML("Steer sent."), { fallbackText: "Steer sent." });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  });
+
+  bot.command("forkthread", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot fork while a prompt is running."), {
+        fallbackText: "Cannot fork while a prompt is running.",
+      });
+      return;
+    }
+
+    if (!session.forkThread) {
+      await safeReply(ctx, escapeHTML("Native thread fork requires the app-server backend. The live backend is still SDK."), {
+        fallbackText: "Native thread fork requires the app-server backend. The live backend is still SDK.",
+      });
+      return;
+    }
+
+    try {
+      const info = await session.forkThread();
+      updateSessionMetadata(contextKey, session);
+      const plain = `Forked thread.\n\n${renderSessionInfoPlain(info)}`;
+      const html = `<b>Forked thread.</b>\n\n${renderSessionInfoHTML(info)}`;
+      await safeReply(ctx, html, { fallbackText: plain });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  });
+
+  bot.command("renamethread", async (ctx) => {
+    const name = getCommandArgument(ctx).trim();
+    if (!name) {
+      await safeReply(ctx, escapeHTML("Usage: /renamethread <name>"), {
+        fallbackText: "Usage: /renamethread <name>",
+      });
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot rename while a prompt is running."), {
+        fallbackText: "Cannot rename while a prompt is running.",
+      });
+      return;
+    }
+
+    if (!session.renameThread) {
+      await safeReply(ctx, escapeHTML("Native thread rename requires the app-server backend. The live backend is still SDK."), {
+        fallbackText: "Native thread rename requires the app-server backend. The live backend is still SDK.",
+      });
+      return;
+    }
+
+    try {
+      await session.renameThread(name);
+      await safeReply(ctx, escapeHTML("Thread renamed."), { fallbackText: "Thread renamed." });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  });
+
+  bot.command("rollbackthread", async (ctx) => {
+    const rawCount = getCommandArgument(ctx).trim() || "1";
+    const turnCount = Number(rawCount);
+    if (!Number.isInteger(turnCount) || turnCount < 1) {
+      await safeReply(ctx, escapeHTML("Usage: /rollbackthread <turn-count>"), {
+        fallbackText: "Usage: /rollbackthread <turn-count>",
+      });
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot roll back while a prompt is running."), {
+        fallbackText: "Cannot roll back while a prompt is running.",
+      });
+      return;
+    }
+
+    if (!session.rollbackThread) {
+      await safeReply(ctx, escapeHTML("Native thread rollback requires the app-server backend. The live backend is still SDK."), {
+        fallbackText: "Native thread rollback requires the app-server backend. The live backend is still SDK.",
+      });
+      return;
+    }
+
+    try {
+      await session.rollbackThread(turnCount);
+      await safeReply(ctx, escapeHTML(`Rolled back ${turnCount} turn${turnCount === 1 ? "" : "s"}. File changes were not reverted.`), {
+        fallbackText: `Rolled back ${turnCount} turn${turnCount === 1 ? "" : "s"}. File changes were not reverted.`,
       });
     } catch (error) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
@@ -1369,6 +1524,101 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const message = `Failed to read usage: ${friendlyErrorText(error)}`;
       await safeReply(ctx, escapeHTML(message), { fallbackText: message });
     }
+  });
+
+  bot.command(["appserver", "appserverstatus", "appserver_status"], async (ctx) => {
+    const result = await probeCodexAppServer(config);
+    const plain = renderAppServerProbePlain(result);
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+  });
+
+  bot.command(["appserverturn", "apprun"], async (ctx) => {
+    const prompt = getCommandArgument(ctx);
+    if (!prompt) {
+      const plain = "Usage: /appserverturn <prompt>";
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      return;
+    }
+
+    await safeReply(ctx, escapeHTML("Running isolated app-server turn..."), {
+      fallbackText: "Running isolated app-server turn...",
+    });
+    const result = await runCodexAppServerTurn(config, prompt);
+    const plain = renderAppServerTurnPlain(result);
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+  });
+
+  bot.command(["appserversteer", "appsteer"], async (ctx) => {
+    const raw = getCommandArgument(ctx);
+    const separator = raw.indexOf("||");
+    if (separator === -1) {
+      const plain = "Usage: /appserversteer <initial prompt> || <steer prompt>";
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      return;
+    }
+
+    const initialPrompt = raw.slice(0, separator).trim();
+    const steerPrompt = raw.slice(separator + 2).trim();
+    if (!initialPrompt || !steerPrompt) {
+      const plain = "Usage: /appserversteer <initial prompt> || <steer prompt>";
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      return;
+    }
+
+    await safeReply(ctx, escapeHTML("Running isolated app-server steer test..."), {
+      fallbackText: "Running isolated app-server steer test...",
+    });
+    const result = await runCodexAppServerSteeredTurn(config, initialPrompt, steerPrompt);
+    const plain = renderAppServerSteerPlain(result);
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+  });
+
+  bot.command("backend", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+
+    const rawBackend = getCommandArgument(ctx);
+    if (!rawBackend) {
+      const current = registry.getBackend(contextKey);
+      const plain = [
+        `Backend for this Telegram context: ${current}`,
+        "",
+        "Available now: sdk",
+        "Reserved for later: app-server",
+        "",
+        "Use /backend sdk to force the safe SDK backend.",
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      return;
+    }
+
+    const requestedBackend = resolveBackendArgument(rawBackend);
+    if (!requestedBackend) {
+      await safeReply(ctx, escapeHTML("Usage: /backend sdk"), { fallbackText: "Usage: /backend sdk" });
+      return;
+    }
+
+    if (requestedBackend === "app-server") {
+      const plain = [
+        "App-server backend switching is not enabled yet.",
+        "Use /appserver to run the probe.",
+        "Use /backend sdk as the fallback command once app-server turns are enabled.",
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      return;
+    }
+
+    registry.setBackend(contextKey, requestedBackend);
+    queuedPrompts.delete(contextKey);
+    const busyState = getBusyState(contextKey);
+    busyState.processing = false;
+    busyState.switching = false;
+    busyState.transcribing = false;
+
+    const plain = "Backend for this Telegram context is now sdk. The next prompt will use a fresh SDK session wrapper.";
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
   });
 
   const setLaunchProfileFromCommand = async (ctx: Context, rawProfile: string): Promise<boolean> => {
@@ -1788,7 +2038,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await createNewThreadFromWorkspaceText(ctx, ctx.match[1] ?? "");
   });
 
-  const createNewFromSummary = async (ctx: Context): Promise<void> => {
+  const createNewFromSummary = async (ctx: Context, rawWorkspace?: string): Promise<void> => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -1807,6 +2057,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         fallbackText: "No active thread to summarize yet.",
       });
       return;
+    }
+
+    let targetWorkspace: string | undefined;
+    const workspaceArg = rawWorkspace?.trim();
+    if (workspaceArg) {
+      const workspaces = session.listWorkspaces();
+      targetWorkspace = resolveWorkspaceArgument(workspaceArg, workspaces, config.workspace) ?? undefined;
+      if (!targetWorkspace) {
+        const selectionMessage = renderWorkspaceSelectionMessage(workspaces, session.getCurrentWorkspace(), config.workspace);
+        await safeReply(ctx, selectionMessage.html, { fallbackText: selectionMessage.plain });
+        return;
+      }
     }
 
     const authStatus = await checkAuthStatus(config.codexApiKey);
@@ -1828,10 +2090,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         throw new Error("Summary generation returned empty text");
       }
 
-      await safeReply(ctx, escapeHTML("Starting new thread from summary..."), {
-        fallbackText: "Starting new thread from summary...",
+      const startMessage = targetWorkspace
+        ? `Starting new thread from summary in ${targetWorkspace}...`
+        : "Starting new thread from summary...";
+      await safeReply(ctx, escapeHTML(startMessage), {
+        fallbackText: startMessage,
       });
-      await session.newThread();
+      await session.newThread(targetWorkspace);
       const seedPrompt = [
         "You are continuing from a previous Codex session.",
         "Treat the following handoff summary as the starting context for this new thread.",
@@ -1862,8 +2127,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
-  bot.command("newsummary", createNewFromSummary);
-  bot.hears(/^new from summary$/i, createNewFromSummary);
+  bot.command("newsummary", async (ctx) => createNewFromSummary(ctx, getCommandArgument(ctx)));
+  bot.hears(/^new from summary$/i, async (ctx) => createNewFromSummary(ctx));
+  bot.hears(/^new from summary\s+(.+)/i, async (ctx) => createNewFromSummary(ctx, ctx.match[1] ?? ""));
 
   bot.command("history", async (ctx) => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
@@ -2092,6 +2358,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
+      return;
+    }
+
+    const commandName = text.match(/^\/([a-zA-Z0-9_]+)/)?.[1]?.toLowerCase();
+    if (commandName === "compact" && session.compactThread) {
+      try {
+        await session.compactThread();
+        await safeReply(ctx, escapeHTML("App-server compaction started."), {
+          fallbackText: "App-server compaction started.",
+        });
+      } catch (error) {
+        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+          fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        });
+      }
       return;
     }
 
@@ -2765,9 +3046,16 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "fork", description: "Start in current workspace" },
     { command: "workspaces", description: "Choose workspace for new thread" },
     { command: "newsummary", description: "Start a new thread from summary" },
+    { command: "forkthread", description: "Fork active app-server thread" },
+    { command: "renamethread", description: "Rename active app-server thread" },
+    { command: "rollbackthread", description: "Roll back app-server thread history" },
     { command: "session", description: "Current thread details" },
     { command: "status", description: "Current thread details" },
     { command: "usage", description: "Codex limits & reset times" },
+    { command: "backend", description: "Show or reset backend" },
+    { command: "appserver", description: "Probe Codex app-server" },
+    { command: "appserverturn", description: "Run isolated app-server turn" },
+    { command: "appserversteer", description: "Run isolated app-server steer test" },
     { command: "sessions", description: "Browse & switch threads" },
     { command: "history", description: "Show recent local thread history" },
     { command: "use", description: "Switch to a thread by ID or latest" },
@@ -2777,6 +3065,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "retry", description: "Resend the last prompt" },
     { command: "abort", description: "Cancel current operation" },
     { command: "stop", description: "Cancel current operation" },
+    { command: "steer", description: "Steer active app-server turn" },
     { command: "launch_profiles", description: "Select launch profile" },
     { command: "model", description: "View & change model" },
     { command: "effort", description: "Set reasoning effort" },
@@ -2821,6 +3110,96 @@ function renderSessionInfoHTML(info: CodexSessionInfo): string {
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+function renderAppServerProbePlain(result: AppServerProbeResult): string {
+  const lines = [
+    "Codex app-server probe:",
+    `Backend setting: ${result.backend}`,
+    `Duration: ${result.durationMs} ms`,
+  ];
+
+  if (!result.ok) {
+    lines.push(`Status: failed`, `Error: ${result.error}`);
+  } else {
+    lines.push(
+      "Status: ok",
+      `Server: ${result.userAgent}`,
+      `Codex home: ${result.codexHome}`,
+      `Platform: ${result.platform}`,
+      `Models returned: ${result.modelCount}${result.modelNames.length ? ` (${result.modelNames.join(", ")})` : ""}`,
+      `Threads returned: ${result.threadCount}${result.threadIds.length ? ` (${result.threadIds.join(", ")})` : ""}`,
+    );
+  }
+
+  lines.push(
+    `Notifications seen: ${result.notifications.length ? result.notifications.join(", ") : "none"}`,
+    `Assistant text delta opt-out: ${result.optOutNotificationMethods.join(", ")}`,
+  );
+
+  return lines.join("\n");
+}
+
+function renderAppServerTurnPlain(result: AppServerTurnResult): string {
+  const lines = [
+    "Codex app-server isolated turn:",
+    `Backend setting: ${result.backend}`,
+    `Duration: ${result.durationMs} ms`,
+  ];
+
+  if (!result.ok) {
+    lines.push(`Status: failed`, `Error: ${result.error}`);
+  } else {
+    lines.push(
+      "Status: ok",
+      `Thread: ${result.threadId}`,
+      `Turn: ${result.turnId}`,
+      "",
+      "Final response:",
+      result.finalText || "(empty)",
+    );
+  }
+
+  lines.push(
+    "",
+    `Notifications seen: ${result.notifications.length ? result.notifications.join(", ") : "none"}`,
+    `Completed item types: ${result.itemTypes.length ? result.itemTypes.join(", ") : "none"}`,
+    `Assistant text delta opt-out: ${result.optOutNotificationMethods.join(", ")}`,
+  );
+
+  return lines.join("\n");
+}
+
+function renderAppServerSteerPlain(result: AppServerSteerResult): string {
+  const lines = [
+    "Codex app-server isolated steer:",
+    `Backend setting: ${result.backend}`,
+    `Duration: ${result.durationMs} ms`,
+    `Steer delay: ${result.steerDelayMs} ms`,
+  ];
+
+  if (!result.ok) {
+    lines.push(`Status: failed`, `Error: ${result.error}`);
+  } else {
+    lines.push(
+      "Status: ok",
+      `Thread: ${result.threadId}`,
+      `Turn: ${result.turnId}`,
+      `Steer accepted for turn: ${result.steerTurnId}`,
+      "",
+      "Final response:",
+      result.finalText || "(empty)",
+    );
+  }
+
+  lines.push(
+    "",
+    `Notifications seen: ${result.notifications.length ? result.notifications.join(", ") : "none"}`,
+    `Completed item types: ${result.itemTypes.length ? result.itemTypes.join(", ") : "none"}`,
+    `Assistant text delta opt-out: ${result.optOutNotificationMethods.join(", ")}`,
+  );
+
+  return lines.join("\n");
 }
 
 function renderLaunchSummaryPlain(info: CodexSessionInfo): string {
@@ -3243,27 +3622,35 @@ function getWorkspaceShortName(workspace: string): string {
   return workspace.split(/[\\/]/).filter(Boolean).pop() ?? workspace;
 }
 
-function renderWorkspaceSelectionMessage(workspaces: string[], currentWorkspace: string): { html: string; plain: string } {
+function renderWorkspaceSelectionMessage(
+  workspaces: string[],
+  currentWorkspace: string,
+  defaultWorkspace?: string,
+): { html: string; plain: string } {
   const plainList = workspaces
     .map((workspace, index) => {
-      const active = workspace === currentWorkspace ? " current" : "";
-      return `${index + 1}. ${getWorkspaceShortName(workspace)} - ${workspace}${active}`;
+      const labels = workspaceLabels(workspace, currentWorkspace, defaultWorkspace);
+      const suffix = labels.length > 0 ? ` ${labels.join(", ")}` : "";
+      return `${index + 1}. ${getWorkspaceShortName(workspace)} - ${workspace}${suffix}`;
     })
     .join("\n");
   const htmlList = workspaces
     .map((workspace, index) => {
-      const active = workspace === currentWorkspace ? " <i>current</i>" : "";
-      return `${index + 1}. <code>${escapeHTML(getWorkspaceShortName(workspace))}</code> - ${escapeHTML(workspace)}${active}`;
+      const labels = workspaceLabels(workspace, currentWorkspace, defaultWorkspace)
+        .map((label) => `<i>${escapeHTML(label)}</i>`)
+        .join(", ");
+      const suffix = labels ? ` ${labels}` : "";
+      return `${index + 1}. <code>${escapeHTML(getWorkspaceShortName(workspace))}</code> - ${escapeHTML(workspace)}${suffix}`;
     })
     .join("\n");
 
   return {
-    html: `<b>Select workspace for new thread:</b>\nSend <code>/new 1</code>, <code>new 1</code>, or <code>workspace 1</code>.\n\n${htmlList}`,
-    plain: `Select workspace for new thread:\nSend /new 1, new 1, or workspace 1.\n\n${plainList}`,
+    html: `<b>Select workspace for new thread:</b>\nSend <code>/new 1</code>, <code>/new default</code>, or <code>workspace 1</code>.\n\n${htmlList}`,
+    plain: `Select workspace for new thread:\nSend /new 1, /new default, or workspace 1.\n\n${plainList}`,
   };
 }
 
-function resolveWorkspaceArgument(raw: string, workspaces: string[]): string | null {
+function resolveWorkspaceArgument(raw: string, workspaces: string[], defaultWorkspace?: string): string | null {
   const value = raw.trim().replace(/^["']|["']$/g, "");
   if (!value) {
     return null;
@@ -3275,11 +3662,35 @@ function resolveWorkspaceArgument(raw: string, workspaces: string[]): string | n
   }
 
   const lower = value.toLowerCase();
+  if (defaultWorkspace && /^(?:default|configured|config|home)$/.test(lower)) {
+    return defaultWorkspace;
+  }
+
   return (
     workspaces.find((workspace) => workspace === value) ??
     workspaces.find((workspace) => getWorkspaceShortName(workspace).toLowerCase() === lower) ??
     value
   );
+}
+
+function workspaceLabels(workspace: string, currentWorkspace: string, defaultWorkspace?: string): string[] {
+  const labels: string[] = [];
+  if (sameWorkspace(workspace, currentWorkspace)) {
+    labels.push("current");
+  }
+  if (defaultWorkspace && sameWorkspace(workspace, defaultWorkspace)) {
+    labels.push("default");
+  }
+  return labels;
+}
+
+function sameWorkspace(left: string, right: string): boolean {
+  const normalizedLeft = left.trim();
+  const normalizedRight = right.trim();
+  if (process.platform === "win32") {
+    return normalizedLeft.toLowerCase() === normalizedRight.toLowerCase();
+  }
+  return normalizedLeft === normalizedRight;
 }
 
 function resolveSessionSelectionArgument(raw: string, pendingThreadIds?: string[]): string {
@@ -3327,6 +3738,26 @@ function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName
 
   const dotted = models.find((model) => normalizeModelName(model.slug).endsWith(normalized));
   return dotted?.slug ?? null;
+}
+
+function getCommandArgument(ctx: Context): string {
+  const text = ctx.message?.text ?? "";
+  return text.replace(/^\/\S+\s*/u, "").trim();
+}
+
+function resolveBackendArgument(raw: string): CodexBackend | null {
+  const normalized = raw.trim().toLowerCase().replace(/_/g, "-");
+  switch (normalized) {
+    case "sdk":
+    case "safe":
+      return "sdk";
+    case "appserver":
+    case "app-server":
+    case "observer":
+      return "app-server";
+    default:
+      return null;
+  }
 }
 
 function normalizeModelName(value: string): string {

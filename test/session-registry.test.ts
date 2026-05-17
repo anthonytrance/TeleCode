@@ -73,10 +73,8 @@ vi.mock("node:fs", () => ({
   }),
 }));
 
-vi.mock("../src/codex-session.js", () => ({
-  CodexSessionService: {
-    create: mockSessionState.create,
-  },
+vi.mock("../src/codex-backend.js", () => ({
+  createCodexSession: mockSessionState.create,
 }));
 
 import { SessionRegistry } from "../src/session-registry.js";
@@ -94,6 +92,8 @@ describe("SessionRegistry", () => {
     maxFileSize: 20 * 1024 * 1024,
     codexApiKey: "codex-key",
     codexModel: "o3",
+    codexBackend: "sdk",
+    codexAppServerPath: undefined,
     codexSandboxMode: "workspace-write",
     codexApprovalPolicy: "never",
     launchProfiles: [
@@ -108,6 +108,7 @@ describe("SessionRegistry", () => {
     defaultLaunchProfileId: "default",
     enableUnsafeLaunchProfiles: false,
     toolVerbosity: "summary",
+    streamAssistantText: false,
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,
@@ -193,6 +194,36 @@ describe("SessionRegistry", () => {
     expect(first).not.toBe(second);
     expect(registry.has("67890:1")).toBe(true);
     expect(registry.has("67890:2")).toBe(true);
+  });
+
+  it("stores backend per context and uses it when recreating the session", async () => {
+    const registry = new SessionRegistry(createConfig());
+    const session = await registry.getOrCreate("123");
+
+    registry.setBackend("123", "app-server");
+
+    expect(session.dispose).toHaveBeenCalledTimes(1);
+    expect(registry.has("123")).toBe(false);
+    expect(registry.getBackend("123")).toBe("app-server");
+    expect(registry.listContexts()).toEqual([
+      {
+        contextKey: "123",
+        threadId: null,
+        workspace: "/workspace/base",
+        model: "o3",
+        reasoningEffort: undefined,
+        launchProfileId: "default",
+        backend: "app-server",
+        updatedAt: expect.any(Number),
+      },
+    ]);
+
+    await registry.getOrCreate("123");
+
+    expect(mockSessionState.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({ codexBackend: "app-server" }),
+      expect.objectContaining({ workspace: "/workspace/base" }),
+    );
   });
 
   it("removing one topic context does not affect another in the same chat", async () => {
@@ -351,6 +382,7 @@ describe("SessionRegistry", () => {
         model: "gpt-5.4",
         reasoningEffort: "high",
         launchProfileId: "default",
+        backend: "sdk",
         updatedAt: 2000,
       },
       {
@@ -360,6 +392,7 @@ describe("SessionRegistry", () => {
         model: "o4-mini",
         reasoningEffort: undefined,
         launchProfileId: "readonly",
+        backend: "sdk",
         updatedAt: 1000,
       },
     ]);
@@ -393,6 +426,7 @@ describe("SessionRegistry", () => {
         model: "o3",
         reasoningEffort: undefined,
         launchProfileId: "readonly",
+        backend: "sdk",
         updatedAt: expect.any(Number),
       },
     ]);
@@ -441,6 +475,7 @@ describe("SessionRegistry", () => {
         model: "o4-mini",
         reasoningEffort: "medium",
         launchProfileId: "default",
+        backend: "sdk",
         updatedAt: expect.any(Number),
       },
     ]);

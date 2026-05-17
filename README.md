@@ -53,12 +53,15 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `TELEGRAM_ALLOWED_USER_IDS` | ✅ | Comma-separated Telegram user IDs |
    | `CODEX_API_KEY` | — | API key for Codex (alternative to ChatGPT login) |
    | `CODEX_MODEL` | — | Default model, e.g. `gpt-5.4`, `o3` |
+   | `CODEX_BACKEND` | — | Runtime backend selector. Keep `sdk` for now; `app-server` is reserved until the native backend is implemented |
+   | `CODEX_APP_SERVER_PATH` | — | Optional absolute Codex binary path used by `/appserver` |
    | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
    | `CODEX_APPROVAL_POLICY` | — | `never` *(default)*, `on-request`, `on-failure`, `untrusted` |
    | `CODEX_LAUNCH_PROFILES_JSON` | — | Optional JSON array of named launch profiles for `/launch_profiles` |
    | `CODEX_DEFAULT_LAUNCH_PROFILE` | — | Default launch profile id (defaults to `default`) |
    | `ENABLE_UNSAFE_LAUNCH_PROFILES` | — | Set to `true` to allow extra `danger-full-access` launch profiles |
    | `TOOL_VERBOSITY` | — | `all`, `summary` *(default)*, `errors-only`, `none` |
+   | `STREAM_ASSISTANT_TEXT` | — | Stream assistant text before final reply (`false` by default) |
    | `SHOW_TURN_TOKEN_USAGE` | — | Show the per-turn `in/cached/out` footer in final replies (`false` by default) |
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
@@ -77,12 +80,21 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/start` | Welcome & status (concise for returning users) |
 | `/help` | Grouped command reference |
 | `/new` | Start a fresh thread (workspace picker if multiple workspaces) |
+| `/new default` | Start a fresh thread in `CODEX_WORKSPACE` |
 | `/newsummary` | Start a fresh thread from a handoff summary of the current thread |
+| `/newsummary default` | Summarize the current thread into a fresh `CODEX_WORKSPACE` thread |
+| `/forkthread` | Fork the active thread once app-server backend switching is enabled |
+| `/renamethread <name>` | Rename the active thread once app-server backend switching is enabled |
+| `/rollbackthread <n>` | Roll back app-server thread history by `n` turns; file changes are not reverted |
 | `/session` | Current thread ID, workspace, model, effort, and token totals |
+| `/appserver` | Probe the Codex app-server without switching the live backend |
+| `/appserverturn <prompt>` | Run one isolated app-server diagnostic turn |
+| `/appserversteer <initial> || <steer>` | Run one isolated app-server turn and steer it mid-turn |
 | `/sessions` | Browse recent threads grouped by workspace; tap to switch |
 | `/switch <id>` | Switch directly to a thread by ID |
 | `/retry` | Resend the last prompt |
 | `/abort` | Cancel the current turn |
+| `/steer <text>` | Steer an active app-server turn once app-server backend switching is enabled |
 | `/launch_profiles` | Select launch profile for new or reattached threads (`/launch` alias kept) |
 | `/model` | View and change the model |
 | `/effort` | Set reasoning effort: `minimal` · `low` · `medium` · `high` · `xhigh` |
@@ -217,7 +229,7 @@ TeleCodex/
 │   ├── voice.ts           — voice transcription (parakeet / Whisper)
 │   ├── config.ts          — environment loading and validation
 │   └── format.ts          — Markdown → Telegram HTML conversion
-├── test/                  — 15 test files, 180+ tests (vitest)
+├── test/                  — 19 test files, 217+ tests (vitest)
 ├── .env.example
 ├── Dockerfile
 ├── docker-compose.yml

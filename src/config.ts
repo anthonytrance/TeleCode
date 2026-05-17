@@ -14,6 +14,7 @@ import {
 } from "./codex-launch.js";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
+export type CodexBackend = "sdk" | "app-server";
 
 export interface TeleCodexConfig {
   telegramBotToken: string;
@@ -23,6 +24,8 @@ export interface TeleCodexConfig {
   maxFileSize: number;
   codexApiKey?: string;
   codexModel?: string;
+  codexBackend: CodexBackend;
+  codexAppServerPath?: string;
   codexSandboxMode: CodexSandboxMode;
   codexApprovalPolicy: CodexApprovalPolicy;
   launchProfiles: CodexLaunchProfile[];
@@ -44,6 +47,8 @@ export function loadConfig(): TeleCodexConfig {
   const maxFileSize = parseMaxFileSize(optionalString(process.env.MAX_FILE_SIZE));
   const codexApiKey = optionalString(process.env.CODEX_API_KEY);
   const codexModel = optionalString(process.env.CODEX_MODEL);
+  const codexBackend = parseCodexBackend(optionalString(process.env.CODEX_BACKEND));
+  const codexAppServerPath = optionalString(process.env.CODEX_APP_SERVER_PATH);
   const codexSandboxMode = parseSandboxMode(optionalString(process.env.CODEX_SANDBOX_MODE));
   const codexApprovalPolicy = parseApprovalPolicy(optionalString(process.env.CODEX_APPROVAL_POLICY));
   const enableUnsafeLaunchProfiles = parseBooleanEnv(
@@ -77,6 +82,8 @@ export function loadConfig(): TeleCodexConfig {
     maxFileSize,
     codexApiKey,
     codexModel,
+    codexBackend,
+    codexAppServerPath,
     codexSandboxMode,
     codexApprovalPolicy,
     launchProfiles,
@@ -258,6 +265,23 @@ function parseToolVerbosity(raw: string | undefined): ToolVerbosity {
         `Invalid TOOL_VERBOSITY value: "${raw}". Expected one of: all, summary, errors-only, none. Falling back to "summary".`,
       );
       return "summary";
+  }
+}
+
+function parseCodexBackend(raw: string | undefined): CodexBackend {
+  if (!raw) {
+    return "sdk";
+  }
+
+  switch (raw) {
+    case "sdk":
+    case "app-server":
+      return raw;
+    default:
+      console.warn(
+        `Invalid CODEX_BACKEND value: "${raw}". Expected one of: sdk, app-server. Falling back to "sdk".`,
+      );
+      return "sdk";
   }
 }
 

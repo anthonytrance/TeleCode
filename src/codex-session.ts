@@ -347,7 +347,7 @@ export class CodexSessionService {
   }
 
   listWorkspaces(): string[] {
-    return listWorkspaces();
+    return uniqueWorkspaces([this.currentWorkspace, this.config.workspace, ...listWorkspaces()]);
   }
 
   listModels(): CodexModelRecord[] {
@@ -555,6 +555,28 @@ function buildCodexEnv(apiKey?: string): Record<string, string> {
   }
 
   return env;
+}
+
+function uniqueWorkspaces(workspaces: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const workspace of workspaces) {
+    const trimmed = workspace.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const key = process.platform === "win32" ? trimmed.toLowerCase() : trimmed;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(trimmed);
+  }
+
+  return result;
 }
 
 function computeTextDelta(previousText: string, nextText: string): string {

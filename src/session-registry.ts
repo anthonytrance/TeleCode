@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
+import { createCodexSession, type CodexSessionRuntime } from "./codex-backend.js";
 import { findLaunchProfile } from "./codex-launch.js";
-import { CodexSessionService } from "./codex-session.js";
-import type { TeleCodexConfig } from "./config.js";
+import type { CodexBackend, TeleCodexConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
 
 export interface ContextMetadata {
@@ -13,11 +13,12 @@ export interface ContextMetadata {
   model?: string;
   reasoningEffort?: string;
   launchProfileId?: string;
+  backend?: CodexBackend;
   updatedAt: number;
 }
 
 export class SessionRegistry {
-  private readonly sessions = new Map<TelegramContextKey, CodexSessionService>();
+  private readonly sessions = new Map<TelegramContextKey, CodexSessionRuntime>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
@@ -30,7 +31,7 @@ export class SessionRegistry {
   async getOrCreate(
     contextKey: TelegramContextKey,
     options?: { deferThreadStart?: boolean },
-  ): Promise<CodexSessionService> {
+  ): Promise<CodexSessionRuntime> {
     let session = this.sessions.get(contextKey);
     if (session) {
       return session;
@@ -38,7 +39,11 @@ export class SessionRegistry {
 
     const meta = this.metadata.get(contextKey);
     const launchProfileId = resolveLaunchProfileId(this.config, meta);
-    session = await CodexSessionService.create(this.config, {
+    const effectiveConfig = {
+      ...this.config,
+      codexBackend: meta?.backend ?? this.config.codexBackend,
+    };
+    session = await createCodexSession(effectiveConfig, {
       workspace: meta?.workspace,
       model: meta?.model,
       reasoningEffort: meta?.reasoningEffort,
@@ -51,7 +56,7 @@ export class SessionRegistry {
     return session;
   }
 
-  get(contextKey: TelegramContextKey): CodexSessionService | undefined {
+  get(contextKey: TelegramContextKey): CodexSessionRuntime | undefined {
     return this.sessions.get(contextKey);
   }
 
@@ -63,8 +68,32 @@ export class SessionRegistry {
     return this.metadata.has(contextKey);
   }
 
-  updateMetadata(contextKey: TelegramContextKey, session: CodexSessionService): void {
+  getBackend(contextKey: TelegramContextKey): CodexBackend {
+    return this.metadata.get(contextKey)?.backend ?? this.config.codexBackend;
+  }
+
+  setBackend(contextKey: TelegramContextKey, backend: CodexBackend): void {
+    const session = this.sessions.get(contextKey);
+    session?.dispose();
+    this.sessions.delete(contextKey);
+
+    const previous = this.metadata.get(contextKey);
+    this.metadata.set(contextKey, {
+      contextKey,
+      threadId: previous?.threadId ?? null,
+      workspace: previous?.workspace ?? this.config.workspace,
+      model: previous?.model ?? this.config.codexModel,
+      reasoningEffort: previous?.reasoningEffort,
+      launchProfileId: previous?.launchProfileId ?? this.config.defaultLaunchProfileId,
+      backend,
+      updatedAt: Date.now(),
+    });
+    this.persistMetadata();
+  }
+
+  updateMetadata(contextKey: TelegramContextKey, session: CodexSessionRuntime): void {
     const info = session.getInfo();
+    const previous = this.metadata.get(contextKey);
     this.metadata.set(contextKey, {
       contextKey,
       threadId: info.threadId,
@@ -72,6 +101,7 @@ export class SessionRegistry {
       model: info.model,
       reasoningEffort: info.reasoningEffort,
       launchProfileId: info.nextLaunchProfileId ?? info.launchProfileId,
+      backend: previous?.backend ?? this.config.codexBackend,
       updatedAt: Date.now(),
     });
     this.persistMetadata();

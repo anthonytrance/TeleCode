@@ -9,11 +9,17 @@ let bot: ReturnType<typeof createBot> | undefined;
 
 try {
   const config = loadConfig();
+  if (config.codexBackend !== "sdk") {
+    throw new Error(
+      "CODEX_BACKEND=app-server is not available for live Telegram sessions yet. Keep CODEX_BACKEND=sdk and use /appserver for diagnostics.",
+    );
+  }
   registry = new SessionRegistry(config);
   bot = createBot(config, registry);
   await registerCommands(bot);
 
   console.log("TeleCodex running");
+  console.log(`Codex backend: ${config.codexBackend}`);
   const authStatus = await checkAuthStatus(config.codexApiKey);
   console.log(`Auth: ${authStatus.authenticated ? "authenticated" : "not authenticated"} (${authStatus.method})`);
   if (!authStatus.authenticated) {

@@ -104,6 +104,8 @@ describe("CodexSessionService", () => {
     maxFileSize: 20 * 1024 * 1024,
     codexApiKey: "codex-key",
     codexModel: "o3",
+    codexBackend: "sdk",
+    codexAppServerPath: undefined,
     codexSandboxMode: "workspace-write",
     codexApprovalPolicy: "never",
     launchProfiles: [
@@ -1057,13 +1059,22 @@ describe("CodexSessionService", () => {
     expect(mockCodexState.listThreads).toHaveBeenCalledWith(5);
   });
 
-  it("listWorkspaces delegates to codex-state", async () => {
+  it("listWorkspaces includes current, configured, and remembered workspaces", async () => {
     mockCodexState.listWorkspaces.mockReturnValue(["/workspace/a", "/workspace/b"]);
 
     const service = await CodexSessionService.create(createConfig());
 
-    expect(service.listWorkspaces()).toEqual(["/workspace/a", "/workspace/b"]);
+    expect(service.listWorkspaces()).toEqual(["/workspace/base", "/workspace/a", "/workspace/b"]);
     expect(mockCodexState.listWorkspaces).toHaveBeenCalledTimes(1);
+  });
+
+  it("listWorkspaces keeps the active workspace before configured workspace", async () => {
+    mockCodexState.listWorkspaces.mockReturnValue(["/workspace/base", "/workspace/old"]);
+
+    const service = await CodexSessionService.create(createConfig());
+    await service.newThread("/workspace/old");
+
+    expect(service.listWorkspaces()).toEqual(["/workspace/old", "/workspace/base"]);
   });
 
   it("listModels delegates to codex-state", async () => {
