@@ -77,6 +77,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/start` | Welcome & status (concise for returning users) |
 | `/help` | Grouped command reference |
 | `/new` | Start a fresh thread (workspace picker if multiple workspaces) |
+| `/newsummary` | Start a fresh thread from a handoff summary of the current thread |
 | `/session` | Current thread ID, workspace, model, effort, and token totals |
 | `/sessions` | Browse recent threads grouped by workspace; tap to switch |
 | `/switch <id>` | Switch directly to a thread by ID |
@@ -156,6 +157,8 @@ The `SessionRegistry` maps context keys to `CodexSessionService` instances:
 
 Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecodex/contexts.json` and restored on restart so threads survive bot reboots.
 
+`/newsummary` follows the same active-thread replacement rule as `/new`, but it first captures a handoff summary from the previous active thread and sends that summary into the newly created thread.
+
 Each context has independent busy-state tracking, so a running prompt in one topic doesn't block another.
 
 ## Handoff: Telegram → CLI
@@ -168,6 +171,10 @@ Each context has independent busy-state tracking, so a running prompt in one top
 3. Paste and run in your terminal
 
 On macOS the command is also copied to the clipboard automatically.
+
+## Handoff: Thread to Fresh Thread
+
+Run `/newsummary` or send `new from summary` to create a compact handoff inside Telegram. TeleCodex first asks the current thread for a summary, then starts a fresh Codex thread in the same context and sends that summary as the initial handoff. `/session` token totals are scoped to the new active thread after the handoff; previous-thread totals are not carried over.
 
 ## Architecture
 

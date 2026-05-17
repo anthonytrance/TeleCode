@@ -33,24 +33,48 @@ import {
   formatLaunchProfileBehavior,
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
-import { getThread } from "./codex-state.js";
+import { getThread, getThreadByPrefix, readThreadHistory } from "./codex-state.js";
 import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { SessionRegistry } from "./session-registry.js";
+import { readLatestCodexUsage, renderUsagePlain } from "./usage.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
+const FIRST_INTERMEDIATE_UPDATE_MS = 2500;
+const INTERMEDIATE_UPDATE_MIN_MS = 30000;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
-const FORMATTED_CHUNK_TARGET = 3000;
+const STREAM_MESSAGE_TARGET = 1200;
+const FORMATTED_CHUNK_TARGET = 3600;
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const KEYBOARD_PAGE_SIZE = 6;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
+const NATIVE_CODEX_COMMANDS = [
+  "compact",
+  "agents",
+  "diff",
+  "help",
+  "doctor",
+  "prompts",
+  "memory",
+  "mentions",
+  "init",
+  "bug",
+  "config",
+  "limits",
+] as const;
+const NEW_FROM_SUMMARY_PROMPT = [
+  "Create a compact handoff summary for continuing this Codex session in a fresh thread.",
+  "Include: current goal, important decisions, files changed or inspected, commands run, current state, open problems, and recommended next steps.",
+  "Be specific enough that a new session can continue without reading the full transcript.",
+  "Output only the summary.",
+].join("\n");
 
 type TelegramChatId = number | string;
 type TelegramParseMode = "HTML";
@@ -78,6 +102,13 @@ type RenderedText = {
 
 type RenderedChunk = RenderedText & {
   sourceText: string;
+};
+
+type QueuedPrompt = {
+  ctx: Context;
+  chatId: TelegramChatId;
+  session: CodexSessionService;
+  userInput: CodexPromptInput;
 };
 
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
@@ -125,6 +156,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
+  const lastAssistantReply = new Map<TelegramContextKey, string>();
+  const queuedPrompts = new Map<TelegramContextKey, QueuedPrompt>();
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
@@ -132,6 +165,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
     lastPromptInput.delete(key);
+    lastAssistantReply.delete(key);
+    queuedPrompts.delete(key);
   });
 
   const getBusyState = (
@@ -218,6 +253,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   };
 
+  const queuePromptReply = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    session: CodexSessionService,
+    userInput: CodexPromptInput,
+  ): Promise<void> => {
+    const replaced = queuedPrompts.has(contextKey);
+    queuedPrompts.set(contextKey, { ctx, chatId, session, userInput });
+    const text = replaced
+      ? "Still working. I replaced the queued message with your latest one. Use /abort if the current task is stuck."
+      : "Still working. I queued this message and will run it next. Use /abort if the current task is stuck.";
+    await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+  };
+
   const setReaction = async (ctx: Context, emoji: "👀" | "👍" | "❤" | "🔥" | "👏"): Promise<void> => {
     if (!config.enableTelegramReactions) {
       return;
@@ -292,10 +342,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
     let accumulatedText = "";
+    let pendingStreamText = "";
+    let sentResponseText = false;
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
     let lastRenderedText = "";
-    let lastEditAt = 0;
+    let lastEditAt = Date.now();
     let flushTimer: NodeJS.Timeout | undefined;
     let isFlushing = false;
     let flushPending = false;
@@ -329,9 +381,64 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     };
 
-    const renderPreview = (): RenderedChunk => {
-      const previewText = buildStreamingPreview(accumulatedText);
-      return renderMarkdownChunkWithinLimit(previewText);
+    const extractStreamParts = (force = false): string[] => {
+      const parts: string[] = [];
+
+      while (pendingStreamText.trim()) {
+        let cut = -1;
+
+        if (force) {
+          cut = pendingStreamText.length;
+        } else {
+          const paragraph = pendingStreamText.match(/\n\s*\n/);
+          if (paragraph?.index !== undefined) {
+            cut = paragraph.index + paragraph[0].length;
+          } else if (pendingStreamText.length >= STREAM_MESSAGE_TARGET) {
+            const windowText = pendingStreamText.slice(0, STREAM_MESSAGE_TARGET);
+            cut = Math.max(
+              windowText.lastIndexOf("\n"),
+              windowText.lastIndexOf(". "),
+              windowText.lastIndexOf("? "),
+              windowText.lastIndexOf("! "),
+              windowText.lastIndexOf("; "),
+              windowText.lastIndexOf(", "),
+              windowText.lastIndexOf(" "),
+            );
+            cut = cut < STREAM_MESSAGE_TARGET / 2 ? STREAM_MESSAGE_TARGET : cut + 1;
+          }
+        }
+
+        if (cut <= 0) {
+          break;
+        }
+
+        const part = pendingStreamText.slice(0, cut).trim();
+        pendingStreamText = pendingStreamText.slice(cut).replace(/^\s+/, "");
+        if (part) {
+          parts.push(part);
+        }
+
+        if (!force && pendingStreamText.length < STREAM_MESSAGE_TARGET) {
+          break;
+        }
+      }
+
+      return parts;
+    };
+
+    const buildFooterText = (): string => {
+      const usageLine =
+        config.showTurnTokenUsage && lastTurnUsage ? formatTurnUsageLine(lastTurnUsage) : "";
+
+      if (toolVerbosity === "summary") {
+        return [formatToolSummaryLine(toolCounts), usageLine].filter((line): line is string => Boolean(line)).join("\n");
+      }
+
+      if (toolVerbosity === "all") {
+        return usageLine;
+      }
+
+      return "";
     };
 
     const buildFinalResponseText = (text: string): string => {
@@ -367,15 +474,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
       responseMessagePromise = (async () => {
         stopTyping();
-        const preview = renderPreview();
-        const message = await sendTextMessage(bot.api, chatId, preview.text, {
-          parseMode: preview.parseMode,
-          fallbackText: preview.fallbackText,
+        const placeholder = renderMarkdownChunkWithinLimit("Working...");
+        const message = await sendTextMessage(bot.api, chatId, placeholder.text, {
+          parseMode: placeholder.parseMode,
+          fallbackText: placeholder.fallbackText,
           replyMarkup: abortKeyboard,
           messageThreadId,
         });
         responseMessageId = message.message_id;
-        lastRenderedText = preview.text;
+        lastRenderedText = placeholder.text;
         lastEditAt = Date.now();
       })();
 
@@ -387,11 +494,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const flushResponse = async (force = false): Promise<void> => {
-      if (!accumulatedText) {
-        return;
-      }
-      if (!responseMessageId) {
-        await ensureResponseMessage();
+      if (!pendingStreamText) {
         return;
       }
       if (isFlushing) {
@@ -400,23 +503,30 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
 
       const now = Date.now();
-      if (!force && now - lastEditAt < EDIT_DEBOUNCE_MS) {
+      const updateDelay = sentResponseText ? INTERMEDIATE_UPDATE_MIN_MS : FIRST_INTERMEDIATE_UPDATE_MS;
+      if (!force && now - lastEditAt < updateDelay) {
         return;
       }
 
-      const nextText = renderPreview();
-      if (nextText.text === lastRenderedText) {
+      const streamParts = extractStreamParts(force);
+      if (streamParts.length === 0) {
         return;
       }
 
       isFlushing = true;
       try {
-        await safeEditMessage(bot, chatId, responseMessageId, nextText.text, {
-          parseMode: nextText.parseMode,
-          fallbackText: nextText.fallbackText,
-          replyMarkup: abortKeyboard,
-        });
-        lastRenderedText = nextText.text;
+        stopTyping();
+        for (const part of streamParts) {
+          const chunks = splitMarkdownForTelegram(part);
+          for (const chunk of chunks) {
+            await sendTextMessage(bot.api, chatId, chunk.text, {
+              parseMode: chunk.parseMode,
+              fallbackText: chunk.fallbackText,
+              messageThreadId,
+            });
+            sentResponseText = true;
+          }
+        }
         lastEditAt = Date.now();
       } finally {
         isFlushing = false;
@@ -432,7 +542,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      const delay = Math.max(0, EDIT_DEBOUNCE_MS - (Date.now() - lastEditAt));
+      const updateDelay = sentResponseText ? INTERMEDIATE_UPDATE_MIN_MS : FIRST_INTERMEDIATE_UPDATE_MS;
+      const delay = Math.max(0, updateDelay - (Date.now() - lastEditAt));
       flushTimer = setTimeout(() => {
         flushTimer = undefined;
         void flushResponse().catch((error) => {
@@ -464,9 +575,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
       const [firstChunk, ...remainingChunks] = chunks;
       if (responseMessageId) {
-        await safeEditMessage(bot, chatId, responseMessageId, firstChunk.text, {
+        await sendTextMessage(bot.api, chatId, firstChunk.text, {
           parseMode: firstChunk.parseMode,
           fallbackText: firstChunk.fallbackText,
+          messageThreadId,
         });
         await removeAbortKeyboard();
       } else {
@@ -503,8 +615,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
       }
 
-      const finalText = buildFinalResponseText(accumulatedText);
-      if (!finalText) {
+      lastAssistantReply.set(contextKey, buildFinalResponseText(accumulatedText));
+      const finalUndeliveredText = buildFinalResponseText(pendingStreamText);
+      if (finalUndeliveredText) {
+        pendingStreamText = "";
+        await deliverRenderedChunks(splitMarkdownForTelegram(finalUndeliveredText));
+        sentResponseText = true;
+      }
+
+      if (!sentResponseText) {
         const html = "<b>✅ Done</b>";
         const plainText = "✅ Done";
 
@@ -517,26 +636,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
     };
 
     const callbacks: CodexSessionCallbacks = {
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
-        if (!responseMessageId) {
-          void ensureResponseMessage()
-            .then(() => {
-              scheduleFlush();
-            })
-            .catch((error) => {
-              console.error("Failed to send initial Telegram response message", error);
-            });
-          return;
-        }
-
+        pendingStreamText += delta;
         scheduleFlush();
       },
       onToolStart: (toolName: string, toolCallId: string) => {
+        if (pendingStreamText.trim()) {
+          void flushResponse(true).catch((error) => {
+            console.error("Failed to flush assistant progress before tool start", error);
+          });
+        }
+
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
           return;
@@ -725,6 +839,47 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       clearFlushTimer();
       busyState.processing = false;
     }
+  };
+
+  const startUserPrompt = (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    session: CodexSessionService,
+    userInput: CodexPromptInput,
+    options: {
+      setSuccessReaction?: boolean;
+      onFinally?: () => Promise<void>;
+    } = {},
+  ): void => {
+    const setSuccessReaction = options.setSuccessReaction ?? true;
+
+    void (async () => {
+      try {
+        await handleUserPrompt(ctx, contextKey, chatId, session, userInput);
+        if (setSuccessReaction) {
+          await setReaction(ctx, "👍");
+        }
+      } catch (error) {
+        console.error("Prompt task failed:", error);
+        await clearReaction(ctx);
+      } finally {
+        if (options.onFinally) {
+          try {
+            await options.onFinally();
+          } catch (cleanupError) {
+            console.error("Prompt cleanup failed:", cleanupError);
+          }
+        }
+
+        const queued = queuedPrompts.get(contextKey);
+        if (queued) {
+          queuedPrompts.delete(contextKey);
+          await setReaction(queued.ctx, "👀");
+          startUserPrompt(queued.ctx, contextKey, queued.chatId, queued.session, queued.userInput);
+        }
+      }
+    })();
   };
 
   const deliverArtifacts = async (
@@ -950,14 +1105,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         [
           "<b>Voice transcription is not available.</b>",
           "",
-          "Install <code>parakeet-coreml</code> + ffmpeg, or set <code>OPENAI_API_KEY</code>.",
+          "Set <code>FASTER_WHISPER_PYTHON</code>, install <code>parakeet-coreml</code>, or set <code>OPENAI_API_KEY</code>.",
           "<i>Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.</i>",
         ].join("\n"),
         {
           fallbackText: [
             "Voice transcription is not available.",
             "",
-            "Install parakeet-coreml + ffmpeg, or set OPENAI_API_KEY.",
+            "Set FASTER_WHISPER_PYTHON, install parakeet-coreml, or set OPENAI_API_KEY.",
             "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.",
           ].join("\n"),
         },
@@ -971,7 +1126,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   });
 
-  bot.command("new", async (ctx) => {
+  bot.command(["new", "fork"], async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
       return;
@@ -990,20 +1145,42 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const workspaces = session.listWorkspaces();
-    if (workspaces.length <= 1) {
-      try {
-        const info = await session.newThread();
-        updateSessionMetadata(contextKey, session);
-        const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
-        const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
-        const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
-        await safeReply(ctx, html, { fallbackText: plainText });
-      } catch (error) {
-        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-          fallbackText: `Failed: ${friendlyErrorText(error)}`,
-        });
+    const rawText = ctx.message?.text ?? "";
+    const workspaceArg = rawText.replace(/^\/(?:new|fork)(?:@\w+)?\s*/i, "").trim();
+    if (workspaceArg) {
+      if (/^(?:choose|list|workspace|workspaces)$/i.test(workspaceArg)) {
+        await showWorkspacePicker(ctx, contextKey, session);
+        return;
       }
+
+      await createNewThreadFromWorkspaceText(ctx, workspaceArg);
+      return;
+    }
+
+    try {
+      const info = await session.newThread(session.getCurrentWorkspace());
+      updateSessionMetadata(contextKey, session);
+      const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
+      const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
+      const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
+      await safeReply(ctx, html, { fallbackText: plainText });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  });
+
+  const showWorkspacePicker = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    session: CodexSessionService,
+  ): Promise<void> => {
+    const workspaces = session.listWorkspaces();
+    if (workspaces.length === 0) {
+      await safeReply(ctx, escapeHTML("No known workspaces found. Use /new to start in the current workspace."), {
+        fallbackText: "No known workspaces found. Use /new to start in the current workspace.",
+      });
       return;
     }
 
@@ -1015,14 +1192,66 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }));
     pendingWorkspaceButtons.set(contextKey, workspaceButtons);
     const keyboard = paginateKeyboard(workspaceButtons, 0, "ws");
+    const selectionMessage = renderWorkspaceSelectionMessage(workspaces, currentWorkspace);
 
-    await safeReply(ctx, "<b>Select workspace for new thread:</b>", {
-      fallbackText: "Select workspace for new thread:",
+    await safeReply(ctx, selectionMessage.html, {
+      fallbackText: selectionMessage.plain,
       replyMarkup: keyboard,
     });
+  };
+
+  bot.command(["workspaces", "workspace"], async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    await showWorkspacePicker(ctx, contextKey, session);
   });
 
-  bot.command("abort", async (ctx) => {
+  const createNewThreadFromWorkspaceText = async (ctx: Context, rawWorkspace: string): Promise<boolean> => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return true;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot create a new thread while a prompt is running."), {
+        fallbackText: "Cannot create a new thread while a prompt is running.",
+      });
+      return true;
+    }
+
+    const workspaces = session.listWorkspaces();
+    const workspace = resolveWorkspaceArgument(rawWorkspace, workspaces);
+    if (!workspace) {
+      const selectionMessage = renderWorkspaceSelectionMessage(workspaces, session.getCurrentWorkspace());
+      await safeReply(ctx, selectionMessage.html, { fallbackText: selectionMessage.plain });
+      return true;
+    }
+
+    pendingWorkspacePicks.delete(contextKey);
+    pendingWorkspaceButtons.delete(contextKey);
+
+    try {
+      const info = await session.newThread(workspace);
+      updateSessionMetadata(contextKey, session);
+      const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
+      const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
+      const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
+      await safeReply(ctx, html, { fallbackText: plainText });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    }
+
+    return true;
+  };
+
+  bot.command(["abort", "stop"], async (ctx) => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -1067,15 +1296,50 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, cached);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
-    }
+    startUserPrompt(ctx, contextKey, chatId, session, cached);
   });
 
-  bot.command("session", async (ctx) => {
+  bot.command("copy", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+
+    const reply = lastAssistantReply.get(contextKey);
+    if (!reply) {
+      await safeReply(ctx, escapeHTML("No assistant reply has been captured for this context yet."), {
+        fallbackText: "No assistant reply has been captured for this context yet.",
+      });
+      return;
+    }
+
+    const rendered = formatMarkdownMessage(reply);
+    await safeReply(ctx, rendered.text, {
+      parseMode: rendered.parseMode,
+      fallbackText: rendered.fallbackText,
+    });
+  });
+
+  bot.command("clear", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot clear while a prompt is running. Use /stop first."), {
+        fallbackText: "Cannot clear while a prompt is running. Use /stop first.",
+      });
+      return;
+    }
+
+    registry.remove(contextKey);
+    await safeReply(ctx, escapeHTML("Cleared this Telegram context. The next message will start a fresh Codex thread."), {
+      fallbackText: "Cleared this Telegram context. The next message will start a fresh Codex thread.",
+    });
+  });
+
+  bot.command(["session", "status"], async (ctx) => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -1091,9 +1355,70 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await safeReply(ctx, htmlLines.join("\n"), { fallbackText: plainLines.join("\n") });
   });
 
+  bot.command("usage", async (ctx) => {
+    try {
+      const plain = renderUsagePlain(await readLatestCodexUsage());
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+    } catch (error) {
+      const message = `Failed to read usage: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    }
+  });
+
+  const setLaunchProfileFromCommand = async (ctx: Context, rawProfile: string): Promise<boolean> => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return true;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot change launch profile while a prompt is running."), {
+        fallbackText: "Cannot change launch profile while a prompt is running.",
+      });
+      return true;
+    }
+
+    const wantsConfirm = /\bconfirm\b/i.test(rawProfile);
+    const requested = rawProfile.replace(/\bconfirm\b/gi, "").trim().toLowerCase();
+    const profile = config.launchProfiles.find(
+      (candidate) =>
+        candidate.id.toLowerCase() === requested ||
+        candidate.label.toLowerCase() === requested ||
+        candidate.label.toLowerCase().replace(/\s+/g, "-") === requested,
+    );
+
+    if (!profile) {
+      const available = config.launchProfiles.map((candidate) => candidate.id).join(", ");
+      await safeReply(ctx, escapeHTML(`Usage: /launch_profiles <${available}>`), {
+        fallbackText: `Usage: /launch_profiles <${available}>`,
+      });
+      return true;
+    }
+
+    if (profile.unsafe && !wantsConfirm) {
+      const text = `Profile ${profile.label} uses danger-full-access. Send /launch_profiles ${profile.id} confirm to select it.`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return true;
+    }
+
+    const selectedProfile = session.setLaunchProfile(profile.id);
+    updateSessionMetadata(contextKey, session);
+    const text = `Launch profile set to ${selectedProfile.label} (${formatLaunchProfileBehavior(selectedProfile)}). It applies to new or reattached threads.`;
+    await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    return true;
+  };
+
   const openLaunchProfilesPicker = async (ctx: Context): Promise<void> => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
+      return;
+    }
+
+    const rawText = ctx.message?.text ?? "";
+    const profileArg = rawText.replace(/^\/(?:launch|launch_profiles)(?:@\w+)?\s*/i, "").trim();
+    if (profileArg) {
+      await setLaunchProfileFromCommand(ctx, profileArg);
       return;
     }
 
@@ -1156,6 +1481,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   bot.command(["launch", "launch_profiles"], openLaunchProfilesPicker);
   bot.hears(/^\/launch-profiles(?:@\w+)?$/i, openLaunchProfilesPicker);
+  bot.hears(/^(?:launch|launch_profiles|launch profile)\s+(.+)/i, async (ctx) => {
+    await setLaunchProfileFromCommand(ctx, ctx.match[1] ?? "");
+  });
 
   bot.command("handback", async (ctx) => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
@@ -1272,7 +1600,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    if (!getThread(threadId)) {
+    if (threadId.toLowerCase() !== "latest" && !getThread(threadId) && !getThreadByPrefix(threadId)) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(`Unknown Codex thread: ${threadId}`)}`, {
         fallbackText: `Failed: Unknown Codex thread: ${threadId}`,
       });
@@ -1296,7 +1624,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   });
 
-  bot.command(["sessions", "switch"], async (ctx) => {
+  bot.command(["sessions", "switch", "use"], async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
       return;
@@ -1316,7 +1644,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const rawText = ctx.message?.text ?? "";
-    const threadId = rawText.replace(/^\/(?:sessions|switch)(?:@\w+)?\s*/, "").trim();
+    const threadArg = rawText.replace(/^\/(?:sessions|switch|use)(?:@\w+)?\s*/, "").trim();
+    const threadId = resolveSessionSelectionArgument(threadArg, pendingSessionPicks.get(contextKey));
 
     if (threadId) {
       const busyState = getBusyState(contextKey);
@@ -1381,11 +1710,192 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
     pendingSessionButtons.set(contextKey, sessionButtons);
     const keyboard = paginateKeyboard(sessionButtons, 0, "sess");
+    const numberedPlain = orderedSessions
+      .map((listedSession, index) => {
+        const active = listedSession.id === activeThreadId ? " active" : "";
+        const title = listedSession.title || listedSession.firstUserMessage || "(untitled)";
+        return `${index + 1}. ${getWorkspaceShortName(listedSession.cwd)} - ${trimLine(title, 48)} - ${formatRelativeTime(listedSession.updatedAt)}${active}`;
+      })
+      .join("\n");
+    const numberedHtml = orderedSessions
+      .map((listedSession, index) => {
+        const active = listedSession.id === activeThreadId ? " <i>active</i>" : "";
+        const title = listedSession.title || listedSession.firstUserMessage || "(untitled)";
+        return `${index + 1}. <code>${escapeHTML(getWorkspaceShortName(listedSession.cwd))}</code> - ${escapeHTML(trimLine(title, 48))} - ${escapeHTML(formatRelativeTime(listedSession.updatedAt))}${active}`;
+      })
+      .join("\n");
 
-    await safeReply(ctx, `<b>Recent threads</b> (${orderedSessions.length}):\nTap to switch.`, {
-      fallbackText: `Recent threads (${orderedSessions.length}):\nTap to switch.`,
+    await safeReply(ctx, `<b>Recent threads</b> (${orderedSessions.length}):\nSend <code>/use 1</code> or tap to switch.\n\n${numberedHtml}`, {
+      fallbackText: `Recent threads (${orderedSessions.length}):\nSend /use 1 or tap to switch.\n\n${numberedPlain}`,
       replyMarkup: keyboard,
     });
+  });
+
+  bot.hears(/^(?:use|switch)\s+(.+)/i, async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot switch sessions while a prompt is running."), {
+        fallbackText: "Cannot switch sessions while a prompt is running.",
+      });
+      return;
+    }
+
+    const threadId = resolveSessionSelectionArgument(ctx.match[1] ?? "", pendingSessionPicks.get(contextKey));
+    if (!threadId) {
+      await safeReply(ctx, escapeHTML("Usage: use <number|thread-id|latest>"), {
+        fallbackText: "Usage: use <number|thread-id|latest>",
+      });
+      return;
+    }
+
+    const busyState = getBusyState(contextKey);
+    busyState.switching = true;
+    try {
+      const info = await session.switchSession(threadId);
+      updateSessionMetadata(contextKey, session);
+      const html = `<b>Switched thread.</b>\n\n${renderSessionInfoHTML(info)}`;
+      const plain = `Switched thread.\n\n${renderSessionInfoPlain(info)}`;
+      await safeReply(ctx, html, { fallbackText: plain });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    } finally {
+      busyState.switching = false;
+    }
+  });
+
+  bot.hears(/^(?:fork|new thread)\s+(.+)/i, async (ctx) => {
+    await createNewThreadFromWorkspaceText(ctx, ctx.match[1] ?? "");
+  });
+
+  bot.hears(/^(?:workspace|ws)\s+(.+)/i, async (ctx) => {
+    await createNewThreadFromWorkspaceText(ctx, ctx.match[1] ?? "");
+  });
+
+  bot.hears(/^new\s+(?!from summary$)(.+)/i, async (ctx) => {
+    await createNewThreadFromWorkspaceText(ctx, ctx.match[1] ?? "");
+  });
+
+  const createNewFromSummary = async (ctx: Context): Promise<void> => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot create a summary thread while a prompt is running."), {
+        fallbackText: "Cannot create a summary thread while a prompt is running.",
+      });
+      return;
+    }
+
+    if (!session.hasActiveThread()) {
+      await safeReply(ctx, escapeHTML("No active thread to summarize yet."), {
+        fallbackText: "No active thread to summarize yet.",
+      });
+      return;
+    }
+
+    const authStatus = await checkAuthStatus(config.codexApiKey);
+    if (!authStatus.authenticated) {
+      await safeReply(ctx, escapeHTML("Codex is not authenticated. Use /login first."), {
+        fallbackText: "Codex is not authenticated. Use /login first.",
+      });
+      return;
+    }
+
+    const busyState = getBusyState(contextKey);
+    busyState.switching = true;
+    try {
+      await safeReply(ctx, escapeHTML("Creating handoff summary..."), {
+        fallbackText: "Creating handoff summary...",
+      });
+      const summary = (await session.runText(NEW_FROM_SUMMARY_PROMPT)).trim();
+      if (!summary) {
+        throw new Error("Summary generation returned empty text");
+      }
+
+      await safeReply(ctx, escapeHTML("Starting new thread from summary..."), {
+        fallbackText: "Starting new thread from summary...",
+      });
+      await session.newThread();
+      const seedPrompt = [
+        "You are continuing from a previous Codex session.",
+        "Treat the following handoff summary as the starting context for this new thread.",
+        "Do not redo work unless asked. Reply only: Summary loaded.",
+        "",
+        summary,
+      ].join("\n");
+      await session.runText(seedPrompt);
+      updateSessionMetadata(contextKey, session);
+
+      const info = session.getInfo();
+      const plain = [`New thread created from summary.`, "", renderSessionInfoPlain(info), "", "Summary:", summary].join("\n");
+      const html = [
+        "<b>New thread created from summary.</b>",
+        "",
+        renderSessionInfoHTML(info),
+        "",
+        "<b>Summary:</b>",
+        escapeHTML(summary),
+      ].join("\n");
+      await safeReply(ctx, html, { fallbackText: plain });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    } finally {
+      busyState.switching = false;
+    }
+  };
+
+  bot.command("newsummary", createNewFromSummary);
+  bot.hears(/^new from summary$/i, createNewFromSummary);
+
+  bot.command("history", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { session } = contextSession;
+    const threadId = session.getInfo().threadId;
+    if (!threadId) {
+      await safeReply(ctx, escapeHTML("No Codex thread is selected here yet. Use /use latest or send a prompt first."), {
+        fallbackText: "No Codex thread is selected here yet. Use /use latest or send a prompt first.",
+      });
+      return;
+    }
+
+    const messages = readThreadHistory(threadId, 8);
+    if (messages.length === 0) {
+      await safeReply(ctx, escapeHTML("No local history entries found for this thread."), {
+        fallbackText: "No local history entries found for this thread.",
+      });
+      return;
+    }
+
+    const plain = messages
+      .map((message) => {
+        const role = message.role === "assistant" ? "Assistant" : "User";
+        return `${role}: ${truncateForHistory(message.text)}`;
+      })
+      .join("\n\n");
+    const html = messages
+      .map((message) => {
+        const role = message.role === "assistant" ? "Assistant" : "User";
+        return `<b>${role}:</b> ${escapeHTML(truncateForHistory(message.text))}`;
+      })
+      .join("\n\n");
+
+    await safeReply(ctx, html, { fallbackText: plain });
   });
 
   bot.command("model", async (ctx) => {
@@ -1415,9 +1925,32 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
+    const rawText = ctx.message?.text ?? "";
+    const modelArg = rawText.replace(/^\/model(?:@\w+)?\s*/i, "").trim();
+    if (modelArg) {
+      const slug = resolveModelSlug(modelArg, models);
+      if (!slug) {
+        const available = models.map((m) => m.slug).join(", ");
+        const text = `Unknown model "${modelArg}". Available: ${available}`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+        return;
+      }
+      try {
+        session.setModel(slug);
+        updateSessionMetadata(contextKey, session);
+        const text = `Model set to ${slug}. It applies from the next turn in this context.`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      } catch (error) {
+        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+          fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        });
+      }
+      return;
+    }
+
     const currentModel = session.getInfo().model ?? "(default)";
     const modelButtons = models.map((model) => ({
-      label: `${model.displayName}${model.slug === currentModel ? " ✓" : ""}`,
+      label: `${formatModelButtonLabel(model.displayName)}${model.slug === currentModel ? " ✓" : ""}`,
       callbackData: `model_${model.slug}`,
     }));
     pendingModelButtons.set(contextKey, modelButtons);
@@ -1433,9 +1966,81 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     );
   });
 
+  bot.hears(/^model\s+(.+)/i, async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot change model while a prompt is running."), {
+        fallbackText: "Cannot change model while a prompt is running.",
+      });
+      return;
+    }
+
+    const modelArg = (ctx.match[1] ?? "").trim();
+    const models = session.listModels();
+    const slug = resolveModelSlug(modelArg, models);
+    if (!slug) {
+      const available = models.map((m) => m.slug).join(", ");
+      const text = `Unknown model "${modelArg}". Available: ${available}`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+    try {
+      session.setModel(slug);
+      updateSessionMetadata(contextKey, session);
+      const text = `Model set to ${slug}. It applies from the next turn in this context.`;
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  });
+
+  const setEffortFromCommand = async (ctx: Context, effortText: string): Promise<boolean> => {
+    const normalized = effortText.trim().toLowerCase();
+    const efforts: ModelReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
+    if (!efforts.includes(normalized as ModelReasoningEffort)) {
+      await safeReply(ctx, escapeHTML("Usage: /effort minimal|low|medium|high|xhigh"), {
+        fallbackText: "Usage: /effort minimal|low|medium|high|xhigh",
+      });
+      return true;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return true;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot change effort while a prompt is running."), {
+        fallbackText: "Cannot change effort while a prompt is running.",
+      });
+      return true;
+    }
+
+    session.setReasoningEffort(normalized as ModelReasoningEffort);
+    updateSessionMetadata(contextKey, session);
+    const text = `Reasoning effort set to ${normalized}. It applies from the next turn in this context.`;
+    await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+    return true;
+  };
+
   bot.command("effort", async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
+      return;
+    }
+
+    const rawText = ctx.message?.text ?? "";
+    const effortArg = rawText.replace(/^\/effort(?:@\w+)?\s*/i, "").trim();
+    if (effortArg) {
+      await setEffortFromCommand(ctx, effortArg);
       return;
     }
 
@@ -1460,6 +2065,31 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       fallbackText: text.replace(/<[^>]+>/g, ""),
       replyMarkup: keyboard,
     });
+  });
+
+  bot.hears(/^effort\s+(\S+)/i, async (ctx) => {
+    await setEffortFromCommand(ctx, ctx.match[1] ?? "");
+  });
+
+  bot.command([...NATIVE_CODEX_COMMANDS], async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const chatId = ctx.chat?.id;
+    const text = ctx.message?.text?.trim();
+    if (!chatId || !text) {
+      return;
+    }
+
+    if (isBusy(contextKey)) {
+      await sendBusyReply(ctx);
+      return;
+    }
+
+    startUserPrompt(ctx, contextKey, chatId, session, text, { setSuccessReaction: false });
   });
 
   bot.callbackQuery(NOOP_PAGE_CALLBACK_DATA, async (ctx) => {
@@ -1885,14 +2515,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const { contextKey, session } = contextSession;
+    if (/^\d+$/.test(userText) && pendingWorkspacePicks.has(contextKey)) {
+      await createNewThreadFromWorkspaceText(ctx, userText);
+      return;
+    }
+
+    if (isBusy(contextKey)) {
+      lastPromptInput.set(contextKey, userText);
+      await queuePromptReply(ctx, contextKey, ctx.chat.id, session, userText);
+      return;
+    }
+
     lastPromptInput.set(contextKey, userText);
     await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
-    }
+    startUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
@@ -1931,12 +2567,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      const preview = trimLine(transcript.replace(/\s+/g, " "), 100);
-      await safeReply(
-        ctx,
-        `🎙️ <b>Transcribed:</b> ${escapeHTML(preview)} <i>(via ${escapeHTML(result.backend)})</i>`,
-        { fallbackText: `🎙️ Transcribed: ${preview} (via ${result.backend})` },
-      );
+      // Forward voice notes as prompts without a separate transcription echo.
     } catch (error) {
       const note = "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.";
       await safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
@@ -1956,12 +2587,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     lastPromptInput.set(contextKey, transcript);
     await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, transcript);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
-    }
+    startUserPrompt(ctx, contextKey, chatId, session, transcript);
   });
 
   bot.on("message:photo", async (ctx) => {
@@ -2009,14 +2635,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       lastPromptInput.set(contextKey, caption);
     }
     await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
-    } finally {
-      await unlink(tempFilePath).catch(() => {});
-    }
+    startUserPrompt(ctx, contextKey, chatId, session, promptInput, {
+      onFinally: async () => {
+        await unlink(tempFilePath).catch(() => {});
+      },
+    });
   });
 
   bot.on("message:document", async (ctx) => {
@@ -2106,21 +2729,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await setReaction(ctx, "👀");
-    try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
-      await setReaction(ctx, "👍");
-    } catch {
-      await clearReaction(ctx);
-    } finally {
-      try {
-        await deliverArtifacts(ctx, chatId, outDir, parseContextKey(contextKey).messageThreadId);
-      } catch (artifactError) {
-        console.error("Failed to deliver artifacts:", artifactError);
-      } finally {
-        await cleanupInbox(workspace, turnId);
-        // TODO: prune old outbox turn folders by age or count to avoid unbounded growth
-      }
-    }
+    startUserPrompt(ctx, contextKey, chatId, session, promptInput, {
+      onFinally: async () => {
+        try {
+          await deliverArtifacts(ctx, chatId, outDir, parseContextKey(contextKey).messageThreadId);
+        } catch (artifactError) {
+          console.error("Failed to deliver artifacts:", artifactError);
+        } finally {
+          await cleanupInbox(workspace, turnId);
+          // TODO: prune old outbox turn folders by age or count to avoid unbounded growth
+        }
+      },
+    });
   });
 
   bot.catch((error) => {
@@ -2135,11 +2755,22 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
   await bot.api.setMyCommands([
     { command: "start", description: "Welcome & status" },
     { command: "help", description: "Command reference" },
-    { command: "new", description: "Start a new thread" },
+    { command: "new", description: "Start in current workspace" },
+    { command: "fork", description: "Start in current workspace" },
+    { command: "workspaces", description: "Choose workspace for new thread" },
+    { command: "newsummary", description: "Start a new thread from summary" },
     { command: "session", description: "Current thread details" },
+    { command: "status", description: "Current thread details" },
+    { command: "usage", description: "Codex limits & reset times" },
     { command: "sessions", description: "Browse & switch threads" },
+    { command: "history", description: "Show recent local thread history" },
+    { command: "use", description: "Switch to a thread by ID or latest" },
+    { command: "compact", description: "Ask Codex to compact this thread" },
+    { command: "clear", description: "Forget this Telegram context" },
+    { command: "copy", description: "Re-send last assistant reply" },
     { command: "retry", description: "Resend the last prompt" },
     { command: "abort", description: "Cancel current operation" },
+    { command: "stop", description: "Cancel current operation" },
     { command: "launch_profiles", description: "Select launch profile" },
     { command: "model", description: "View & change model" },
     { command: "effort", description: "Set reasoning effort" },
@@ -2438,18 +3069,49 @@ function splitMarkdownForTelegram(markdown: string): RenderedChunk[] {
   }
 
   const chunks: RenderedChunk[] = [];
-  let remaining = markdown;
+  const blocks = markdown.split(/(\n\s*\n)/);
+  let current = "";
 
-  while (remaining) {
-    const maxLength = Math.min(remaining.length, FORMATTED_CHUNK_TARGET);
-    const initialCut = findPreferredSplitIndex(remaining, maxLength);
-    const candidate = remaining.slice(0, initialCut) || remaining.slice(0, 1);
-    const rendered = renderMarkdownChunkWithinLimit(candidate);
+  const pushCurrent = (): void => {
+    const text = current.trim();
+    if (text) {
+      chunks.push(renderMarkdownChunkWithinLimit(text));
+    }
+    current = "";
+  };
 
-    chunks.push(rendered);
-    remaining = remaining.slice(rendered.sourceText.length).trimStart();
+  for (const block of blocks) {
+    if (!block) {
+      continue;
+    }
+
+    const candidate = current ? `${current}${block}` : block;
+    const renderedCandidate = formatMarkdownMessage(candidate.trim());
+    if (candidate.length <= FORMATTED_CHUNK_TARGET && renderedCandidate.text.length <= TELEGRAM_MESSAGE_LIMIT) {
+      current = candidate;
+      continue;
+    }
+
+    if (current.trim()) {
+      pushCurrent();
+    }
+
+    if (block.length > FORMATTED_CHUNK_TARGET || formatMarkdownMessage(block.trim()).text.length > TELEGRAM_MESSAGE_LIMIT) {
+      let remaining = block.trim();
+      while (remaining) {
+        const maxLength = Math.min(remaining.length, FORMATTED_CHUNK_TARGET);
+        const initialCut = findPreferredSplitIndex(remaining, maxLength);
+        const candidatePart = remaining.slice(0, initialCut) || remaining.slice(0, 1);
+        const rendered = renderMarkdownChunkWithinLimit(candidatePart);
+        chunks.push(rendered);
+        remaining = remaining.slice(rendered.sourceText.length).trimStart();
+      }
+    } else {
+      current = block;
+    }
   }
 
+  pushCurrent();
   return chunks;
 }
 
@@ -2544,8 +3206,103 @@ function trimLine(text: string, maxLength: number): string {
   return `${singleLine.slice(0, maxLength - 1)}…`;
 }
 
+function truncateForHistory(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return normalized.length <= 900 ? normalized : `${normalized.slice(0, 899)}â€¦`;
+}
+
 function getWorkspaceShortName(workspace: string): string {
   return workspace.split(/[\\/]/).filter(Boolean).pop() ?? workspace;
+}
+
+function renderWorkspaceSelectionMessage(workspaces: string[], currentWorkspace: string): { html: string; plain: string } {
+  const plainList = workspaces
+    .map((workspace, index) => {
+      const active = workspace === currentWorkspace ? " current" : "";
+      return `${index + 1}. ${getWorkspaceShortName(workspace)} - ${workspace}${active}`;
+    })
+    .join("\n");
+  const htmlList = workspaces
+    .map((workspace, index) => {
+      const active = workspace === currentWorkspace ? " <i>current</i>" : "";
+      return `${index + 1}. <code>${escapeHTML(getWorkspaceShortName(workspace))}</code> - ${escapeHTML(workspace)}${active}`;
+    })
+    .join("\n");
+
+  return {
+    html: `<b>Select workspace for new thread:</b>\nSend <code>/new 1</code>, <code>new 1</code>, or <code>workspace 1</code>.\n\n${htmlList}`,
+    plain: `Select workspace for new thread:\nSend /new 1, new 1, or workspace 1.\n\n${plainList}`,
+  };
+}
+
+function resolveWorkspaceArgument(raw: string, workspaces: string[]): string | null {
+  const value = raw.trim().replace(/^["']|["']$/g, "");
+  if (!value) {
+    return null;
+  }
+
+  const numeric = Number.parseInt(value, 10);
+  if (/^\d+$/.test(value)) {
+    return numeric >= 1 && numeric <= workspaces.length ? workspaces[numeric - 1] ?? null : null;
+  }
+
+  const lower = value.toLowerCase();
+  return (
+    workspaces.find((workspace) => workspace === value) ??
+    workspaces.find((workspace) => getWorkspaceShortName(workspace).toLowerCase() === lower) ??
+    value
+  );
+}
+
+function resolveSessionSelectionArgument(raw: string, pendingThreadIds?: string[]): string {
+  const value = raw.trim();
+  if (!value) {
+    return "";
+  }
+
+  const numeric = Number.parseInt(value, 10);
+  if (/^\d+$/.test(value) && pendingThreadIds && numeric >= 1 && numeric <= pendingThreadIds.length) {
+    return pendingThreadIds[numeric - 1] ?? value;
+  }
+
+  return value;
+}
+
+function formatModelButtonLabel(displayName: string): string {
+  return displayName.replace(/^GPT[- ]?/i, "").replace(/^gpt[- ]?/i, "");
+}
+
+function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName: string }>): string | null {
+  const value = raw.trim();
+  const normalized = normalizeModelName(value);
+
+  const direct = models.find(
+    (model) =>
+      normalizeModelName(model.slug) === normalized ||
+      normalizeModelName(model.displayName) === normalized,
+  );
+  if (direct) {
+    return direct.slug;
+  }
+
+  const withoutGpt = models.find((model) => normalizeModelName(formatModelButtonLabel(model.displayName)) === normalized);
+  if (withoutGpt) {
+    return withoutGpt.slug;
+  }
+
+  if (normalized === "mini") {
+    const mini = models.find((model) => model.slug.toLowerCase().includes("mini"));
+    if (mini) {
+      return mini.slug;
+    }
+  }
+
+  const dotted = models.find((model) => normalizeModelName(model.slug).endsWith(normalized));
+  return dotted?.slug ?? null;
+}
+
+function normalizeModelName(value: string): string {
+  return value.toLowerCase().replace(/^gpt[- ]?/, "").replace(/\s+/g, "-");
 }
 
 function formatRelativeTime(date: Date): string {

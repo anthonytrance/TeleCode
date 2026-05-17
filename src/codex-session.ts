@@ -12,6 +12,7 @@ import {
 import type { TeleCodexConfig } from "./config.js";
 import {
   getThread,
+  getThreadByPrefix,
   listModels,
   listThreads,
   listWorkspaces,
@@ -299,6 +300,7 @@ export class CodexSessionService {
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const effectiveModel = model ?? this.currentModel;
     this.thread = this.getCodex().startThread(this.buildThreadOptions(effectiveWorkspace, effectiveModel));
+    this.resetSessionTokens();
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = effectiveWorkspace;
     this.currentThreadId = this.thread.id ?? null;
@@ -315,6 +317,7 @@ export class CodexSessionService {
       threadId,
       this.buildThreadOptions(this.currentWorkspace, this.currentModel),
     );
+    this.resetSessionTokens();
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentThreadId = threadId;
     return this.getInfo();
@@ -323,14 +326,16 @@ export class CodexSessionService {
   async switchSession(threadId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("switch session");
 
-    const record = getThread(threadId);
+    const record = this.resolveThread(threadId);
+    const resolvedThreadId = record?.id ?? threadId;
     const workspace = record?.cwd ?? this.currentWorkspace;
     const model = record?.model || undefined;
 
-    this.thread = this.getCodex().resumeThread(threadId, this.buildThreadOptions(workspace, model));
+    this.thread = this.getCodex().resumeThread(resolvedThreadId, this.buildThreadOptions(workspace, model));
+    this.resetSessionTokens();
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = workspace;
-    this.currentThreadId = threadId;
+    this.currentThreadId = resolvedThreadId;
     if (model) {
       this.currentModel = model;
     }
@@ -350,12 +355,52 @@ export class CodexSessionService {
   }
 
   setModel(slug: string): string {
+    this.ensureIdle("change model");
     this.currentModel = slug;
+    if (this.currentThreadId) {
+      this.thread = this.getCodex().resumeThread(
+        this.currentThreadId,
+        this.buildThreadOptions(this.currentWorkspace, this.currentModel),
+      );
+    }
     return slug;
   }
 
+  async runText(input: CodexPromptInput): Promise<string> {
+    if (!this.thread) {
+      throw new Error("Codex thread is not initialized");
+    }
+
+    if (this.abortController) {
+      throw new Error("A Codex turn is already in progress");
+    }
+
+    const controller = new AbortController();
+    this.abortController = controller;
+    try {
+      const result = await this.thread.run(this.buildSdkInput(input), { signal: controller.signal });
+      if (result.usage) {
+        this.sessionTokens.input += result.usage.input_tokens;
+        this.sessionTokens.cached += result.usage.cached_input_tokens;
+        this.sessionTokens.output += result.usage.output_tokens;
+      }
+      return result.finalResponse;
+    } finally {
+      if (this.abortController === controller) {
+        this.abortController = null;
+      }
+    }
+  }
+
   setReasoningEffort(effort: ModelReasoningEffort): void {
+    this.ensureIdle("change reasoning effort");
     this.currentReasoningEffort = effort;
+    if (this.currentThreadId) {
+      this.thread = this.getCodex().resumeThread(
+        this.currentThreadId,
+        this.buildThreadOptions(this.currentWorkspace, this.currentModel),
+      );
+    }
   }
 
   setLaunchProfile(profileId: string): CodexLaunchProfile {
@@ -448,6 +493,19 @@ export class CodexSessionService {
     if (this.abortController) {
       throw new Error(`Cannot ${action} while a turn is in progress`);
     }
+  }
+
+  private resetSessionTokens(): void {
+    this.sessionTokens = { input: 0, cached: 0, output: 0 };
+  }
+
+  private resolveThread(threadIdOrPrefix: string): CodexThreadRecord | null {
+    const value = threadIdOrPrefix.trim();
+    if (value.toLowerCase() === "latest") {
+      return listThreads(1)[0] ?? null;
+    }
+
+    return getThread(value) ?? getThreadByPrefix(value);
   }
 
   private handleThreadEvent(event: ThreadEvent): void {

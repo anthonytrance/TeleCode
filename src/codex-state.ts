@@ -16,6 +16,12 @@ export interface CodexModelRecord {
   displayName: string;
 }
 
+export interface CodexHistoryMessage {
+  role: "user" | "assistant";
+  text: string;
+  timestamp?: Date;
+}
+
 export const FALLBACK_MODELS: CodexModelRecord[] = [
   { slug: "gpt-5.4", displayName: "GPT-5.4" },
   { slug: "gpt-5.4-mini", displayName: "GPT-5.4-Mini" },
@@ -112,6 +118,59 @@ export function getThread(id: string): CodexThreadRecord | null {
   );
 }
 
+export function getThreadByPrefix(idPrefix: string): CodexThreadRecord | null {
+  const normalized = idPrefix.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  return (
+    withDatabase((db) => {
+      const query = db.prepare(`
+        SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+        FROM threads
+        WHERE (archived = 0 OR archived IS NULL) AND id LIKE ?
+        ORDER BY updated_at DESC
+        LIMIT 2
+      `);
+
+      const rows = query.all(`${normalized}%`) as ThreadRow[];
+      return rows.length === 1 ? mapThreadRow(rows[0]!) : null;
+    }) ?? null
+  );
+}
+
+export function readThreadHistory(threadId: string, limit = 10): CodexHistoryMessage[] {
+  const sessionPath = findThreadSessionFile(threadId);
+  if (!sessionPath) {
+    return [];
+  }
+
+  const messages: CodexHistoryMessage[] = [];
+  try {
+    const lines = readFileSync(sessionPath, "utf8").split(/\r?\n/);
+    for (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+
+      const parsed = JSON.parse(line) as {
+        timestamp?: unknown;
+        type?: unknown;
+        payload?: unknown;
+      };
+      const message = extractHistoryMessage(parsed);
+      if (message) {
+        messages.push(message);
+      }
+    }
+  } catch {
+    return [];
+  }
+
+  return messages.slice(-Math.max(1, limit));
+}
+
 export function listWorkspaces(): string[] {
   return (
     withDatabase((db) => {
@@ -205,4 +264,98 @@ function getCodexDir(): string | null {
 function getModelsCachePath(): string | null {
   const codexDir = getCodexDir();
   return codexDir ? path.join(codexDir, "models_cache.json") : null;
+}
+
+function findThreadSessionFile(threadId: string): string | null {
+  const codexDir = getCodexDir();
+  if (!codexDir) {
+    return null;
+  }
+
+  const sessionsDir = path.join(codexDir, "sessions");
+  if (!existsSync(sessionsDir)) {
+    return null;
+  }
+
+  try {
+    const files = walkFiles(sessionsDir)
+      .filter((file) => file.endsWith(".jsonl") && path.basename(file).includes(threadId))
+      .map((file) => ({ file, modifiedAtMs: statSync(file).mtimeMs }))
+      .sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
+    return files[0]?.file ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function walkFiles(dir: string): string[] {
+  const results: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...walkFiles(fullPath));
+    } else if (entry.isFile()) {
+      results.push(fullPath);
+    }
+  }
+  return results;
+}
+
+function extractHistoryMessage(entry: {
+  timestamp?: unknown;
+  type?: unknown;
+  payload?: unknown;
+}): CodexHistoryMessage | null {
+  if (entry.type !== "response_item" || !entry.payload || typeof entry.payload !== "object") {
+    return null;
+  }
+
+  const payload = entry.payload as {
+    type?: unknown;
+    role?: unknown;
+    content?: unknown;
+  };
+  if (payload.type !== "message") {
+    return null;
+  }
+  if (payload.role !== "user" && payload.role !== "assistant") {
+    return null;
+  }
+
+  const text = extractContentText(payload.content).trim();
+  if (!text) {
+    return null;
+  }
+
+  return {
+    role: payload.role,
+    text,
+    timestamp: typeof entry.timestamp === "string" ? new Date(entry.timestamp) : undefined,
+  };
+}
+
+function extractContentText(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+      const record = item as { text?: unknown; input_text?: unknown };
+      if (typeof record.text === "string") {
+        return record.text;
+      }
+      if (typeof record.input_text === "string") {
+        return record.input_text;
+      }
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
 }

@@ -41,6 +41,7 @@ const mockState = vi.hoisted(() => {
     const thread = {
       id,
       options,
+      run: vi.fn().mockResolvedValue({ finalResponse: "", usage: undefined }),
       runStreamed: vi.fn().mockResolvedValue({ events: createEmptyEvents() }),
     };
     createdThreads.push(thread);
@@ -620,6 +621,104 @@ describe("CodexSessionService", () => {
       cached: 5,
       output: 20,
     });
+  });
+
+  it("resets session token totals when starting a new thread", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    thread.runStreamed.mockResolvedValueOnce({
+      events: streamEvents([{ type: "turn.completed", usage }]),
+    });
+
+    await service.prompt("first thread", callbacks);
+    expect(service.getInfo().sessionTokens).toEqual({
+      input: 1,
+      cached: 0,
+      output: 1,
+    });
+
+    const info = await service.newThread();
+
+    expect(info.sessionTokens).toBeUndefined();
+    expect(service.getInfo().sessionTokens).toBeUndefined();
+  });
+
+  it("counts only the seed turn after creating a new thread from a summary", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const oldThread = mockState.createdThreads[0];
+    const summaryUsage = {
+      input_tokens: 100,
+      cached_input_tokens: 80,
+      output_tokens: 20,
+    };
+    const seedUsage = {
+      input_tokens: 7,
+      cached_input_tokens: 4,
+      output_tokens: 2,
+    };
+
+    oldThread.run.mockResolvedValueOnce({
+      finalResponse: "handoff summary",
+      usage: summaryUsage,
+    });
+
+    const summary = await service.runText("summarize current thread");
+    expect(summary).toBe("handoff summary");
+    expect(service.getInfo().sessionTokens).toEqual({
+      input: 100,
+      cached: 80,
+      output: 20,
+    });
+
+    await service.newThread();
+    const newThread = mockState.createdThreads[1];
+    newThread.run.mockResolvedValueOnce({
+      finalResponse: "Summary loaded.",
+      usage: seedUsage,
+    });
+
+    await service.runText("seed new thread from summary");
+
+    expect(service.getInfo().sessionTokens).toEqual({
+      input: 7,
+      cached: 4,
+      output: 2,
+    });
+  });
+
+  it("resets session token totals when switching threads", async () => {
+    mockCodexState.getThread.mockReturnValue({
+      id: "thread-next",
+      title: "Next",
+      cwd: "/workspace/base",
+      model: "o3",
+      createdAt: new Date("2025-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2025-01-02T00:00:00.000Z"),
+      firstUserMessage: "hello",
+    });
+
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    thread.runStreamed.mockResolvedValueOnce({
+      events: streamEvents([{ type: "turn.completed", usage }]),
+    });
+
+    await service.prompt("first thread", callbacks);
+    expect(service.getInfo().sessionTokens).toEqual({
+      input: 1,
+      cached: 0,
+      output: 1,
+    });
+
+    const info = await service.switchSession("thread-next");
+
+    expect(info.threadId).toBe("thread-next");
+    expect(info.sessionTokens).toBeUndefined();
+    expect(service.getInfo().sessionTokens).toBeUndefined();
   });
 
   it("throws when the turn fails", async () => {

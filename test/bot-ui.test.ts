@@ -21,10 +21,14 @@ describe("bot-ui", () => {
       expect(plain).toContain("/launch_profiles");
     });
 
-    it("lists all 16 commands", () => {
+    it("lists the expanded command surface", () => {
       const { plain } = renderHelpMessage();
       const commandMatches = plain.match(/\/\w+/g) ?? [];
-      expect(commandMatches.length).toBe(16);
+      expect(commandMatches.length).toBeGreaterThanOrEqual(30);
+      expect(plain).toContain("/compact");
+      expect(plain).toContain("/history");
+      expect(plain).toContain("/clear");
+      expect(plain).toContain("/copy");
     });
 
     it("returns valid HTML with bold tags", () => {
