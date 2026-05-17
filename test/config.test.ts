@@ -24,6 +24,7 @@ describe("loadConfig", () => {
     delete process.env.CODEX_DEFAULT_LAUNCH_PROFILE;
     delete process.env.ENABLE_UNSAFE_LAUNCH_PROFILES;
     delete process.env.TOOL_VERBOSITY;
+    delete process.env.STREAM_ASSISTANT_TEXT;
     delete process.env.SHOW_TURN_TOKEN_USAGE;
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
@@ -99,6 +100,7 @@ describe("loadConfig", () => {
       defaultLaunchProfileId: "default",
       enableUnsafeLaunchProfiles: false,
       toolVerbosity: "all",
+      streamAssistantText: false,
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
@@ -315,6 +317,30 @@ describe("loadConfig", () => {
     delete process.env.SHOW_TURN_TOKEN_USAGE;
     const config = loadConfig();
     expect(config.showTurnTokenUsage).toBe(false);
+  });
+
+  it("parses STREAM_ASSISTANT_TEXT boolean values", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+
+    const truthyValues = ["true", "1", "yes"];
+    const falsyValues = ["false", "0", "no"];
+
+    for (const value of truthyValues) {
+      process.env.STREAM_ASSISTANT_TEXT = value;
+      const config = loadConfig();
+      expect(config.streamAssistantText).toBe(true);
+    }
+
+    for (const value of falsyValues) {
+      process.env.STREAM_ASSISTANT_TEXT = value;
+      const config = loadConfig();
+      expect(config.streamAssistantText).toBe(false);
+    }
+
+    delete process.env.STREAM_ASSISTANT_TEXT;
+    const config = loadConfig();
+    expect(config.streamAssistantText).toBe(false);
   });
 
   it("falls back to defaults for invalid optional enum values", () => {

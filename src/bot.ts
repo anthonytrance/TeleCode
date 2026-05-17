@@ -328,7 +328,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
-    const holdFinalResponse = shouldHoldFinalResponse(userInput);
+    const streamAssistantText = config.streamAssistantText && !shouldHoldFinalResponse(userInput);
 
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
@@ -647,12 +647,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
         pendingStreamText += delta;
-        if (!holdFinalResponse) {
+        if (streamAssistantText) {
           scheduleFlush();
         }
       },
       onToolStart: (toolName: string, toolCallId: string) => {
-        if (!holdFinalResponse && pendingStreamText.trim()) {
+        if (streamAssistantText && pendingStreamText.trim()) {
           void flushResponse(true).catch((error) => {
             console.error("Failed to flush assistant progress before tool start", error);
           });

@@ -29,6 +29,7 @@ export interface TeleCodexConfig {
   defaultLaunchProfileId: string;
   enableUnsafeLaunchProfiles: boolean;
   toolVerbosity: ToolVerbosity;
+  streamAssistantText: boolean;
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
@@ -60,6 +61,7 @@ export function loadConfig(): TeleCodexConfig {
     launchProfiles,
   );
   const toolVerbosity = parseToolVerbosity(optionalString(process.env.TOOL_VERBOSITY));
+  const streamAssistantText = parseBooleanEnv(optionalString(process.env.STREAM_ASSISTANT_TEXT), false);
   const showTurnTokenUsage = parseBooleanEnv(optionalString(process.env.SHOW_TURN_TOKEN_USAGE), false);
   const enableTelegramLogin = parseBooleanEnv(optionalString(process.env.ENABLE_TELEGRAM_LOGIN), true);
   const enableTelegramReactions = parseBooleanEnv(
@@ -81,6 +83,7 @@ export function loadConfig(): TeleCodexConfig {
     defaultLaunchProfileId,
     enableUnsafeLaunchProfiles,
     toolVerbosity,
+    streamAssistantText,
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
