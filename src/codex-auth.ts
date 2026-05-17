@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { platform } from "node:os";
 
 export interface AuthStatus {
   authenticated: boolean;
@@ -11,7 +12,8 @@ export interface LoginResult {
   message: string;
 }
 
-const CODEX_CLI = "codex";
+const CODEX_CLI = process.env.CODEX_CLI_PATH?.trim() || (platform() === "win32" ? "codex.cmd" : "codex");
+const IS_WINDOWS = platform() === "win32";
 const COMMAND_TIMEOUT_MS = 10_000;
 const AUTH_CACHE_TTL_MS = 30_000;
 
@@ -111,9 +113,12 @@ export async function startLogout(): Promise<LoginResult> {
 
 function runCodexCommand(args: string[]): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
+    const command = IS_WINDOWS ? process.env.ComSpec || "cmd.exe" : CODEX_CLI;
+    const commandArgs = IS_WINDOWS ? ["/d", "/s", "/c", CODEX_CLI, ...args] : args;
+
     execFile(
-      CODEX_CLI,
-      args,
+      command,
+      commandArgs,
       {
         timeout: COMMAND_TIMEOUT_MS,
         env: { ...process.env },

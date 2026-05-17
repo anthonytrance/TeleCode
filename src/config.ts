@@ -89,10 +89,16 @@ export function loadConfig(): TeleCodexConfig {
 
 /**
  * Workspace is derived automatically:
+ * - CODEX_WORKSPACE when set
  * - In Docker: /workspace (the mount point)
  * - Outside Docker: process.cwd()
  */
 function resolveWorkspace(): string {
+  const configuredWorkspace = optionalString(process.env.CODEX_WORKSPACE);
+  if (configuredWorkspace) {
+    return path.resolve(configuredWorkspace);
+  }
+
   if (isRunningInDocker()) {
     return "/workspace";
   }

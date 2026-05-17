@@ -17,6 +17,7 @@ describe("loadConfig", () => {
     delete process.env.TELEGRAM_ALLOWED_USER_IDS;
     delete process.env.CODEX_API_KEY;
     delete process.env.CODEX_MODEL;
+    delete process.env.CODEX_WORKSPACE;
     delete process.env.CODEX_SANDBOX_MODE;
     delete process.env.CODEX_APPROVAL_POLICY;
     delete process.env.CODEX_LAUNCH_PROFILES_JSON;
@@ -221,6 +222,17 @@ describe("loadConfig", () => {
     const config = loadConfig();
 
     expect(config.workspace).toBe("/workspace");
+  });
+
+  it("uses CODEX_WORKSPACE when configured", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CODEX_WORKSPACE = path.join(tempDir, "workspace");
+    process.env.container = "docker";
+
+    const config = loadConfig();
+
+    expect(config.workspace).toBe(path.join(tempDir, "workspace"));
   });
 
   it("parses MAX_FILE_SIZE when configured", () => {
