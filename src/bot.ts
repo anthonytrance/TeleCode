@@ -328,6 +328,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
+    const holdFinalResponse = shouldHoldFinalResponse(userInput);
 
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
@@ -599,6 +600,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     };
 
+    const deliverFinalMarkdown = async (markdown: string): Promise<void> => {
+      await deliverRenderedChunks(splitMarkdownForTelegram(markdown));
+    };
+
     const finalizeResponse = async (): Promise<void> => {
       if (finalized) {
         return;
@@ -619,7 +624,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const finalUndeliveredText = buildFinalResponseText(pendingStreamText);
       if (finalUndeliveredText) {
         pendingStreamText = "";
-        await deliverRenderedChunks(splitMarkdownForTelegram(finalUndeliveredText));
+        await deliverFinalMarkdown(finalUndeliveredText);
         sentResponseText = true;
       }
 
@@ -642,10 +647,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
         pendingStreamText += delta;
-        scheduleFlush();
+        if (!holdFinalResponse) {
+          scheduleFlush();
+        }
       },
       onToolStart: (toolName: string, toolCallId: string) => {
-        if (pendingStreamText.trim()) {
+        if (!holdFinalResponse && pendingStreamText.trim()) {
           void flushResponse(true).catch((error) => {
             console.error("Failed to flush assistant progress before tool start", error);
           });
@@ -827,9 +834,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         finalized = true;
 
         const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
-        const chunks = splitMarkdownForTelegram(combinedText);
         try {
-          await deliverRenderedChunks(chunks);
+          await deliverFinalMarkdown(combinedText);
         } catch (telegramError) {
           console.error("Failed to send error message to Telegram:", telegramError);
         }
@@ -3087,7 +3093,7 @@ function splitMarkdownForTelegram(markdown: string): RenderedChunk[] {
 
     const candidate = current ? `${current}${block}` : block;
     const renderedCandidate = formatMarkdownMessage(candidate.trim());
-    if (candidate.length <= FORMATTED_CHUNK_TARGET && renderedCandidate.text.length <= TELEGRAM_MESSAGE_LIMIT) {
+    if (candidate.length <= TELEGRAM_MESSAGE_LIMIT && renderedCandidate.text.length <= TELEGRAM_MESSAGE_LIMIT) {
       current = candidate;
       continue;
     }
@@ -3096,7 +3102,7 @@ function splitMarkdownForTelegram(markdown: string): RenderedChunk[] {
       pushCurrent();
     }
 
-    if (block.length > FORMATTED_CHUNK_TARGET || formatMarkdownMessage(block.trim()).text.length > TELEGRAM_MESSAGE_LIMIT) {
+    if (block.length > TELEGRAM_MESSAGE_LIMIT || formatMarkdownMessage(block.trim()).text.length > TELEGRAM_MESSAGE_LIMIT) {
       let remaining = block.trim();
       while (remaining) {
         const maxLength = Math.min(remaining.length, FORMATTED_CHUNK_TARGET);
@@ -3113,6 +3119,28 @@ function splitMarkdownForTelegram(markdown: string): RenderedChunk[] {
 
   pushCurrent();
   return chunks;
+}
+
+function shouldHoldFinalResponse(input: CodexPromptInput): boolean {
+  const text = getPromptText(input).toLowerCase();
+  if (!text) {
+    return false;
+  }
+
+  return (
+    /\bhand[-\s]?off\b/.test(text) ||
+    /\b(single|one)\s+(telegram\s+)?message\b/.test(text) ||
+    /\b(do not|don't|dont)\s+split\b/.test(text) ||
+    /\b(no\s+split|one\s+piece)\b/.test(text)
+  );
+}
+
+function getPromptText(input: CodexPromptInput): string {
+  if (typeof input === "string") {
+    return input;
+  }
+
+  return [input.text, input.stagedFileInstructions].filter((part): part is string => Boolean(part)).join("\n");
 }
 
 function renderMarkdownChunkWithinLimit(markdown: string): RenderedChunk {
