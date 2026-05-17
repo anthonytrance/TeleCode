@@ -227,6 +227,22 @@ describe("SessionRegistry", () => {
     );
   });
 
+  it("stores progress delivery per context without replacing the active session", async () => {
+    const registry = new SessionRegistry(createConfig());
+    const session = await registry.getOrCreate("123");
+
+    registry.setProgressDelivery("123", "edit");
+
+    expect(session.dispose).not.toHaveBeenCalled();
+    expect(registry.has("123")).toBe(true);
+    expect(registry.getProgressDelivery("123")).toBe("edit");
+    expect(registry.listContexts()[0]).toMatchObject({
+      contextKey: "123",
+      backend: "sdk",
+      progressDelivery: "edit",
+    });
+  });
+
   it("removing one topic context does not affect another in the same chat", async () => {
     const registry = new SessionRegistry(createConfig());
 

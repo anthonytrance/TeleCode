@@ -42,7 +42,7 @@ import {
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
 import { getThread, getThreadByPrefix, readThreadHistory } from "./codex-state.js";
-import type { CodexBackend, TeleCodexConfig, ToolVerbosity } from "./config.js";
+import type { CodexBackend, ProgressDelivery, TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
@@ -349,6 +349,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
+    const progressDelivery = registry.getProgressDelivery(contextKey);
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
     let accumulatedText = "";
@@ -575,7 +576,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const sendProgressUpdate = async (rendered: RenderedText): Promise<void> => {
-      if (finalized || config.progressDelivery === "none" || rendered.text === lastProgressText) {
+      if (finalized || progressDelivery === "none" || rendered.text === lastProgressText) {
         return;
       }
 
@@ -606,7 +607,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       progressUpdateInFlight = true;
       try {
         stopTyping();
-        if (config.progressDelivery === "messages") {
+        if (progressDelivery === "messages") {
           await sendTextMessage(bot.api, chatId, rendered.text, {
             parseMode: rendered.parseMode,
             fallbackText: rendered.fallbackText,
@@ -644,7 +645,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const noteSummaryProgress = (toolName: string): void => {
-      if (toolVerbosity !== "summary" || config.progressDelivery === "none") {
+      if (toolVerbosity !== "summary" || progressDelivery === "none") {
         return;
       }
 
@@ -725,7 +726,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const finalUndeliveredText = buildFinalResponseText(pendingStreamText);
       if (finalUndeliveredText) {
         pendingStreamText = "";
-        if (config.progressDelivery === "edit" && responseMessageId && !sentResponseText) {
+        if (progressDelivery === "edit" && responseMessageId && !sentResponseText) {
           const completed = renderProgressCompletedMessage();
           await safeEditMessage(bot, chatId, responseMessageId, completed.text, {
             parseMode: completed.parseMode,
@@ -1754,6 +1755,46 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       requestedBackend === "app-server"
         ? "Backend for this Telegram context is now app-server. The next prompt will resume the same stored thread through the observer protocol. Use /backend sdk to switch back."
         : "Backend for this Telegram context is now sdk. The next prompt will use a fresh SDK session wrapper.";
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+  });
+
+  bot.command(["velocity", "progress"], async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+
+    const rawMode = getCommandArgument(ctx);
+    if (!rawMode) {
+      const current = registry.getProgressDelivery(contextKey);
+      const plain = [
+        `Progress velocity for this Telegram context: ${current}`,
+        "",
+        "Use /velocity messages for separate progress messages.",
+        "Use /velocity edit for one edited progress message.",
+        "Use /velocity none for final answers only.",
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      return;
+    }
+
+    const requested = resolveVelocityArgument(rawMode);
+    if (!requested) {
+      await safeReply(ctx, escapeHTML("Usage: /velocity messages, /velocity edit, or /velocity none"), {
+        fallbackText: "Usage: /velocity messages, /velocity edit, or /velocity none",
+      });
+      return;
+    }
+
+    registry.setProgressDelivery(contextKey, requested);
+    const plain = [
+      `Progress velocity set to ${requested}.`,
+      requested === "messages"
+        ? "I will send separate progress messages and keep the final answer clean."
+        : requested === "edit"
+          ? "I will keep one progress message updated, then send the final answer separately."
+          : "I will send only the final answer unless there is an error.",
+    ].join("\n");
     await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
   });
 
@@ -3189,6 +3230,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "status", description: "Current thread details" },
     { command: "usage", description: "Codex limits & reset times" },
     { command: "backend", description: "Show or reset backend" },
+    { command: "velocity", description: "Set progress delivery" },
     { command: "appserver", description: "Probe Codex app-server" },
     { command: "appserverturn", description: "Run isolated app-server turn" },
     { command: "appserversteer", description: "Run isolated app-server steer test" },
@@ -3921,6 +3963,27 @@ function resolveBackendArgument(raw: string): CodexBackend | null {
     case "app-server":
     case "observer":
       return "app-server";
+    default:
+      return null;
+  }
+}
+
+function resolveVelocityArgument(raw: string): ProgressDelivery | null {
+  const normalized = raw.trim().toLowerCase().replace(/_/g, "-");
+  switch (normalized) {
+    case "none":
+    case "off":
+    case "quiet":
+      return "none";
+    case "message":
+    case "messages":
+    case "chat":
+    case "normal":
+      return "messages";
+    case "edit":
+    case "edited":
+    case "single":
+      return "edit";
     default:
       return null;
   }
