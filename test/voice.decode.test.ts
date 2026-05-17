@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 type FakeChildProcess = EventEmitter & {
   stdout: EventEmitter;
@@ -22,11 +22,22 @@ async function importVoiceWithSpawn(spawnMock: ReturnType<typeof createSpawnMock
   return await import("../src/voice.js");
 }
 
+const originalFasterWhisperPython = process.env.FASTER_WHISPER_PYTHON;
+
+beforeEach(() => {
+  process.env.FASTER_WHISPER_PYTHON = "Z:\\missing-python.exe";
+});
+
 afterEach(() => {
   vi.doUnmock("node:child_process");
   vi.resetModules();
   vi.unstubAllGlobals();
   delete process.env.OPENAI_API_KEY;
+  if (originalFasterWhisperPython === undefined) {
+    delete process.env.FASTER_WHISPER_PYTHON;
+  } else {
+    process.env.FASTER_WHISPER_PYTHON = originalFasterWhisperPython;
+  }
 });
 
 describe("voice decoding", () => {
@@ -119,6 +130,6 @@ describe("voice decoding", () => {
       },
     }));
 
-    await expect(voice.transcribeAudio("/tmp/missing.ogg")).rejects.toThrow("brew install ffmpeg");
+    await expect(voice.transcribeAudio("/tmp/missing.ogg")).rejects.toThrow("winget install Gyan.FFmpeg");
   });
 });

@@ -13,6 +13,7 @@ import {
 
 describe("voice transcription", () => {
   const originalOpenAIKey = process.env.OPENAI_API_KEY;
+  const originalFasterWhisperPython = process.env.FASTER_WHISPER_PYTHON;
   let tempDir: string;
   let audioPath: string;
 
@@ -21,6 +22,7 @@ describe("voice transcription", () => {
     audioPath = path.join(tempDir, "sample.ogg");
     writeFileSync(audioPath, Buffer.from("audio"));
     delete process.env.OPENAI_API_KEY;
+    process.env.FASTER_WHISPER_PYTHON = path.join(tempDir, "missing-python.exe");
     _resetImportHook();
     vi.unstubAllGlobals();
   });
@@ -33,6 +35,11 @@ describe("voice transcription", () => {
       delete process.env.OPENAI_API_KEY;
     } else {
       process.env.OPENAI_API_KEY = originalOpenAIKey;
+    }
+    if (originalFasterWhisperPython === undefined) {
+      delete process.env.FASTER_WHISPER_PYTHON;
+    } else {
+      process.env.FASTER_WHISPER_PYTHON = originalFasterWhisperPython;
     }
   });
 
@@ -99,7 +106,7 @@ describe("voice transcription", () => {
 
     await expect(transcribeAudio(audioPath)).rejects.toThrow("Voice messages require a transcription backend.");
     await expect(transcribeAudio(audioPath)).rejects.toThrow("npm install parakeet-coreml");
-    await expect(transcribeAudio(audioPath)).rejects.toThrow("brew install ffmpeg");
+    await expect(transcribeAudio(audioPath)).rejects.toThrow("faster-whisper");
     await expect(transcribeAudio(audioPath)).rejects.toThrow("OPENAI_API_KEY=sk-");
   });
 

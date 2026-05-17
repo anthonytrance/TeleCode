@@ -1,15 +1,16 @@
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 
 export interface TranscriptionResult {
   text: string;
-  backend: "parakeet" | "openai";
+  backend: "faster-whisper" | "parakeet" | "openai";
   durationMs: number;
 }
 
-export type TranscriptionBackend = "parakeet" | "openai";
+export type TranscriptionBackend = "faster-whisper" | "parakeet" | "openai";
 
 // Minimal interface for the parakeet-coreml engine instance.
 interface ParakeetEngine {
@@ -18,14 +19,18 @@ interface ParakeetEngine {
 }
 
 const PARAKEET_SPECIFIER = "parakeet-coreml";
-const FFMPEG_INSTALL_MESSAGE = "ffmpeg not found. Install it with: brew install ffmpeg";
+const FFMPEG_INSTALL_MESSAGE = "ffmpeg not found. Install it with winget install Gyan.FFmpeg";
 const NO_BACKEND_ERROR = `Voice messages require a transcription backend.
 
-Option 1: Install Parakeet for local transcription (free, private, ~1.5GB download):
-  npm install parakeet-coreml
-Also requires ffmpeg: brew install ffmpeg
+Option 1: Use a faster-whisper Python environment:
+  FASTER_WHISPER_PYTHON=/path/to/python
+  FASTER_WHISPER_MODEL=tiny
 
-Option 2: Set OPENAI_API_KEY for cloud transcription (~$0.006/min):
+Option 2: Install Parakeet for local transcription (free, private, ~1.5GB download):
+  npm install parakeet-coreml
+Also requires ffmpeg.
+
+Option 3: Set OPENAI_API_KEY for cloud transcription (~$0.006/min):
   Add OPENAI_API_KEY=sk-... to your .env file`;
 
 const _require = createRequire(import.meta.url);
@@ -48,6 +53,10 @@ export function _resetImportHook(): void {
 }
 
 export async function transcribeAudio(filePath: string): Promise<TranscriptionResult> {
+  if (hasFasterWhisper()) {
+    return await transcribeWithFasterWhisper(filePath);
+  }
+
   try {
     const parakeetMod = await _importModule(PARAKEET_SPECIFIER);
     return await transcribeWithParakeet(filePath, parakeetMod);
@@ -67,6 +76,10 @@ export async function transcribeAudio(filePath: string): Promise<TranscriptionRe
 export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
   const backends: TranscriptionBackend[] = [];
 
+  if (hasFasterWhisper()) {
+    backends.push("faster-whisper");
+  }
+
   try {
     await _importModule(PARAKEET_SPECIFIER);
     backends.push("parakeet");
@@ -79,6 +92,63 @@ export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
   }
 
   return backends;
+}
+
+function hasFasterWhisper(): boolean {
+  const pythonPath = process.env.FASTER_WHISPER_PYTHON?.trim();
+  return Boolean(pythonPath && existsSync(pythonPath));
+}
+
+function transcribeWithFasterWhisper(filePath: string): Promise<TranscriptionResult> {
+  const startedAt = Date.now();
+  const pythonPath = process.env.FASTER_WHISPER_PYTHON?.trim();
+  if (!pythonPath) {
+    throw new Error("FASTER_WHISPER_PYTHON is not configured");
+  }
+  const modelName = process.env.FASTER_WHISPER_MODEL?.trim() || "tiny";
+  const script = [
+    "from faster_whisper import WhisperModel",
+    "import sys",
+    "audio_path = sys.argv[1]",
+    "model_name = sys.argv[2]",
+    "model = WhisperModel(model_name, device='cpu', compute_type='int8')",
+    "segments, info = model.transcribe(audio_path)",
+    "print(' '.join(segment.text.strip() for segment in segments if segment.text).strip())",
+  ].join("\n");
+
+  return new Promise<TranscriptionResult>((resolve, reject) => {
+    const child = spawn(pythonPath, ["-c", script, filePath, modelName], {
+      env: {
+        ...process.env,
+        PYTHONUTF8: "1",
+        PYTHONIOENCODING: "utf-8",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      if (code !== 0) {
+        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+        reject(new Error(`faster-whisper failed: ${stderr || signal || `exit code ${code}`}`));
+        return;
+      }
+
+      resolve({
+        text: Buffer.concat(stdoutChunks).toString("utf8").trim(),
+        backend: "faster-whisper",
+        durationMs: Date.now() - startedAt,
+      });
+    });
+  });
 }
 
 async function transcribeWithParakeet(filePath: string, parakeetMod: unknown): Promise<TranscriptionResult> {
