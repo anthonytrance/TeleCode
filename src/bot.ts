@@ -575,7 +575,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const sendProgressUpdate = async (rendered: RenderedText): Promise<void> => {
-      if (finalized || rendered.text === lastProgressText) {
+      if (finalized || config.progressDelivery === "none" || rendered.text === lastProgressText) {
         return;
       }
 
@@ -585,7 +585,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
 
       const now = Date.now();
-      if (responseMessageId && now - lastProgressEditAt < SUMMARY_PROGRESS_UPDATE_MIN_MS) {
+      if (lastProgressEditAt && now - lastProgressEditAt < SUMMARY_PROGRESS_UPDATE_MIN_MS) {
         pendingProgress = rendered;
         if (!progressTimer) {
           const delay = Math.max(0, SUMMARY_PROGRESS_UPDATE_MIN_MS - (now - lastProgressEditAt));
@@ -606,7 +606,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       progressUpdateInFlight = true;
       try {
         stopTyping();
-        if (!responseMessageId) {
+        if (config.progressDelivery === "messages") {
+          await sendTextMessage(bot.api, chatId, rendered.text, {
+            parseMode: rendered.parseMode,
+            fallbackText: rendered.fallbackText,
+            messageThreadId,
+          });
+        } else if (!responseMessageId) {
           const message = await sendTextMessage(bot.api, chatId, rendered.text, {
             parseMode: rendered.parseMode,
             fallbackText: rendered.fallbackText,
@@ -638,7 +644,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const noteSummaryProgress = (toolName: string): void => {
-      if (toolVerbosity !== "summary") {
+      if (toolVerbosity !== "summary" || config.progressDelivery === "none") {
         return;
       }
 
@@ -719,7 +725,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const finalUndeliveredText = buildFinalResponseText(pendingStreamText);
       if (finalUndeliveredText) {
         pendingStreamText = "";
-        if (responseMessageId && !sentResponseText) {
+        if (config.progressDelivery === "edit" && responseMessageId && !sentResponseText) {
           const completed = renderProgressCompletedMessage();
           await safeEditMessage(bot, chatId, responseMessageId, completed.text, {
             parseMode: completed.parseMode,
@@ -1684,10 +1690,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const plain = [
         `Backend for this Telegram context: ${current}`,
         "",
-        "Available now: sdk",
-        "Reserved for later: app-server",
+        "Available: sdk, app-server",
         "",
         "Use /backend sdk to force the safe SDK backend.",
+        "Use /backend appserver confirm to try the observer backend in this context.",
       ].join("\n");
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
@@ -1695,18 +1701,46 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const requestedBackend = resolveBackendArgument(rawBackend);
     if (!requestedBackend) {
-      await safeReply(ctx, escapeHTML("Usage: /backend sdk"), { fallbackText: "Usage: /backend sdk" });
+      await safeReply(ctx, escapeHTML("Usage: /backend sdk or /backend appserver confirm"), {
+        fallbackText: "Usage: /backend sdk or /backend appserver confirm",
+      });
+      return;
+    }
+
+    const activeSession = registry.get(contextKey);
+    if (activeSession?.isProcessing()) {
+      await safeReply(ctx, escapeHTML("Cannot switch backend while a prompt is running. Use /abort first if it is stuck."), {
+        fallbackText: "Cannot switch backend while a prompt is running. Use /abort first if it is stuck.",
+      });
+      return;
+    }
+
+    const confirmed = /\bconfirm\b/i.test(rawBackend);
+    if (requestedBackend === "app-server" && !confirmed) {
+      const plain = [
+        "App-server backend switching is experimental.",
+        "Run /backend appserver confirm to switch this Telegram context.",
+        "Use /backend sdk to switch this context back.",
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
     }
 
     if (requestedBackend === "app-server") {
-      const plain = [
-        "App-server backend switching is not enabled yet.",
-        "Use /appserver to run the probe.",
-        "Use /backend sdk as the fallback command once app-server turns are enabled.",
-      ].join("\n");
-      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
-      return;
+      await safeReply(ctx, escapeHTML("Checking app-server before switching..."), {
+        fallbackText: "Checking app-server before switching...",
+      });
+      const probe = await probeCodexAppServer(config);
+      if (!probe.ok) {
+        const plain = [
+          "App-server probe failed. Backend was not changed.",
+          `Error: ${probe.error}`,
+          "",
+          "Use /backend sdk to stay on the safe backend.",
+        ].join("\n");
+        await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+        return;
+      }
     }
 
     registry.setBackend(contextKey, requestedBackend);
@@ -1716,7 +1750,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     busyState.switching = false;
     busyState.transcribing = false;
 
-    const plain = "Backend for this Telegram context is now sdk. The next prompt will use a fresh SDK session wrapper.";
+    const plain =
+      requestedBackend === "app-server"
+        ? "Backend for this Telegram context is now app-server. The next prompt will resume the same stored thread through the observer protocol. Use /backend sdk to switch back."
+        : "Backend for this Telegram context is now sdk. The next prompt will use a fresh SDK session wrapper.";
     await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
   });
 
@@ -3875,7 +3912,7 @@ function getCommandArgument(ctx: Context): string {
 }
 
 function resolveBackendArgument(raw: string): CodexBackend | null {
-  const normalized = raw.trim().toLowerCase().replace(/_/g, "-");
+  const normalized = raw.trim().toLowerCase().replace(/_/g, "-").replace(/\bconfirm\b/g, "").trim();
   switch (normalized) {
     case "sdk":
     case "safe":

@@ -27,6 +27,7 @@ describe("loadConfig", () => {
     delete process.env.ENABLE_UNSAFE_LAUNCH_PROFILES;
     delete process.env.TOOL_VERBOSITY;
     delete process.env.STREAM_ASSISTANT_TEXT;
+    delete process.env.PROGRESS_DELIVERY;
     delete process.env.SHOW_TURN_TOKEN_USAGE;
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
@@ -105,6 +106,7 @@ describe("loadConfig", () => {
       enableUnsafeLaunchProfiles: false,
       toolVerbosity: "all",
       streamAssistantText: false,
+      progressDelivery: "messages",
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
@@ -150,6 +152,7 @@ describe("loadConfig", () => {
     expect(config.defaultLaunchProfileId).toBe("default");
     expect(config.enableUnsafeLaunchProfiles).toBe(false);
     expect(config.toolVerbosity).toBe("summary");
+    expect(config.progressDelivery).toBe("messages");
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
@@ -349,6 +352,26 @@ describe("loadConfig", () => {
     expect(config.streamAssistantText).toBe(false);
   });
 
+  it("parses PROGRESS_DELIVERY values", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+
+    process.env.PROGRESS_DELIVERY = "none";
+    expect(loadConfig().progressDelivery).toBe("none");
+
+    process.env.PROGRESS_DELIVERY = "message";
+    expect(loadConfig().progressDelivery).toBe("messages");
+
+    process.env.PROGRESS_DELIVERY = "messages";
+    expect(loadConfig().progressDelivery).toBe("messages");
+
+    process.env.PROGRESS_DELIVERY = "edit";
+    expect(loadConfig().progressDelivery).toBe("edit");
+
+    process.env.PROGRESS_DELIVERY = "edited";
+    expect(loadConfig().progressDelivery).toBe("edit");
+  });
+
   it("parses CODEX_BACKEND and CODEX_APP_SERVER_PATH", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
@@ -369,6 +392,7 @@ describe("loadConfig", () => {
     process.env.CODEX_SANDBOX_MODE = "unsafe";
     process.env.CODEX_APPROVAL_POLICY = "sometimes";
     process.env.TOOL_VERBOSITY = "loud";
+    process.env.PROGRESS_DELIVERY = "loud";
     process.env.MAX_FILE_SIZE = "nope";
 
     const config = loadConfig();
@@ -377,8 +401,9 @@ describe("loadConfig", () => {
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
     expect(config.toolVerbosity).toBe("summary");
+    expect(config.progressDelivery).toBe("messages");
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
-    expect(warnSpy).toHaveBeenCalledTimes(5);
+    expect(warnSpy).toHaveBeenCalledTimes(6);
   });
 
   it("parses explicit launch profiles and default selection", () => {

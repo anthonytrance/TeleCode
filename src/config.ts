@@ -14,6 +14,7 @@ import {
 } from "./codex-launch.js";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
+export type ProgressDelivery = "none" | "messages" | "edit";
 export type CodexBackend = "sdk" | "app-server";
 
 export interface TeleCodexConfig {
@@ -33,6 +34,7 @@ export interface TeleCodexConfig {
   enableUnsafeLaunchProfiles: boolean;
   toolVerbosity: ToolVerbosity;
   streamAssistantText: boolean;
+  progressDelivery: ProgressDelivery;
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
@@ -67,6 +69,7 @@ export function loadConfig(): TeleCodexConfig {
   );
   const toolVerbosity = parseToolVerbosity(optionalString(process.env.TOOL_VERBOSITY));
   const streamAssistantText = parseBooleanEnv(optionalString(process.env.STREAM_ASSISTANT_TEXT), false);
+  const progressDelivery = parseProgressDelivery(optionalString(process.env.PROGRESS_DELIVERY));
   const showTurnTokenUsage = parseBooleanEnv(optionalString(process.env.SHOW_TURN_TOKEN_USAGE), false);
   const enableTelegramLogin = parseBooleanEnv(optionalString(process.env.ENABLE_TELEGRAM_LOGIN), true);
   const enableTelegramReactions = parseBooleanEnv(
@@ -91,6 +94,7 @@ export function loadConfig(): TeleCodexConfig {
     enableUnsafeLaunchProfiles,
     toolVerbosity,
     streamAssistantText,
+    progressDelivery,
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
@@ -265,6 +269,29 @@ function parseToolVerbosity(raw: string | undefined): ToolVerbosity {
         `Invalid TOOL_VERBOSITY value: "${raw}". Expected one of: all, summary, errors-only, none. Falling back to "summary".`,
       );
       return "summary";
+  }
+}
+
+function parseProgressDelivery(raw: string | undefined): ProgressDelivery {
+  if (!raw) {
+    return "messages";
+  }
+
+  switch (raw.toLowerCase()) {
+    case "none":
+    case "off":
+      return "none";
+    case "message":
+    case "messages":
+      return "messages";
+    case "edit":
+    case "edited":
+      return "edit";
+    default:
+      console.warn(
+        `Invalid PROGRESS_DELIVERY value: "${raw}". Expected one of: none, messages, edit. Falling back to "messages".`,
+      );
+      return "messages";
   }
 }
 

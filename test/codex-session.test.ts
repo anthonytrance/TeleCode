@@ -120,6 +120,8 @@ describe("CodexSessionService", () => {
     defaultLaunchProfileId: "default",
     enableUnsafeLaunchProfiles: false,
     toolVerbosity: "summary",
+    streamAssistantText: false,
+    progressDelivery: "messages",
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,

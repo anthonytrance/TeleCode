@@ -331,6 +331,7 @@ function createConfig(): TeleCodexConfig {
     enableUnsafeLaunchProfiles: false,
     toolVerbosity: "summary",
     streamAssistantText: false,
+    progressDelivery: "messages",
     showTurnTokenUsage: false,
     enableTelegramLogin: true,
     enableTelegramReactions: false,
