@@ -54,6 +54,7 @@ const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const FIRST_INTERMEDIATE_UPDATE_MS = 2500;
 const INTERMEDIATE_UPDATE_MIN_MS = 30000;
+const SUMMARY_PROGRESS_UPDATE_MIN_MS = 5000;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
@@ -358,6 +359,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let lastRenderedText = "";
     let lastEditAt = Date.now();
     let flushTimer: NodeJS.Timeout | undefined;
+    let progressTimer: NodeJS.Timeout | undefined;
+    let lastProgressEditAt = 0;
+    let lastProgressText = "";
+    let progressUpdateInFlight = false;
+    let pendingProgress: RenderedText | undefined;
     let isFlushing = false;
     let flushPending = false;
     let finalized = false;
@@ -387,6 +393,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       if (flushTimer) {
         clearTimeout(flushTimer);
         flushTimer = undefined;
+      }
+    };
+
+    const clearProgressTimer = (): void => {
+      if (progressTimer) {
+        clearTimeout(progressTimer);
+        progressTimer = undefined;
       }
     };
 
@@ -561,6 +574,79 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }, delay);
     };
 
+    const sendProgressUpdate = async (rendered: RenderedText): Promise<void> => {
+      if (finalized || rendered.text === lastProgressText) {
+        return;
+      }
+
+      if (progressUpdateInFlight) {
+        pendingProgress = rendered;
+        return;
+      }
+
+      const now = Date.now();
+      if (responseMessageId && now - lastProgressEditAt < SUMMARY_PROGRESS_UPDATE_MIN_MS) {
+        pendingProgress = rendered;
+        if (!progressTimer) {
+          const delay = Math.max(0, SUMMARY_PROGRESS_UPDATE_MIN_MS - (now - lastProgressEditAt));
+          progressTimer = setTimeout(() => {
+            progressTimer = undefined;
+            const next = pendingProgress;
+            pendingProgress = undefined;
+            if (next) {
+              void sendProgressUpdate(next).catch((error) => {
+                console.error("Failed to send progress update", error);
+              });
+            }
+          }, delay);
+        }
+        return;
+      }
+
+      progressUpdateInFlight = true;
+      try {
+        stopTyping();
+        if (!responseMessageId) {
+          const message = await sendTextMessage(bot.api, chatId, rendered.text, {
+            parseMode: rendered.parseMode,
+            fallbackText: rendered.fallbackText,
+            replyMarkup: abortKeyboard,
+            messageThreadId,
+          });
+          responseMessageId = message.message_id;
+        } else {
+          await safeEditMessage(bot, chatId, responseMessageId, rendered.text, {
+            parseMode: rendered.parseMode,
+            fallbackText: rendered.fallbackText,
+            replyMarkup: abortKeyboard,
+          });
+        }
+        lastProgressText = rendered.text;
+        lastRenderedText = rendered.text;
+        lastProgressEditAt = Date.now();
+        lastEditAt = lastProgressEditAt;
+      } finally {
+        progressUpdateInFlight = false;
+        if (pendingProgress && !progressTimer) {
+          const next = pendingProgress;
+          pendingProgress = undefined;
+          void sendProgressUpdate(next).catch((error) => {
+            console.error("Failed to send queued progress update", error);
+          });
+        }
+      }
+    };
+
+    const noteSummaryProgress = (toolName: string): void => {
+      if (toolVerbosity !== "summary") {
+        return;
+      }
+
+      void sendProgressUpdate(renderSummaryProgressMessage(toolName, toolCounts)).catch((error) => {
+        console.error("Failed to send summary progress update", error);
+      });
+    };
+
     const removeAbortKeyboard = async (): Promise<void> => {
       if (!responseMessageId) {
         return;
@@ -620,6 +706,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
       stopTyping();
       clearFlushTimer();
+      clearProgressTimer();
       if (responseMessagePromise) {
         try {
           await responseMessagePromise;
@@ -632,6 +719,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const finalUndeliveredText = buildFinalResponseText(pendingStreamText);
       if (finalUndeliveredText) {
         pendingStreamText = "";
+        if (responseMessageId && !sentResponseText) {
+          const completed = renderProgressCompletedMessage();
+          await safeEditMessage(bot, chatId, responseMessageId, completed.text, {
+            parseMode: completed.parseMode,
+            fallbackText: completed.fallbackText,
+            replyMarkup: new InlineKeyboard(),
+          }).catch((error) => {
+            console.error("Failed to complete progress message", error);
+          });
+        }
         await deliverFinalMarkdown(finalUndeliveredText);
         sentResponseText = true;
       }
@@ -668,6 +765,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
+          noteSummaryProgress(toolName);
           return;
         }
 
@@ -828,6 +926,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     } catch (error) {
       stopTyping();
       clearFlushTimer();
+      clearProgressTimer();
       if (responseMessagePromise) {
         try {
           await responseMessagePromise;
@@ -3256,6 +3355,36 @@ export function formatToolSummaryLine(toolCounts: Map<string, number>): string {
     .map(([name, count]) => formatSummaryEntry(name, count))
     .join(", ");
   return `Tools used: ${tools}`;
+}
+
+export function renderSummaryProgressMessage(toolName: string, toolCounts: Map<string, number>): RenderedText {
+  const summaryLine = formatToolSummaryLine(toolCounts);
+  const htmlLines = [`<b>Working:</b> <code>${escapeHTML(trimProgressToolName(toolName))}</code>`];
+  const plainLines = [`Working: ${trimProgressToolName(toolName)}`];
+
+  if (summaryLine) {
+    htmlLines.push(escapeHTML(summaryLine));
+    plainLines.push(summaryLine);
+  }
+
+  return {
+    text: htmlLines.join("\n"),
+    fallbackText: plainLines.join("\n"),
+    parseMode: "HTML",
+  };
+}
+
+function renderProgressCompletedMessage(): RenderedText {
+  return {
+    text: "<b>Completed.</b>",
+    fallbackText: "Completed.",
+    parseMode: "HTML",
+  };
+}
+
+function trimProgressToolName(toolName: string): string {
+  const singleLine = toolName.replace(/\s+/g, " ").trim();
+  return singleLine.length <= 120 ? singleLine : `${singleLine.slice(0, 119)}...`;
 }
 
 function renderTodoList(items: Array<{ text: string; completed: boolean }>): string {

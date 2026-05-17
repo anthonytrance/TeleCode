@@ -1,4 +1,4 @@
-import { formatToolSummaryLine, formatTurnUsageLine, summarizeToolName } from "../src/bot.js";
+import { formatToolSummaryLine, formatTurnUsageLine, renderSummaryProgressMessage, summarizeToolName } from "../src/bot.js";
 
 describe("tool summary formatting", () => {
   it("normalizes raw tool names into compact summary categories", () => {
@@ -20,6 +20,19 @@ describe("tool summary formatting", () => {
     expect(formatToolSummaryLine(toolCounts)).toBe(
       "Tools used: 3x bash, 2x subagents, web_fetch",
     );
+  });
+
+  it("formats a single editable progress message for summary mode", () => {
+    const toolCounts = new Map<string, number>([
+      ["npm test", 1],
+      ["git status", 1],
+    ]);
+
+    const rendered = renderSummaryProgressMessage("npm test", toolCounts);
+
+    expect(rendered.fallbackText).toBe("Working: npm test\nTools used: 2x bash");
+    expect(rendered.text).toContain("<b>Working:</b>");
+    expect(rendered.text).toContain("Tools used: 2x bash");
   });
 
   it("keeps the turn usage line format stable when enabled", () => {
