@@ -5,7 +5,7 @@ import {
   type AppServerClientLike,
   type AppServerNotification,
 } from "../src/app-server-session.js";
-import { DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS, type JsonValue } from "../src/app-server.js";
+import { DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS, type AppServerServerRequest, type JsonValue } from "../src/app-server.js";
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
 import type { TeleCodexConfig } from "../src/config.js";
 
@@ -21,6 +21,9 @@ class FakeAppServerClient implements AppServerClientLike {
   readonly notifyInitialized = vi.fn();
   readonly started = vi.fn(async () => undefined);
   private notificationHandler: ((notification: AppServerNotification) => void) | null = null;
+  private requestHandler:
+    | ((request: AppServerServerRequest) => JsonValue | undefined | Promise<JsonValue | undefined>)
+    | null = null;
 
   constructor(
     private readonly responder: (
@@ -32,6 +35,10 @@ class FakeAppServerClient implements AppServerClientLike {
 
   onNotification(handler: (notification: AppServerNotification) => void): void {
     this.notificationHandler = handler;
+  }
+
+  onRequest(handler: (request: AppServerServerRequest) => JsonValue | undefined | Promise<JsonValue | undefined>): void {
+    this.requestHandler = handler;
   }
 
   async start(): Promise<void> {
@@ -54,6 +61,10 @@ class FakeAppServerClient implements AppServerClientLike {
 
   emit(notification: AppServerNotification): void {
     this.notificationHandler?.(notification);
+  }
+
+  async requestFromServer(request: AppServerServerRequest): Promise<JsonValue | undefined> {
+    return await this.requestHandler?.(request);
   }
 }
 
@@ -172,17 +183,23 @@ describe("AppServerSessionService", () => {
     const service = await AppServerSessionService.create(createConfig(), {
       appServerClientFactory: () => client!,
     });
+    const onToolStart = vi.fn();
+    const onToolUpdate = vi.fn();
+    const onToolEnd = vi.fn();
     const promptPromise = service.prompt("initial", {
       onTextDelta: vi.fn(),
-      onToolStart: vi.fn(),
-      onToolUpdate: vi.fn(),
-      onToolEnd: vi.fn(),
+      onToolStart,
+      onToolUpdate,
+      onToolEnd,
       onAgentEnd: vi.fn(),
     });
 
     await vi.waitFor(() => {
       expect(client!.requests.some((request) => request.method === "turn/start")).toBe(true);
     });
+    await expect(
+      client.requestFromServer({ id: "approval-1", method: "item/commandExecution/requestApproval" }),
+    ).resolves.toEqual({ decision: "decline" });
     await service.steer("change course");
     await service.abort();
     await promptPromise;
@@ -196,6 +213,12 @@ describe("AppServerSessionService", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
+    expect(onToolStart).toHaveBeenCalledWith("app_server_request", "server-request:approval-1");
+    expect(onToolUpdate).toHaveBeenCalledWith(
+      "server-request:approval-1",
+      "Handled item/commandExecution/requestApproval with a safe default response.",
+    );
+    expect(onToolEnd).toHaveBeenCalledWith("server-request:approval-1", true);
   });
 
   it("supports native app-server thread controls", async () => {

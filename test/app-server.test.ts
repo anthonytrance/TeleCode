@@ -76,6 +76,11 @@ describe("CodexAppServerClient", () => {
               platformOs: "windows",
             },
           });
+          process.send({
+            id: "server-request-1",
+            method: "item/fileChange/requestApproval",
+            params: { reason: "test" },
+          });
         } else if (message.method === "model/list") {
           process.send({ id: message.id, result: { data: [{ displayName: "GPT Test" }] } });
         }
@@ -91,12 +96,17 @@ describe("CodexAppServerClient", () => {
     await client.start();
     const initialized = await client.initialize();
     client.notifyInitialized();
+    await new Promise((resolve) => setImmediate(resolve));
     const models = await client.request<{ data: Array<{ displayName: string }> }>("model/list", { limit: 1 });
     await client.close();
 
     expect(initialized.userAgent).toBe("codex-test");
     expect(models.data[0]?.displayName).toBe("GPT Test");
     expect(client.getNotificationMethods()).toEqual(["remoteControl/status/changed"]);
+    expect(requests).toContainEqual({
+      id: "server-request-1",
+      result: { decision: "decline" },
+    });
     expect(requests[0]?.params.capabilities.optOutNotificationMethods).toEqual(
       DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS,
     );

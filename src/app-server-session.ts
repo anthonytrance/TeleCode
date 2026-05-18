@@ -5,7 +5,9 @@ import {
   type AppServerClientOptions,
   CodexAppServerClient,
   DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS,
+  safeAppServerServerRequestResponse,
   type AppServerInitializeResponse,
+  type AppServerServerRequest,
   type JsonValue,
 } from "./app-server.js";
 import {
@@ -59,6 +61,7 @@ export type AppServerNotification = { method: string; params?: unknown };
 
 export interface AppServerClientLike {
   onNotification(handler: (notification: AppServerNotification) => void): void;
+  onRequest(handler: (request: AppServerServerRequest) => JsonValue | undefined | Promise<JsonValue | undefined>): void;
   start(): Promise<void>;
   initialize(optOutNotificationMethods?: string[]): Promise<AppServerInitializeResponse>;
   notifyInitialized(): void;
@@ -440,6 +443,7 @@ export class AppServerSessionService {
       env: buildAppServerEnv(this.config.codexApiKey),
     });
     client.onNotification((notification) => this.handleNotification(notification));
+    client.onRequest((request) => this.handleServerRequest(request));
     await client.start();
     await client.initialize(DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS);
     client.notifyInitialized();
@@ -507,6 +511,23 @@ export class AppServerSessionService {
         this.activeResolve?.();
       }
     }
+  }
+
+  private handleServerRequest(request: AppServerServerRequest): JsonValue | undefined {
+    const response = safeAppServerServerRequestResponse(request.method);
+    if (response === undefined) {
+      return undefined;
+    }
+
+    const callbacks = this.activeCallbacks;
+    if (callbacks) {
+      const itemId = `server-request:${request.id}`;
+      callbacks.onToolStart("app_server_request", itemId);
+      callbacks.onToolUpdate(itemId, `Handled ${request.method} with a safe default response.`);
+      callbacks.onToolEnd(itemId, true);
+    }
+
+    return response;
   }
 
   private handleCompletedItem(item: AppServerThreadItem, callbacks: CodexSessionCallbacks): void {

@@ -50,6 +50,16 @@ export interface AppServerClientOptions {
   spawnProcess?: SpawnAppServerProcess;
 }
 
+export type AppServerServerRequest = {
+  id: number | string;
+  method: string;
+  params?: unknown;
+};
+
+export type AppServerServerRequestHandler = (
+  request: AppServerServerRequest,
+) => JsonValue | undefined | Promise<JsonValue | undefined>;
+
 export interface AppServerInitializeResponse {
   userAgent: string;
   codexHome: string;
@@ -150,7 +160,13 @@ type PendingRequest = {
 };
 
 type AppServerWireMessage =
-  | { id: number | string; result?: unknown; error?: { message?: string; code?: number; data?: unknown } }
+  | {
+      id: number | string;
+      method?: string;
+      params?: unknown;
+      result?: unknown;
+      error?: { message?: string; code?: number; data?: unknown };
+    }
   | { method: string; params?: unknown };
 
 export class CodexAppServerClient {
@@ -159,6 +175,7 @@ export class CodexAppServerClient {
   private readonly pending = new Map<string, PendingRequest>();
   private readonly notifications: Array<{ method: string; params?: unknown }> = [];
   private readonly notificationHandlers = new Set<(notification: { method: string; params?: unknown }) => void>();
+  private readonly requestHandlers = new Set<AppServerServerRequestHandler>();
   private readonly stderrChunks: Buffer[] = [];
   private readlineInterface: readline.Interface | null = null;
   private closing = false;
@@ -171,6 +188,10 @@ export class CodexAppServerClient {
 
   onNotification(handler: (notification: { method: string; params?: unknown }) => void): void {
     this.notificationHandlers.add(handler);
+  }
+
+  onRequest(handler: AppServerServerRequestHandler): void {
+    this.requestHandlers.add(handler);
   }
 
   async start(): Promise<void> {
@@ -301,6 +322,17 @@ export class CodexAppServerClient {
       return;
     }
 
+    if ("id" in message && typeof message.method === "string") {
+      void this.handleServerRequest({
+        id: message.id,
+        method: message.method,
+        params: message.params,
+      }).catch((error) => {
+        this.sendErrorResponse(message.id, error instanceof Error ? error.message : String(error));
+      });
+      return;
+    }
+
     if ("id" in message) {
       const pending = this.pending.get(String(message.id));
       if (!pending) {
@@ -334,8 +366,63 @@ export class CodexAppServerClient {
     this.pending.clear();
   }
 
+  private async handleServerRequest(request: AppServerServerRequest): Promise<void> {
+    for (const handler of this.requestHandlers) {
+      const result = await handler(request);
+      if (result !== undefined) {
+        this.sendResultResponse(request.id, result);
+        return;
+      }
+    }
+
+    const safeResponse = safeAppServerServerRequestResponse(request.method);
+    if (safeResponse !== undefined) {
+      this.sendResultResponse(request.id, safeResponse);
+      return;
+    }
+
+    this.sendErrorResponse(request.id, `Unsupported app-server request: ${request.method}`);
+  }
+
+  private sendResultResponse(id: number | string, result: JsonValue): void {
+    this.child?.stdin.write(`${JSON.stringify({ id, result })}\n`);
+  }
+
+  private sendErrorResponse(id: number | string, message: string): void {
+    this.child?.stdin.write(`${JSON.stringify({ id, error: { code: -32601, message } })}\n`);
+  }
+
   private stderrText(): string {
     return Buffer.concat(this.stderrChunks).toString("utf8").trim();
+  }
+}
+
+export function safeAppServerServerRequestResponse(method: string): JsonValue | undefined {
+  switch (method) {
+    case "execCommandApproval":
+    case "applyPatchApproval":
+      return { decision: "denied" };
+    case "item/commandExecution/requestApproval":
+    case "item/fileChange/requestApproval":
+      return { decision: "decline" };
+    case "item/permissions/requestApproval":
+      return { permissions: {}, scope: "turn", strictAutoReview: true };
+    case "item/tool/requestUserInput":
+      return { answers: {} };
+    case "mcpServer/elicitation/request":
+      return { action: "decline", content: null };
+    case "item/tool/call":
+      return {
+        success: false,
+        contentItems: [
+          {
+            type: "inputText",
+            text: "TeleCodex does not support this app-server tool request yet.",
+          },
+        ],
+      };
+    default:
+      return undefined;
   }
 }
 
