@@ -28,7 +28,7 @@ export function renderHelpMessage(): DualText {
         ["/usage", "Codex limits & reset times"],
         ["/backend", "Show or reset backend"],
         ["/backend sdk", "Switch back to SDK backend"],
-        ["/velocity <mode>", "Set progress delivery"],
+        ["/verbosity <mode>", "Set message verbosity"],
         ["/appserver", "Probe Codex app-server"],
         ["/appserverturn <prompt>", "Run isolated app-server turn"],
         ["/appserversteer a || b", "Steer isolated app-server turn"],

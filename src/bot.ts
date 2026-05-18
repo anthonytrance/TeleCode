@@ -454,7 +454,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         config.showTurnTokenUsage && lastTurnUsage ? formatTurnUsageLine(lastTurnUsage) : "";
 
       if (toolVerbosity === "summary") {
-        return [formatToolSummaryLine(toolCounts), usageLine].filter((line): line is string => Boolean(line)).join("\n");
+        return usageLine;
       }
 
       if (toolVerbosity === "all") {
@@ -470,7 +470,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         config.showTurnTokenUsage && lastTurnUsage ? formatTurnUsageLine(lastTurnUsage) : "";
 
       if (toolVerbosity === "summary") {
-        const footerLines = [formatToolSummaryLine(toolCounts), usageLine].filter((line): line is string => Boolean(line));
+        const footerLines = [usageLine].filter((line): line is string => Boolean(line));
         if (footerLines.length === 0) {
           return trimmedText;
         }
@@ -644,16 +644,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     };
 
-    const noteSummaryProgress = (toolName: string): void => {
-      if (toolVerbosity !== "summary" || progressDelivery === "none") {
-        return;
-      }
-
-      void sendProgressUpdate(renderSummaryProgressMessage(toolName, toolCounts)).catch((error) => {
-        console.error("Failed to send summary progress update", error);
-      });
-    };
-
     const removeAbortKeyboard = async (): Promise<void> => {
       if (!responseMessageId) {
         return;
@@ -789,7 +779,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
-          noteSummaryProgress(toolName);
           return;
         }
 
@@ -1842,7 +1831,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
   });
 
-  bot.command(["velocity", "progress"], async (ctx) => {
+  bot.command(["verbosity", "velocity", "progress"], async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
       return;
@@ -1852,11 +1841,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!rawMode) {
       const current = registry.getProgressDelivery(contextKey);
       const plain = [
-        `Progress velocity for this Telegram context: ${current}`,
+        `Message verbosity for this Telegram context: ${current}`,
         "",
-        "Use /velocity messages for separate progress messages.",
-        "Use /velocity edit for one edited progress message.",
-        "Use /velocity none for final answers only.",
+        "Use /verbosity messages for separate progress messages.",
+        "Use /verbosity edit for one edited progress message.",
+        "Use /verbosity none for final answers only.",
       ].join("\n");
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
@@ -1864,15 +1853,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const requested = resolveVelocityArgument(rawMode);
     if (!requested) {
-      await safeReply(ctx, escapeHTML("Usage: /velocity messages, /velocity edit, or /velocity none"), {
-        fallbackText: "Usage: /velocity messages, /velocity edit, or /velocity none",
+      await safeReply(ctx, escapeHTML("Usage: /verbosity messages, /verbosity edit, or /verbosity none"), {
+        fallbackText: "Usage: /verbosity messages, /verbosity edit, or /verbosity none",
       });
       return;
     }
 
     registry.setProgressDelivery(contextKey, requested);
     const plain = [
-      `Progress velocity set to ${requested}.`,
+      `Message verbosity set to ${requested}.`,
       requested === "messages"
         ? "I will send separate progress messages and keep the final answer clean."
         : requested === "edit"
@@ -3314,7 +3303,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "status", description: "Current thread details" },
     { command: "usage", description: "Codex limits & reset times" },
     { command: "backend", description: "Show or reset backend" },
-    { command: "velocity", description: "Set progress delivery" },
+    { command: "verbosity", description: "Set message verbosity" },
     { command: "appserver", description: "Probe Codex app-server" },
     { command: "appserverturn", description: "Run isolated app-server turn" },
     { command: "appserversteer", description: "Run isolated app-server steer test" },

@@ -88,7 +88,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/renamethread <name>` | Rename the active thread once app-server backend switching is enabled |
 | `/rollbackthread <n>` | Roll back app-server thread history by `n` turns; file changes are not reverted |
 | `/session` | Current thread ID, workspace, model, effort, and token totals |
-| `/velocity <mode>` | Set progress delivery for this Telegram context: `messages`, `edit`, or `none` |
+| `/verbosity <mode>` | Set message verbosity for this Telegram context: `messages`, `edit`, or `none` |
 | `/appserver` | Probe the Codex app-server without switching the live backend |
 | `/appserverturn <prompt>` | Run one isolated app-server diagnostic turn |
 | `/appserversteer <initial> || <steer>` | Run one isolated app-server turn and steer it mid-turn |
