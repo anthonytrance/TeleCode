@@ -1767,7 +1767,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         "Available: sdk, app-server",
         "",
         "Use /backend sdk to force the safe SDK backend.",
-        "Use /backend appserver confirm to try the observer backend in this context.",
+        "Use /backend appserver to switch this context to app-server.",
+        "The choice persists for this Telegram context across restarts.",
       ].join("\n");
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
@@ -1775,8 +1776,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const requestedBackend = resolveBackendArgument(rawBackend);
     if (!requestedBackend) {
-      await safeReply(ctx, escapeHTML("Usage: /backend sdk or /backend appserver confirm"), {
-        fallbackText: "Usage: /backend sdk or /backend appserver confirm",
+      await safeReply(ctx, escapeHTML("Usage: /backend sdk or /backend appserver"), {
+        fallbackText: "Usage: /backend sdk or /backend appserver",
       });
       return;
     }
@@ -1786,17 +1787,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await safeReply(ctx, escapeHTML("Cannot switch backend while a prompt is running. Use /abort first if it is stuck."), {
         fallbackText: "Cannot switch backend while a prompt is running. Use /abort first if it is stuck.",
       });
-      return;
-    }
-
-    const confirmed = /\bconfirm\b/i.test(rawBackend);
-    if (requestedBackend === "app-server" && !confirmed) {
-      const plain = [
-        "App-server backend switching is experimental.",
-        "Run /backend appserver confirm to switch this Telegram context.",
-        "Use /backend sdk to switch this context back.",
-      ].join("\n");
-      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
     }
 
@@ -1826,8 +1816,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const plain =
       requestedBackend === "app-server"
-        ? "Backend for this Telegram context is now app-server. The next prompt will resume the same stored thread through the observer protocol. Use /backend sdk to switch back."
-        : "Backend for this Telegram context is now sdk. The next prompt will use a fresh SDK session wrapper.";
+        ? "Backend for this Telegram context is now app-server. This persists across restarts. Use /backend sdk to switch back."
+        : "Backend for this Telegram context is now sdk. This persists across restarts.";
     await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
   });
 
@@ -1851,7 +1841,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const requested = resolveVelocityArgument(rawMode);
+    const requested = resolveVerbosityArgument(rawMode);
     if (!requested) {
       await safeReply(ctx, escapeHTML("Usage: /verbosity messages, /verbosity edit, or /verbosity none"), {
         fallbackText: "Usage: /verbosity messages, /verbosity edit, or /verbosity none",
@@ -4028,21 +4018,20 @@ function getCommandArgument(ctx: Context): string {
 }
 
 function resolveBackendArgument(raw: string): CodexBackend | null {
-  const normalized = raw.trim().toLowerCase().replace(/_/g, "-").replace(/\bconfirm\b/g, "").trim();
+  const normalized = raw.trim().toLowerCase().replace(/_/g, "-");
   switch (normalized) {
     case "sdk":
     case "safe":
       return "sdk";
     case "appserver":
     case "app-server":
-    case "observer":
       return "app-server";
     default:
       return null;
   }
 }
 
-function resolveVelocityArgument(raw: string): ProgressDelivery | null {
+function resolveVerbosityArgument(raw: string): ProgressDelivery | null {
   const normalized = raw.trim().toLowerCase().replace(/_/g, "-");
   switch (normalized) {
     case "none":

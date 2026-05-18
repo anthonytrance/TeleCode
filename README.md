@@ -84,10 +84,13 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/new default` | Start a fresh thread in `CODEX_WORKSPACE` |
 | `/newsummary` | Start a fresh thread from a handoff summary of the current thread |
 | `/newsummary default` | Summarize the current thread into a fresh `CODEX_WORKSPACE` thread |
-| `/forkthread` | Fork the active thread once app-server backend switching is enabled |
-| `/renamethread <name>` | Rename the active thread once app-server backend switching is enabled |
+| `/forkthread` | Fork the active app-server thread |
+| `/renamethread <name>` | Rename the active app-server thread |
 | `/rollbackthread <n>` | Roll back app-server thread history by `n` turns; file changes are not reverted |
 | `/session` | Current thread ID, workspace, model, effort, and token totals |
+| `/backend` | Show the current backend for this Telegram context |
+| `/backend appserver` | Switch this Telegram context to app-server; persists across restarts |
+| `/backend sdk` | Switch this Telegram context back to SDK; persists across restarts |
 | `/verbosity <mode>` | Set message verbosity for this Telegram context: `messages`, `edit`, or `none` |
 | `/appserver` | Probe the Codex app-server without switching the live backend |
 | `/appserverturn <prompt>` | Run one isolated app-server diagnostic turn |
@@ -97,7 +100,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/switch <id>` | Switch directly to a thread by ID |
 | `/retry` | Resend the last prompt |
 | `/abort` | Cancel the current turn |
-| `/steer <text>` | Steer an active app-server turn once app-server backend switching is enabled |
+| `/steer <text>` | Steer an active app-server turn |
 | `/launch_profiles` | Select launch profile for new or reattached threads (`/launch` alias kept) |
 | `/model` | View and change the model |
 | `/effort` | Set reasoning effort: `minimal` · `low` · `medium` · `high` · `xhigh` |
