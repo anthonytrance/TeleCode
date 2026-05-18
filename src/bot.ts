@@ -372,6 +372,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let lastRenderedPlan = "";
     let planMessageSending = false;
     let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
+    let autoArtifactOutDir: string | undefined;
 
     const typingInterval = setInterval(() => {
       void bot.api
@@ -933,7 +934,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      await session.prompt(userInput, callbacks);
+      const promptInput = userInputHasOutputInstructions(userInput)
+        ? userInput
+        : await (async (): Promise<CodexPromptInput> => {
+            const turnId = randomUUID().slice(0, 12);
+            autoArtifactOutDir = outboxPath(session.getCurrentWorkspace(), turnId);
+            await ensureOutDir(autoArtifactOutDir);
+            return addOutputInstructions(userInput, autoArtifactOutDir);
+          })();
+
+      await session.prompt(promptInput, callbacks);
       updateSessionMetadata(contextKey, session);
       await finalizeResponse();
     } catch (error) {
@@ -963,6 +973,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     } finally {
       stopTyping();
       clearFlushTimer();
+      if (autoArtifactOutDir) {
+        try {
+          await deliverArtifacts(ctx, chatId, autoArtifactOutDir, messageThreadId);
+        } catch (artifactError) {
+          console.error("Failed to deliver artifacts:", artifactError);
+        }
+      }
       busyState.processing = false;
     }
   };
@@ -3824,6 +3841,22 @@ function getPromptText(input: CodexPromptInput): string {
   }
 
   return [input.text, input.stagedFileInstructions].filter((part): part is string => Boolean(part)).join("\n");
+}
+
+function userInputHasOutputInstructions(input: CodexPromptInput): boolean {
+  return typeof input === "object" && Boolean(input.stagedFileInstructions);
+}
+
+function addOutputInstructions(input: CodexPromptInput, outDir: string): CodexPromptInput {
+  const stagedFileInstructions = `Output files: write any files the user should receive to ${outDir}`;
+  if (typeof input === "string") {
+    return { text: input, stagedFileInstructions };
+  }
+
+  return {
+    ...input,
+    stagedFileInstructions,
+  };
 }
 
 function renderMarkdownChunkWithinLimit(markdown: string): RenderedChunk {
