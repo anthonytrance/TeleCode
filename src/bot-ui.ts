@@ -32,6 +32,7 @@ export function renderHelpMessage(): DualText {
         ["/appserver", "Probe Codex app-server"],
         ["/appserverturn <prompt>", "Run isolated app-server turn"],
         ["/appserversteer a || b", "Steer isolated app-server turn"],
+        ["/appbackendtest", "Smoke-test app-server backend"],
         ["/sessions", "Browse & switch threads"],
         ["/use <number>", "Switch after /sessions"],
         ["/use latest", "Switch to latest thread"],

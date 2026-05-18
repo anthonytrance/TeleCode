@@ -34,7 +34,7 @@ import {
   type CodexSessionCallbacks,
   type CodexSessionInfo,
 } from "./codex-session.js";
-import type { CodexSessionRuntime } from "./codex-backend.js";
+import { createCodexSession, type CodexSessionRuntime } from "./codex-backend.js";
 import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "./codex-auth.js";
 import {
   findLaunchProfile,
@@ -1696,6 +1696,73 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
   });
 
+  bot.command(["appbackendtest", "appsmoke"], async (ctx) => {
+    await safeReply(ctx, escapeHTML("Running app-server backend smoke test..."), {
+      fallbackText: "Running app-server backend smoke test...",
+    });
+
+    const startedAt = Date.now();
+    const steps: string[] = [];
+    let session: CodexSessionRuntime | undefined;
+    try {
+      session = await createCodexSession(
+        { ...config, codexBackend: "app-server" },
+        { deferThreadStart: true, workspace: config.workspace, model: config.codexModel },
+      );
+      steps.push("created backend runtime");
+
+      const info = await session.newThread(config.workspace, config.codexModel);
+      steps.push(`started thread ${info.threadId ?? "(unknown)"}`);
+
+      const firstReply = (await session.runText("Reply with exactly OK.")).trim();
+      steps.push(`prompt returned ${firstReply || "(empty)"}`);
+      if (normalizeSmokeReply(firstReply) !== "OK") {
+        throw new Error(`Expected OK from first prompt, got ${firstReply || "(empty)"}`);
+      }
+
+      if (session.renameThread) {
+        await session.renameThread(`TeleCodex smoke ${new Date().toISOString()}`);
+        steps.push("renamed thread");
+      }
+
+      if (session.forkThread) {
+        const forked = await session.forkThread();
+        steps.push(`forked thread ${forked.threadId ?? "(unknown)"}`);
+        const forkReply = (await session.runText("Reply with exactly FORK_OK.")).trim();
+        steps.push(`fork prompt returned ${forkReply || "(empty)"}`);
+        if (normalizeSmokeReply(forkReply) !== "FORK_OK") {
+          throw new Error(`Expected FORK_OK from fork prompt, got ${forkReply || "(empty)"}`);
+        }
+      }
+
+      if (session.rollbackThread) {
+        await session.rollbackThread(1);
+        steps.push("rolled back one turn");
+      }
+
+      const plain = [
+        "App-server backend smoke test:",
+        `Status: ok`,
+        `Duration: ${Date.now() - startedAt} ms`,
+        "",
+        ...steps.map((step) => `- ${step}`),
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+    } catch (error) {
+      const plain = [
+        "App-server backend smoke test:",
+        "Status: failed",
+        `Duration: ${Date.now() - startedAt} ms`,
+        `Error: ${friendlyErrorText(error)}`,
+        "",
+        ...steps.map((step) => `- ${step}`),
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+    } finally {
+      session?.dispose();
+    }
+  });
+
   bot.command("backend", async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
@@ -3251,6 +3318,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "appserver", description: "Probe Codex app-server" },
     { command: "appserverturn", description: "Run isolated app-server turn" },
     { command: "appserversteer", description: "Run isolated app-server steer test" },
+    { command: "appbackendtest", description: "Smoke-test app-server backend" },
     { command: "sessions", description: "Browse & switch threads" },
     { command: "history", description: "Show recent local thread history" },
     { command: "use", description: "Switch to a thread by ID or latest" },
@@ -4004,6 +4072,10 @@ function resolveVelocityArgument(raw: string): ProgressDelivery | null {
     default:
       return null;
   }
+}
+
+function normalizeSmokeReply(reply: string): string {
+  return reply.trim().replace(/[.!]+$/g, "").toUpperCase();
 }
 
 function normalizeModelName(value: string): string {
