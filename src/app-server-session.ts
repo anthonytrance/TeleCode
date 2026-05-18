@@ -53,8 +53,16 @@ type AppServerThreadItem = {
   query?: string;
   server?: string;
   tool?: string;
+  namespace?: string | null;
+  success?: boolean | null;
+  result?: string;
+  prompt?: string | null;
+  savedPath?: string | null;
+  path?: string;
   error?: { message?: string } | null;
   changes?: Array<{ kind?: string; path?: string }>;
+  contentItems?: Array<{ type?: string; text?: string; imageUrl?: string }> | null;
+  receiverThreadIds?: string[];
 };
 
 export type AppServerNotification = { method: string; params?: unknown };
@@ -495,6 +503,11 @@ export class AppServerSessionService {
       const usage = readTokenUsage(notification.params);
       if (usage) {
         this.sessionTokens = usage;
+        callbacks.onTurnComplete?.({
+          inputTokens: usage.input,
+          cachedInputTokens: usage.cached,
+          outputTokens: usage.output,
+        });
       }
       return;
     }
@@ -557,6 +570,40 @@ export class AppServerSessionService {
       }
       callbacks.onToolEnd(item.id, item.status === "failed");
     } else if (item.type === "webSearch") {
+      callbacks.onToolEnd(item.id, false);
+    } else if (item.type === "dynamicToolCall") {
+      const toolName = `dynamic:${[item.namespace, item.tool].filter(Boolean).join("/") || "tool"}`;
+      callbacks.onToolStart(toolName, item.id);
+      const content = formatDynamicToolContent(item);
+      if (content) {
+        callbacks.onToolUpdate(item.id, content);
+      }
+      callbacks.onToolEnd(item.id, item.status === "failed" || item.success === false);
+    } else if (item.type === "collabAgentToolCall") {
+      callbacks.onToolStart(`mcp:codex_apps/${item.tool ?? "agent"}`, item.id);
+      const detail = [
+        item.prompt ? `Prompt: ${item.prompt}` : "",
+        item.receiverThreadIds?.length ? `Threads: ${item.receiverThreadIds.join(", ")}` : "",
+      ].filter(Boolean).join("\n");
+      if (detail) {
+        callbacks.onToolUpdate(item.id, detail);
+      }
+      callbacks.onToolEnd(item.id, item.status === "failed");
+    } else if (item.type === "imageGeneration") {
+      callbacks.onToolStart("image_generation", item.id);
+      const detail = [item.result, item.savedPath ? `Saved: ${item.savedPath}` : ""].filter(Boolean).join("\n");
+      if (detail) {
+        callbacks.onToolUpdate(item.id, detail);
+      }
+      callbacks.onToolEnd(item.id, item.status === "failed");
+    } else if (item.type === "imageView") {
+      callbacks.onToolStart("image_view", item.id);
+      if (item.path) {
+        callbacks.onToolUpdate(item.id, item.path);
+      }
+      callbacks.onToolEnd(item.id, false);
+    } else if (item.type === "contextCompaction") {
+      callbacks.onToolStart("context_compaction", item.id);
       callbacks.onToolEnd(item.id, false);
     }
   }
@@ -646,6 +693,18 @@ function formatTurnError(error: unknown): string {
 
 function computeTextDelta(previousText: string, nextText: string): string {
   return nextText.startsWith(previousText) ? nextText.slice(previousText.length) : nextText;
+}
+
+function formatDynamicToolContent(item: AppServerThreadItem): string {
+  const parts: string[] = [];
+  for (const contentItem of item.contentItems ?? []) {
+    if (contentItem.type === "inputText" && contentItem.text) {
+      parts.push(contentItem.text);
+    } else if (contentItem.type === "inputImage" && contentItem.imageUrl) {
+      parts.push(contentItem.imageUrl);
+    }
+  }
+  return parts.join("\n");
 }
 
 function uniqueWorkspaces(workspaces: string[]): string[] {

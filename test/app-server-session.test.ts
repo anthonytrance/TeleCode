@@ -103,6 +103,27 @@ describe("AppServerSessionService", () => {
             },
           });
           activeClient.emit({
+            method: "item/completed",
+            params: {
+              turnId: "turn-1",
+              item: {
+                id: "dyn-1",
+                type: "dynamicToolCall",
+                namespace: "tools",
+                tool: "inspect",
+                status: "completed",
+                success: true,
+                contentItems: [{ type: "inputText", text: "dynamic result" }],
+              },
+            },
+          });
+          activeClient.emit({
+            method: "thread/tokenUsage/updated",
+            params: {
+              usage: { inputTokens: 10, cachedInputTokens: 4, outputTokens: 6 },
+            },
+          });
+          activeClient.emit({
             method: "turn/completed",
             params: { turn: { id: "turn-1", status: "completed" } },
           });
@@ -125,6 +146,7 @@ describe("AppServerSessionService", () => {
         onToolUpdate: (id, text) => events.push(`update:${id}:${text}`),
         onToolEnd: (id, failed) => events.push(`end:${id}:${failed}`),
         onAgentEnd: () => events.push("agent:end"),
+        onTurnComplete: (usage) => events.push(`usage:${usage.inputTokens}/${usage.cachedInputTokens}/${usage.outputTokens}`),
       },
     );
 
@@ -148,6 +170,10 @@ describe("AppServerSessionService", () => {
       "update:cmd-1:passing\n",
       "end:cmd-1:false",
       "text:Done",
+      "start:dyn-1:dynamic:tools/inspect",
+      "update:dyn-1:dynamic result",
+      "end:dyn-1:false",
+      "usage:10/4/6",
       "agent:end",
     ]);
   });
