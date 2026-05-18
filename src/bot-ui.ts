@@ -20,7 +20,7 @@ export function renderHelpMessage(): DualText {
         ["/fork", "Start in current workspace"],
         ["/newsummary", "New thread from summary"],
         ["/newsummary default", "Summarize into configured workspace"],
-        ["/forkthread", "Fork active app-server thread"],
+        ["/forkthread [n]", "Fork app-server thread, optionally roll back fork"],
         ["/renamethread <name>", "Rename active app-server thread"],
         ["/rollbackthread <n>", "Roll back app-server thread history"],
         ["/session", "Current thread details"],

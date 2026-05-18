@@ -84,7 +84,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/new default` | Start a fresh thread in `CODEX_WORKSPACE` |
 | `/newsummary` | Start a fresh thread from a handoff summary of the current thread |
 | `/newsummary default` | Summarize the current thread into a fresh `CODEX_WORKSPACE` thread |
-| `/forkthread` | Fork the active app-server thread |
+| `/forkthread [n]` | Fork the active app-server thread; with `n`, roll back that many turns on the fork only |
 | `/renamethread <name>` | Rename the active app-server thread |
 | `/rollbackthread <n>` | Roll back app-server thread history by `n` turns; file changes are not reverted |
 | `/session` | Current thread ID, workspace, model, effort, and token totals |

@@ -1446,6 +1446,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   });
 
   bot.command("forkthread", async (ctx) => {
+    const rawCount = getCommandArgument(ctx).trim();
+    const rollbackCount = rawCount ? Number(rawCount) : 0;
+    if (!Number.isInteger(rollbackCount) || rollbackCount < 0) {
+      await safeReply(ctx, escapeHTML("Usage: /forkthread or /forkthread <turn-count>"), {
+        fallbackText: "Usage: /forkthread or /forkthread <turn-count>",
+      });
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -1466,11 +1475,26 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
+    if (rollbackCount > 0 && !session.rollbackThread) {
+      await safeReply(ctx, escapeHTML("Fork rollback requires the app-server backend. The live backend is still SDK."), {
+        fallbackText: "Fork rollback requires the app-server backend. The live backend is still SDK.",
+      });
+      return;
+    }
+
     try {
       const info = await session.forkThread();
+      if (rollbackCount > 0) {
+        await session.rollbackThread?.(rollbackCount);
+      }
       updateSessionMetadata(contextKey, session);
-      const plain = `Forked thread.\n\n${renderSessionInfoPlain(info)}`;
-      const html = `<b>Forked thread.</b>\n\n${renderSessionInfoHTML(info)}`;
+      const latestInfo = session.getInfo();
+      const rollbackText =
+        rollbackCount > 0
+          ? ` Rolled back ${rollbackCount} turn${rollbackCount === 1 ? "" : "s"} on the fork. File changes were not reverted.`
+          : "";
+      const plain = `Forked thread.${rollbackText}\n\n${renderSessionInfoPlain(latestInfo)}`;
+      const html = `<b>Forked thread.</b>${escapeHTML(rollbackText)}\n\n${renderSessionInfoHTML(latestInfo)}`;
       await safeReply(ctx, html, { fallbackText: plain });
     } catch (error) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
