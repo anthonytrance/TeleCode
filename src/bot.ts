@@ -54,7 +54,7 @@ const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const FIRST_INTERMEDIATE_UPDATE_MS = 2500;
 const INTERMEDIATE_UPDATE_MIN_MS = 30000;
-const SUMMARY_PROGRESS_UPDATE_MIN_MS = 5000;
+const SUMMARY_PROGRESS_UPDATE_MIN_MS = 30000;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
@@ -705,6 +705,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await deliverRenderedChunks(splitMarkdownForTelegram(markdown));
     };
 
+    const deliverIntermediateAssistantText = async (): Promise<void> => {
+      const text = accumulatedText.trim();
+      accumulatedText = "";
+      pendingStreamText = "";
+      if (!text || progressDelivery === "none") {
+        return;
+      }
+
+      if (progressDelivery === "messages") {
+        await deliverFinalMarkdown(text);
+      }
+    };
+
     const finalizeResponse = async (): Promise<void> => {
       if (finalized) {
         return;
@@ -767,6 +780,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         if (streamAssistantText && pendingStreamText.trim()) {
           void flushResponse(true).catch((error) => {
             console.error("Failed to flush assistant progress before tool start", error);
+          });
+        } else if (!streamAssistantText && pendingStreamText.trim()) {
+          void deliverIntermediateAssistantText().catch((error) => {
+            console.error("Failed to deliver assistant progress before tool start", error);
           });
         }
 
