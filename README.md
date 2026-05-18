@@ -96,6 +96,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/appserverturn <prompt>` | Run one isolated app-server diagnostic turn |
 | `/appserversteer <initial> || <steer>` | Run one isolated app-server turn and steer it mid-turn |
 | `/appbackendtest` | Smoke-test the app-server backend path without switching this Telegram context |
+| `/artifacttest` | Generate and send a small text file through TeleCodex artifact delivery |
 | `/sessions` | Browse recent threads grouped by workspace; tap to switch |
 | `/switch <id>` | Switch directly to a thread by ID |
 | `/retry` | Resend the last prompt |

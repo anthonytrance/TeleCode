@@ -1752,6 +1752,37 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   });
 
+  bot.command(["artifacttest", "filetest"], async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const chatId = ctx.chat?.id;
+    if (!contextKey || !chatId) {
+      return;
+    }
+
+    const turnId = `artifacttest-${randomUUID().slice(0, 8)}`;
+    const session = registry.get(contextKey);
+    const workspace = session?.getCurrentWorkspace() ?? config.workspace;
+    const outDir = outboxPath(workspace, turnId);
+    const filePath = path.join(outDir, "telecodex-artifact-test.txt");
+    const content = [
+      "TeleCodex artifact delivery test",
+      `Created: ${new Date().toISOString()}`,
+      `Backend: ${registry.getBackend(contextKey)}`,
+      `Workspace: ${workspace}`,
+      "",
+      "If this file arrived in Telegram, generated artifact delivery is working.",
+    ].join("\n");
+
+    try {
+      await ensureOutDir(outDir);
+      await writeFile(filePath, content, "utf8");
+      await deliverArtifacts(ctx, chatId, outDir, parseContextKey(contextKey).messageThreadId);
+    } catch (error) {
+      const plain = `Artifact test failed: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(plain), { fallbackText: plain });
+    }
+  });
+
   bot.command("backend", async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
@@ -3298,6 +3329,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "appserverturn", description: "Run isolated app-server turn" },
     { command: "appserversteer", description: "Run isolated app-server steer test" },
     { command: "appbackendtest", description: "Smoke-test app-server backend" },
+    { command: "artifacttest", description: "Send a generated test file" },
     { command: "sessions", description: "Browse & switch threads" },
     { command: "history", description: "Show recent local thread history" },
     { command: "use", description: "Switch to a thread by ID or latest" },

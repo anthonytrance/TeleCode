@@ -34,6 +34,7 @@ export function renderHelpMessage(): DualText {
         ["/appserverturn <prompt>", "Run isolated app-server turn"],
         ["/appserversteer a || b", "Steer isolated app-server turn"],
         ["/appbackendtest", "Smoke-test app-server backend"],
+        ["/artifacttest", "Send a generated test file"],
         ["/sessions", "Browse & switch threads"],
         ["/use <number>", "Switch after /sessions"],
         ["/use latest", "Switch to latest thread"],
