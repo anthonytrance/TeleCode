@@ -1483,6 +1483,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     try {
+      if (rollbackCount > 0 && session.getTurnCount) {
+        const turnCount = await session.getTurnCount();
+        if (rollbackCount >= turnCount) {
+          const plain = [
+            `Cannot fork and roll back ${rollbackCount} turns.`,
+            `This thread currently has ${turnCount} persisted Codex turn${turnCount === 1 ? "" : "s"}.`,
+            "Use a smaller number so the fork keeps some context.",
+          ].join("\n");
+          await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+          return;
+        }
+      }
+
       const info = await session.forkThread();
       if (rollbackCount > 0) {
         await session.rollbackThread?.(rollbackCount);

@@ -256,6 +256,9 @@ describe("AppServerSessionService", () => {
       if (method === "thread/fork") {
         return { thread: { id: "thread-fork", cwd: "/workspace/base" }, model: "gpt-test" };
       }
+      if (method === "thread/read") {
+        return { thread: { id: "thread-fork", turns: [{ id: "turn-1" }, { id: "turn-2" }] } };
+      }
       if (method === "thread/compact/start") {
         return {};
       }
@@ -272,11 +275,13 @@ describe("AppServerSessionService", () => {
       appServerClientFactory: () => client!,
     });
     const forked = await service.forkThread();
+    const turnCount = await service.getTurnCount();
     await service.compactThread();
     await service.renameThread(" App work ");
     await service.rollbackThread(2);
 
     expect(forked.threadId).toBe("thread-fork");
+    expect(turnCount).toBe(2);
     expect(client.requests.find((request) => request.method === "thread/fork")?.params).toMatchObject({
       threadId: "thread-1",
       cwd: "/workspace/base",
@@ -286,6 +291,10 @@ describe("AppServerSessionService", () => {
     });
     expect(client.requests.find((request) => request.method === "thread/compact/start")?.params).toEqual({
       threadId: "thread-fork",
+    });
+    expect(client.requests.find((request) => request.method === "thread/read")?.params).toEqual({
+      threadId: "thread-fork",
+      includeTurns: true,
     });
     expect(client.requests.find((request) => request.method === "thread/name/set")?.params).toEqual({
       threadId: "thread-fork",

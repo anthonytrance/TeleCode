@@ -20,6 +20,7 @@ export interface CodexSessionRuntime {
   prompt(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void>;
   steer?(input: CodexPromptInput): Promise<void>;
   forkThread?(): Promise<CodexSessionInfo>;
+  getTurnCount?(): Promise<number>;
   compactThread?(): Promise<void>;
   renameThread?(name: string): Promise<void>;
   rollbackThread?(turnCount: number): Promise<void>;

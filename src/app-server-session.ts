@@ -35,6 +35,7 @@ import type { TeleCodexConfig } from "./config.js";
 type AppServerThread = {
   id: string;
   cwd?: string;
+  turns?: unknown[];
 };
 
 type AppServerTurn = {
@@ -264,6 +265,20 @@ export class AppServerSessionService {
       this.currentModel = response.model;
     }
     return this.getInfo();
+  }
+
+  async getTurnCount(): Promise<number> {
+    if (!this.currentThreadId) {
+      throw new Error("No active app-server thread to inspect");
+    }
+    this.ensureIdle("inspect thread history");
+
+    const client = await this.getClient();
+    const response = await client.request<{ thread?: AppServerThread }>("thread/read", {
+      threadId: this.currentThreadId,
+      includeTurns: true,
+    });
+    return Array.isArray(response.thread?.turns) ? response.thread.turns.length : 0;
   }
 
   async compactThread(): Promise<void> {
