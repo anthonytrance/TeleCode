@@ -91,7 +91,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/backend` | Show the current backend for this Telegram context |
 | `/backend appserver` | Switch this Telegram context to app-server; persists across restarts |
 | `/backend sdk` | Switch this Telegram context back to SDK; persists across restarts |
-| `/verbosity <mode>` | Set message verbosity for this Telegram context: `messages`, `edit`, or `none` |
+| `/verbosity <mode>` | Set progress delivery for this Telegram context: `messages`, `edit`, or `none` |
 | `/appserver` | Probe the Codex app-server without switching the live backend |
 | `/appserverturn <prompt>` | Run one isolated app-server diagnostic turn |
 | `/appserversteer <initial> || <steer>` | Run one isolated app-server turn and steer it mid-turn |
@@ -128,6 +128,18 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `none` | Silent |
 
 Per-turn token usage is hidden by default. Set `SHOW_TURN_TOKEN_USAGE=true` if you want the `in / cached / out` footer appended to final replies.
+
+### Progress delivery
+
+`PROGRESS_DELIVERY` sets the default progress delivery mode, and `/verbosity <mode>` overrides it per Telegram context.
+
+| Mode | What you see |
+|---|---|
+| `messages` *(default)* | Separate progress messages during the turn, with the final answer sent cleanly |
+| `edit` | One short rolling progress message, showing the latest five progress lines and grouped tool counts, then a separate final answer |
+| `none` | No progress messages, only the final answer unless there is an error |
+
+Changing `/verbosity` during an active turn affects future progress updates in that turn. Telegram messages already sent are not merged or rewritten into the new mode.
 
 ### Launch profiles
 

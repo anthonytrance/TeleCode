@@ -28,11 +28,29 @@ describe("tool summary formatting", () => {
       ["git status", 1],
     ]);
 
-    const rendered = renderSummaryProgressMessage("npm test", toolCounts);
+    const rendered = renderSummaryProgressMessage("npm test", toolCounts, [
+      "Started git status",
+      "Started npm test",
+    ]);
 
-    expect(rendered.fallbackText).toBe("Working: npm test\nTools used: 2x bash");
+    expect(rendered.fallbackText).toBe(
+      "Working: npm test\nRecent:\n- Started git status\n- Started npm test\nTools used: 2x bash",
+    );
     expect(rendered.text).toContain("<b>Working:</b>");
+    expect(rendered.text).toContain("<b>Recent:</b>");
     expect(rendered.text).toContain("Tools used: 2x bash");
+  });
+
+  it("keeps only the latest progress lines in summary progress", () => {
+    const rendered = renderSummaryProgressMessage(
+      "tool 6",
+      new Map<string, number>([["tool 6", 1]]),
+      ["tool 1", "tool 2", "tool 3", "tool 4", "tool 5", "tool 6"],
+    );
+
+    expect(rendered.fallbackText).not.toContain("tool 1");
+    expect(rendered.fallbackText).toContain("- tool 2");
+    expect(rendered.fallbackText).toContain("- tool 6");
   });
 
   it("keeps the turn usage line format stable when enabled", () => {

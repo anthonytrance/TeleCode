@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  cleanSessionTitle,
   formatSessionLabel,
   renderHelpMessage,
   renderWelcomeFirstTime,
@@ -78,6 +79,18 @@ describe("bot-ui", () => {
   });
 
   describe("formatSessionLabel", () => {
+    it("strips TeleCodex output-file preamble from session labels", () => {
+      const label = formatSessionLabel({
+        workspace: "/project",
+        title:
+          "Output files: write any files the user should receive to C:\\Users\\Anthony\\.telecodex\\turns\\abc\\out\n\nI would like you to help me install Hermes agent",
+        relativeTime: "1m ago",
+        isActive: false,
+      });
+      expect(label).toContain("I would like you");
+      expect(label).not.toContain("Output files");
+    });
+
     it("formats basic session label", () => {
       const label = formatSessionLabel({
         workspace: "/home/user/my-project",
@@ -151,6 +164,20 @@ describe("bot-ui", () => {
         isActive: false,
       });
       expect(label).toContain("very-long…");
+    });
+  });
+
+  describe("cleanSessionTitle", () => {
+    it("keeps ordinary titles unchanged", () => {
+      expect(cleanSessionTitle("Install Hermes agent")).toBe("Install Hermes agent");
+    });
+
+    it("removes output-file preamble", () => {
+      expect(
+        cleanSessionTitle(
+          "Output files: write any files the user should receive to C:\\Users\\Anthony\\.telecodex\\turns\\x\\out\n\nInstall Hermes agent",
+        ),
+      ).toBe("Install Hermes agent");
     });
   });
 });

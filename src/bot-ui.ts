@@ -29,7 +29,7 @@ export function renderHelpMessage(): DualText {
         ["/backend", "Show or switch backend"],
         ["/backend appserver", "Switch to app-server backend"],
         ["/backend sdk", "Switch back to SDK backend"],
-        ["/verbosity <mode>", "Set message verbosity"],
+        ["/verbosity <mode>", "Set progress delivery"],
         ["/appserver", "Probe Codex app-server"],
         ["/appserverturn <prompt>", "Run isolated app-server turn"],
         ["/appserversteer a || b", "Steer isolated app-server turn"],
@@ -37,6 +37,7 @@ export function renderHelpMessage(): DualText {
         ["/artifacttest", "Send a generated test file"],
         ["/sessions", "Browse & switch threads"],
         ["/use <number>", "Switch after /sessions"],
+        ["/use previous", "Switch to previous thread"],
         ["/use latest", "Switch to latest thread"],
         ["/history", "Show recent local thread history"],
         ["/attach", "Bind a Codex thread to this topic"],
@@ -187,7 +188,7 @@ export function formatSessionLabel(
 ): string {
   const prefix = options.isActive ? "✅" : "📁";
   const workspaceName = trimLabel(getWorkspaceShortName(options.workspace), 12) || "(unknown)";
-  const title = trimLabel(options.title || "(untitled)", 20) || "(untitled)";
+  const title = trimLabel(cleanSessionTitle(options.title) || "(untitled)", 20) || "(untitled)";
   const time = options.relativeTime;
 
   let label = `${prefix} ${workspaceName} · ${title} · ${time}`;
@@ -198,6 +199,13 @@ export function formatSessionLabel(
   }
 
   return label;
+}
+
+export function cleanSessionTitle(title: string): string {
+  const normalized = title.replace(/\s+/g, " ").trim();
+  const outputFilesPrefix =
+    /^Output files:\s*write any files the user should receive to\s+.*?[\\/]out\b\s*/i;
+  return normalized.replace(outputFilesPrefix, "").trim();
 }
 
 function trimLabel(text: string, maxLength: number): string {

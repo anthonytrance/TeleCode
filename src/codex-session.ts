@@ -504,6 +504,9 @@ export class CodexSessionService {
     if (value.toLowerCase() === "latest") {
       return listThreads(1)[0] ?? null;
     }
+    if (/^(?:previous|prev)$/i.test(value)) {
+      return listThreads(10).find((thread) => thread.id !== this.currentThreadId) ?? null;
+    }
 
     return getThread(value) ?? getThreadByPrefix(value);
   }

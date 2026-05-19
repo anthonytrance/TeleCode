@@ -24,6 +24,7 @@ import {
 } from "./attachments.js";
 import { collectArtifactReport, ensureOutDir, formatArtifactSummary } from "./artifacts.js";
 import {
+  cleanSessionTitle,
   formatSessionLabel,
   renderHelpMessage,
   renderWelcomeFirstTime,
@@ -55,6 +56,7 @@ const EDIT_DEBOUNCE_MS = 1500;
 const FIRST_INTERMEDIATE_UPDATE_MS = 2500;
 const INTERMEDIATE_UPDATE_MIN_MS = 30000;
 const SUMMARY_PROGRESS_UPDATE_MIN_MS = 30000;
+const SUMMARY_PROGRESS_RECENT_LIMIT = 5;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
@@ -170,6 +172,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
+    pendingSessionPicks.delete(key);
+    pendingSessionButtons.delete(key);
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
@@ -218,6 +222,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchPicks.delete(contextKey);
     pendingLaunchButtons.delete(contextKey);
     pendingUnsafeLaunchConfirmations.delete(contextKey);
+  };
+
+  const clearSessionSelectionState = (contextKey: TelegramContextKey): void => {
+    pendingSessionPicks.delete(contextKey);
+    pendingSessionButtons.delete(contextKey);
   };
 
   const handlePageCallback = (
@@ -319,6 +328,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       await session.newThread();
       updateSessionMetadata(contextKey, session);
+      clearSessionSelectionState(contextKey);
       return true;
     } catch (error) {
       await safeReply(ctx, escapeHTML(`Failed to create thread: ${friendlyErrorText(error)}`), {
@@ -349,9 +359,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
-    const progressDelivery = registry.getProgressDelivery(contextKey);
+    const getProgressDelivery = (): ProgressDelivery => registry.getProgressDelivery(contextKey);
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
+    const recentProgressLines: string[] = [];
     let accumulatedText = "";
     let pendingStreamText = "";
     let sentResponseText = false;
@@ -402,6 +413,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       if (progressTimer) {
         clearTimeout(progressTimer);
         progressTimer = undefined;
+      }
+    };
+
+    const recordProgressLine = (line: string): void => {
+      const trimmed = trimProgressToolName(line);
+      if (!trimmed) {
+        return;
+      }
+      recentProgressLines.push(trimmed);
+      if (recentProgressLines.length > SUMMARY_PROGRESS_RECENT_LIMIT) {
+        recentProgressLines.splice(0, recentProgressLines.length - SUMMARY_PROGRESS_RECENT_LIMIT);
       }
     };
 
@@ -577,6 +599,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const sendProgressUpdate = async (rendered: RenderedText): Promise<void> => {
+      const progressDelivery = getProgressDelivery();
       if (finalized || progressDelivery === "none" || rendered.text === lastProgressText) {
         return;
       }
@@ -697,14 +720,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const deliverIntermediateAssistantText = async (): Promise<void> => {
+      const progressDelivery = getProgressDelivery();
       const text = accumulatedText.trim();
-      accumulatedText = "";
-      pendingStreamText = "";
       if (!text || progressDelivery === "none") {
         return;
       }
 
       if (progressDelivery === "messages") {
+        accumulatedText = "";
+        pendingStreamText = "";
         await deliverFinalMarkdown(text);
       }
     };
@@ -730,7 +754,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const finalUndeliveredText = buildFinalResponseText(pendingStreamText);
       if (finalUndeliveredText) {
         pendingStreamText = "";
-        if (progressDelivery === "edit" && responseMessageId && !sentResponseText) {
+        if (getProgressDelivery() === "edit" && responseMessageId && !sentResponseText) {
           const completed = renderProgressCompletedMessage();
           await safeEditMessage(bot, chatId, responseMessageId, completed.text, {
             parseMode: completed.parseMode,
@@ -780,6 +804,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
+          recordProgressLine(`Started ${toolName}`);
+          void sendProgressUpdate(
+            renderSummaryProgressMessage(toolName, toolCounts, recentProgressLines),
+          ).catch((error) => {
+            console.error(`Failed to send summary progress for ${toolName}`, error);
+          });
           return;
         }
 
@@ -1303,6 +1333,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const info = await session.newThread(session.getCurrentWorkspace());
       updateSessionMetadata(contextKey, session);
+      clearSessionSelectionState(contextKey);
       const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
       const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
@@ -1381,6 +1412,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const info = await session.newThread(workspace);
       updateSessionMetadata(contextKey, session);
+      clearSessionSelectionState(contextKey);
       const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
       const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
@@ -1916,10 +1948,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!rawMode) {
       const current = registry.getProgressDelivery(contextKey);
       const plain = [
-        `Message verbosity for this Telegram context: ${current}`,
+        `Progress delivery for this Telegram context: ${current}`,
         "",
         "Use /verbosity messages for separate progress messages.",
-        "Use /verbosity edit for one edited progress message.",
+        "Use /verbosity edit for one rolling edited progress message.",
         "Use /verbosity none for final answers only.",
       ].join("\n");
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
@@ -1935,14 +1967,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     registry.setProgressDelivery(contextKey, requested);
+    const busyNote = isBusy(contextKey)
+      ? "This applies to future progress updates. Messages already sent in the current turn stay as they are."
+      : "";
     const plain = [
-      `Message verbosity set to ${requested}.`,
+      `Progress delivery set to ${requested}.`,
       requested === "messages"
         ? "I will send separate progress messages and keep the final answer clean."
         : requested === "edit"
-          ? "I will keep one progress message updated, then send the final answer separately."
+          ? "I will keep one rolling progress message updated, then send the final answer separately."
           : "I will send only the final answer unless there is an error.",
-    ].join("\n");
+      busyNote,
+    ].filter(Boolean).join("\n");
     await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
   });
 
@@ -2226,7 +2262,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const rawText = ctx.message?.text ?? "";
     const threadArg = rawText.replace(/^\/(?:sessions|switch|use)(?:@\w+)?\s*/, "").trim();
-    const threadId = resolveSessionSelectionArgument(threadArg, pendingSessionPicks.get(contextKey));
+    const pendingThreadIds = pendingSessionPicks.get(contextKey);
+    if (/^\d+$/.test(threadArg) && !pendingThreadIds) {
+      await safeReply(ctx, escapeHTML("Numbered session selection needs a fresh list. Run /sessions, then use /sessions 1 or /use 1."), {
+        fallbackText: "Numbered session selection needs a fresh list. Run /sessions, then use /sessions 1 or /use 1.",
+      });
+      return;
+    }
+    const threadId = resolveSessionSelectionArgument(threadArg, pendingThreadIds);
 
     if (threadId) {
       const busyState = getBusyState(contextKey);
@@ -2294,14 +2337,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const numberedPlain = orderedSessions
       .map((listedSession, index) => {
         const active = listedSession.id === activeThreadId ? " active" : "";
-        const title = listedSession.title || listedSession.firstUserMessage || "(untitled)";
+        const title = cleanSessionTitle(listedSession.title || listedSession.firstUserMessage || "") || "(untitled)";
         return `${index + 1}. ${getWorkspaceShortName(listedSession.cwd)} - ${trimLine(title, 48)} - ${formatRelativeTime(listedSession.updatedAt)}${active}`;
       })
       .join("\n");
     const numberedHtml = orderedSessions
       .map((listedSession, index) => {
         const active = listedSession.id === activeThreadId ? " <i>active</i>" : "";
-        const title = listedSession.title || listedSession.firstUserMessage || "(untitled)";
+        const title = cleanSessionTitle(listedSession.title || listedSession.firstUserMessage || "") || "(untitled)";
         return `${index + 1}. <code>${escapeHTML(getWorkspaceShortName(listedSession.cwd))}</code> - ${escapeHTML(trimLine(title, 48))} - ${escapeHTML(formatRelativeTime(listedSession.updatedAt))}${active}`;
       })
       .join("\n");
@@ -2326,7 +2369,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const threadId = resolveSessionSelectionArgument(ctx.match[1] ?? "", pendingSessionPicks.get(contextKey));
+    const rawSelection = ctx.match[1] ?? "";
+    const pendingThreadIds = pendingSessionPicks.get(contextKey);
+    if (/^\d+$/.test(rawSelection.trim()) && !pendingThreadIds) {
+      await safeReply(ctx, escapeHTML("Numbered session selection needs a fresh list. Run /sessions, then use /sessions 1 or /use 1."), {
+        fallbackText: "Numbered session selection needs a fresh list. Run /sessions, then use /sessions 1 or /use 1.",
+      });
+      return;
+    }
+
+    const threadId = resolveSessionSelectionArgument(rawSelection, pendingThreadIds);
     if (!threadId) {
       await safeReply(ctx, escapeHTML("Usage: use <number|thread-id|latest>"), {
         fallbackText: "Usage: use <number|thread-id|latest>",
@@ -2422,6 +2474,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         fallbackText: startMessage,
       });
       await session.newThread(targetWorkspace);
+      clearSessionSelectionState(contextKey);
       const seedPrompt = [
         "You are continuing from a previous Codex session.",
         "Treat the following handoff summary as the starting context for this new thread.",
@@ -2763,8 +2816,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await ctx.answerCallbackQuery({ text: "Switching..." });
-    pendingSessionPicks.delete(contextKey);
-    pendingSessionButtons.delete(contextKey);
+    clearSessionSelectionState(contextKey);
 
     const busyState = getBusyState(contextKey);
     busyState.switching = true;
@@ -2828,6 +2880,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const info = await session.newThread(workspace);
       updateSessionMetadata(contextKey, session);
+      clearSessionSelectionState(contextKey);
       const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
       const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
@@ -3378,7 +3431,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "status", description: "Current thread details" },
     { command: "usage", description: "Codex limits & reset times" },
     { command: "backend", description: "Show or reset backend" },
-    { command: "verbosity", description: "Set message verbosity" },
+    { command: "verbosity", description: "Set progress delivery" },
     { command: "appserver", description: "Probe Codex app-server" },
     { command: "appserverturn", description: "Run isolated app-server turn" },
     { command: "appserversteer", description: "Run isolated app-server steer test" },
@@ -3586,10 +3639,24 @@ export function formatToolSummaryLine(toolCounts: Map<string, number>): string {
   return `Tools used: ${tools}`;
 }
 
-export function renderSummaryProgressMessage(toolName: string, toolCounts: Map<string, number>): RenderedText {
+export function renderSummaryProgressMessage(
+  toolName: string,
+  toolCounts: Map<string, number>,
+  recentProgressLines: string[] = [],
+): RenderedText {
   const summaryLine = formatToolSummaryLine(toolCounts);
+  const recentLines = recentProgressLines.slice(-SUMMARY_PROGRESS_RECENT_LIMIT);
   const htmlLines = [`<b>Working:</b> <code>${escapeHTML(trimProgressToolName(toolName))}</code>`];
   const plainLines = [`Working: ${trimProgressToolName(toolName)}`];
+
+  if (recentLines.length > 0) {
+    htmlLines.push("<b>Recent:</b>");
+    plainLines.push("Recent:");
+    for (const line of recentLines) {
+      htmlLines.push(`- ${escapeHTML(trimProgressToolName(line))}`);
+      plainLines.push(`- ${trimProgressToolName(line)}`);
+    }
+  }
 
   if (summaryLine) {
     htmlLines.push(escapeHTML(summaryLine));
