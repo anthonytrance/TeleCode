@@ -4,9 +4,11 @@ describe("tool summary formatting", () => {
   it("normalizes raw tool names into compact summary categories", () => {
     expect(summarizeToolName("ls -la")).toBe("bash");
     expect(summarizeToolName("🔍 latest codex release")).toBe("web_fetch");
+    expect(summarizeToolName("search latest codex release")).toBe("web_search");
     expect(summarizeToolName("mcp:codex_apps/spawn_agent")).toBe("subagent");
     expect(summarizeToolName("mcp:codex_apps/github_fetch")).toBe("github_fetch");
     expect(summarizeToolName("file_change")).toBe("file_change");
+    expect(summarizeToolName("plan")).toBe("plan");
   });
 
   it("formats a short summary line with grouped counts", () => {
@@ -34,7 +36,7 @@ describe("tool summary formatting", () => {
     ]);
 
     expect(rendered.fallbackText).toBe(
-      "Working: npm test\nRecent:\n- Started git status\n- Started npm test\nTools used: 2x bash",
+      "Working: bash\nRecent:\n- Started git status\n- Started npm test\nTools used: 2x bash",
     );
     expect(rendered.text).toContain("<b>Working:</b>");
     expect(rendered.text).toContain("<b>Recent:</b>");

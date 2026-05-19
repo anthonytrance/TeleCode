@@ -136,7 +136,7 @@ Per-turn token usage is hidden by default. Set `SHOW_TURN_TOKEN_USAGE=true` if y
 | Mode | What you see |
 |---|---|
 | `messages` *(default)* | Separate progress messages during the turn, with the final answer sent cleanly |
-| `edit` | One short rolling progress message, showing the latest five progress lines and grouped tool counts, then a separate final answer |
+| `edit` | One short rolling progress message, sent immediately on first progress and then edited with a short debounce, showing the latest five progress lines and grouped tool counts, then a separate final answer |
 | `none` | No progress messages, only the final answer unless there is an error |
 
 Changing `/verbosity` during an active turn affects future progress updates in that turn. Telegram messages already sent are not merged or rewritten into the new mode.

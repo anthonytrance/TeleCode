@@ -347,7 +347,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
-    const streamAssistantText = config.streamAssistantText && !shouldHoldFinalResponse(userInput);
+    const getProgressDelivery = (): ProgressDelivery => registry.getProgressDelivery(contextKey);
+    const shouldStreamAssistantText = (): boolean =>
+      config.streamAssistantText && getProgressDelivery() === "messages" && !shouldHoldFinalResponse(userInput);
 
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
@@ -359,7 +361,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
-    const getProgressDelivery = (): ProgressDelivery => registry.getProgressDelivery(contextKey);
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
     const recentProgressLines: string[] = [];
@@ -540,6 +541,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const flushResponse = async (force = false): Promise<void> => {
+      if (getProgressDelivery() !== "messages") {
+        return;
+      }
       if (!pendingStreamText) {
         return;
       }
@@ -584,7 +588,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const scheduleFlush = (): void => {
-      if (flushTimer || finalized) {
+      if (flushTimer || finalized || getProgressDelivery() !== "messages") {
         return;
       }
 
@@ -610,10 +614,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
 
       const now = Date.now();
-      if (lastProgressEditAt && now - lastProgressEditAt < SUMMARY_PROGRESS_UPDATE_MIN_MS) {
+      const progressUpdateMinMs =
+        progressDelivery === "edit" ? EDIT_DEBOUNCE_MS : SUMMARY_PROGRESS_UPDATE_MIN_MS;
+      if (lastProgressEditAt && now - lastProgressEditAt < progressUpdateMinMs) {
         pendingProgress = rendered;
         if (!progressTimer) {
-          const delay = Math.max(0, SUMMARY_PROGRESS_UPDATE_MIN_MS - (now - lastProgressEditAt));
+          const delay = Math.max(0, progressUpdateMinMs - (now - lastProgressEditAt));
           progressTimer = setTimeout(() => {
             progressTimer = undefined;
             const next = pendingProgress;
@@ -787,11 +793,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
         pendingStreamText += delta;
-        if (streamAssistantText) {
+        if (shouldStreamAssistantText()) {
           scheduleFlush();
         }
       },
       onToolStart: (toolName: string, toolCallId: string) => {
+        const streamAssistantText = shouldStreamAssistantText();
         if (streamAssistantText && pendingStreamText.trim()) {
           void flushResponse(true).catch((error) => {
             console.error("Failed to flush assistant progress before tool start", error);
@@ -802,9 +809,26 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           });
         }
 
+        const progressDelivery = getProgressDelivery();
+        if (progressDelivery === "none" || toolVerbosity === "none") {
+          return;
+        }
+
+        toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
+        toolStates.set(toolCallId, { toolName, partialResult: "" });
+
+        if (progressDelivery === "edit") {
+          recordProgressLine(`Started ${formatProgressToolName(toolName)}`);
+          void sendProgressUpdate(
+            renderSummaryProgressMessage(toolName, toolCounts, recentProgressLines),
+          ).catch((error) => {
+            console.error(`Failed to send edit-mode progress for ${toolName}`, error);
+          });
+          return;
+        }
+
         if (toolVerbosity === "summary") {
-          toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
-          recordProgressLine(`Started ${toolName}`);
+          recordProgressLine(`Started ${formatProgressToolName(toolName)}`);
           void sendProgressUpdate(
             renderSummaryProgressMessage(toolName, toolCounts, recentProgressLines),
           ).catch((error) => {
@@ -813,11 +837,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           return;
         }
 
-        if (toolVerbosity === "none") {
-          return;
-        }
-
-        toolStates.set(toolCallId, { toolName, partialResult: "" });
         if (toolVerbosity !== "all") {
           return;
         }
@@ -847,6 +866,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         });
       },
       onToolUpdate: (toolCallId: string, partialResult: string) => {
+        if (getProgressDelivery() !== "messages") {
+          return;
+        }
+
         if (toolVerbosity === "none" || toolVerbosity === "summary") {
           return;
         }
@@ -859,12 +882,27 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         state.partialResult = appendWithCap(state.partialResult, partialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
       },
       onToolEnd: (toolCallId: string, isError: boolean) => {
-        if (toolVerbosity === "none" || toolVerbosity === "summary") {
+        const progressDelivery = getProgressDelivery();
+        if (progressDelivery === "none" || toolVerbosity === "none") {
           return;
         }
 
         const state = toolStates.get(toolCallId);
         if (!state) {
+          return;
+        }
+
+        if (progressDelivery === "edit") {
+          recordProgressLine(`${isError ? "Failed" : "Finished"} ${formatProgressToolName(state.toolName)}`);
+          void sendProgressUpdate(
+            renderSummaryProgressMessage(state.toolName, toolCounts, recentProgressLines),
+          ).catch((error) => {
+            console.error(`Failed to update edit-mode progress for ${state.toolName}`, error);
+          });
+          return;
+        }
+
+        if (toolVerbosity === "summary") {
           return;
         }
 
@@ -896,7 +934,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         });
       },
       onTodoUpdate: (items) => {
-        if (toolVerbosity === "none") {
+        const progressDelivery = getProgressDelivery();
+        if (toolVerbosity === "none" || progressDelivery === "none") {
+          return;
+        }
+
+        if (progressDelivery === "edit") {
+          recordProgressLine("Updated plan");
+          void sendProgressUpdate(
+            renderSummaryProgressMessage("plan", toolCounts, recentProgressLines),
+          ).catch((error) => {
+            console.error("Failed to update edit-mode plan progress", error);
+          });
           return;
         }
 
@@ -3646,8 +3695,9 @@ export function renderSummaryProgressMessage(
 ): RenderedText {
   const summaryLine = formatToolSummaryLine(toolCounts);
   const recentLines = recentProgressLines.slice(-SUMMARY_PROGRESS_RECENT_LIMIT);
-  const htmlLines = [`<b>Working:</b> <code>${escapeHTML(trimProgressToolName(toolName))}</code>`];
-  const plainLines = [`Working: ${trimProgressToolName(toolName)}`];
+  const progressToolName = formatProgressToolName(toolName);
+  const htmlLines = [`<b>Working:</b> <code>${escapeHTML(progressToolName)}</code>`];
+  const plainLines = [`Working: ${progressToolName}`];
 
   if (recentLines.length > 0) {
     htmlLines.push("<b>Recent:</b>");
@@ -3683,6 +3733,10 @@ function trimProgressToolName(toolName: string): string {
   return singleLine.length <= 120 ? singleLine : `${singleLine.slice(0, 119)}...`;
 }
 
+function formatProgressToolName(toolName: string): string {
+  return trimProgressToolName(summarizeToolName(toolName));
+}
+
 function renderTodoList(items: Array<{ text: string; completed: boolean }>): string {
   const lines = items.map((item) => {
     const icon = item.completed ? "✅" : "⬜";
@@ -3700,8 +3754,16 @@ export function summarizeToolName(toolName: string): string {
     return "web_fetch";
   }
 
+  if (toolName.startsWith("search ")) {
+    return "web_search";
+  }
+
   if (toolName === "file_change") {
     return "file_change";
+  }
+
+  if (toolName === "plan") {
+    return "plan";
   }
 
   if (toolName === "⚠️ error") {
