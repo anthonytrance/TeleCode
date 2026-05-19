@@ -1,4 +1,10 @@
-import { formatToolSummaryLine, formatTurnUsageLine, renderSummaryProgressMessage, summarizeToolName } from "../src/bot.js";
+import {
+  formatToolSummaryLine,
+  formatTurnUsageLine,
+  renderAssistantProgressMessage,
+  renderSummaryProgressMessage,
+  summarizeToolName,
+} from "../src/bot.js";
 
 describe("tool summary formatting", () => {
   it("normalizes raw tool names into compact summary categories", () => {
@@ -53,6 +59,19 @@ describe("tool summary formatting", () => {
     expect(rendered.fallbackText).not.toContain("tool 1");
     expect(rendered.fallbackText).toContain("- tool 2");
     expect(rendered.fallbackText).toContain("- tool 6");
+  });
+
+  it("formats assistant progress without tool summary wording", () => {
+    const rendered = renderAssistantProgressMessage([
+      "I am checking the message handling path.",
+      "I found the edit-mode throttle.",
+    ]);
+
+    expect(rendered.fallbackText).toBe(
+      "Progress:\n- I am checking the message handling path.\n- I found the edit-mode throttle.",
+    );
+    expect(rendered.fallbackText).not.toContain("Working: bash");
+    expect(rendered.fallbackText).not.toContain("Tools used");
   });
 
   it("keeps the turn usage line format stable when enabled", () => {

@@ -364,6 +364,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
     const recentProgressLines: string[] = [];
+    const recentAssistantProgress: string[] = [];
     let accumulatedText = "";
     let pendingStreamText = "";
     let sentResponseText = false;
@@ -425,6 +426,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       recentProgressLines.push(trimmed);
       if (recentProgressLines.length > SUMMARY_PROGRESS_RECENT_LIMIT) {
         recentProgressLines.splice(0, recentProgressLines.length - SUMMARY_PROGRESS_RECENT_LIMIT);
+      }
+    };
+
+    const recordAssistantProgress = (text: string): void => {
+      const trimmed = trimProgressText(text);
+      if (!trimmed) {
+        return;
+      }
+      recentAssistantProgress.push(trimmed);
+      if (recentAssistantProgress.length > SUMMARY_PROGRESS_RECENT_LIMIT) {
+        recentAssistantProgress.splice(0, recentAssistantProgress.length - SUMMARY_PROGRESS_RECENT_LIMIT);
       }
     };
 
@@ -736,6 +748,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         accumulatedText = "";
         pendingStreamText = "";
         await deliverFinalMarkdown(text);
+        return;
+      }
+
+      if (progressDelivery === "edit") {
+        accumulatedText = "";
+        pendingStreamText = "";
+        recordAssistantProgress(text);
+        await sendProgressUpdate(renderAssistantProgressMessage(recentAssistantProgress));
       }
     };
 
@@ -814,18 +834,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           return;
         }
 
-        toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
-        toolStates.set(toolCallId, { toolName, partialResult: "" });
-
         if (progressDelivery === "edit") {
-          recordProgressLine(`Started ${formatProgressToolName(toolName)}`);
-          void sendProgressUpdate(
-            renderSummaryProgressMessage(toolName, toolCounts, recentProgressLines),
-          ).catch((error) => {
-            console.error(`Failed to send edit-mode progress for ${toolName}`, error);
-          });
           return;
         }
+
+        toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
+        toolStates.set(toolCallId, { toolName, partialResult: "" });
 
         if (toolVerbosity === "summary") {
           recordProgressLine(`Started ${formatProgressToolName(toolName)}`);
@@ -893,12 +907,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
 
         if (progressDelivery === "edit") {
-          recordProgressLine(`${isError ? "Failed" : "Finished"} ${formatProgressToolName(state.toolName)}`);
-          void sendProgressUpdate(
-            renderSummaryProgressMessage(state.toolName, toolCounts, recentProgressLines),
-          ).catch((error) => {
-            console.error(`Failed to update edit-mode progress for ${state.toolName}`, error);
-          });
           return;
         }
 
@@ -940,12 +948,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
 
         if (progressDelivery === "edit") {
-          recordProgressLine("Updated plan");
-          void sendProgressUpdate(
-            renderSummaryProgressMessage("plan", toolCounts, recentProgressLines),
-          ).catch((error) => {
-            console.error("Failed to update edit-mode plan progress", error);
-          });
           return;
         }
 
@@ -3720,6 +3722,23 @@ export function renderSummaryProgressMessage(
   };
 }
 
+export function renderAssistantProgressMessage(recentProgressLines: string[]): RenderedText {
+  const recentLines = recentProgressLines.slice(-SUMMARY_PROGRESS_RECENT_LIMIT);
+  const htmlLines = ["<b>Progress:</b>"];
+  const plainLines = ["Progress:"];
+
+  for (const line of recentLines) {
+    htmlLines.push(`- ${escapeHTML(trimProgressText(line))}`);
+    plainLines.push(`- ${trimProgressText(line)}`);
+  }
+
+  return {
+    text: htmlLines.join("\n"),
+    fallbackText: plainLines.join("\n"),
+    parseMode: "HTML",
+  };
+}
+
 function renderProgressCompletedMessage(): RenderedText {
   return {
     text: "<b>Completed.</b>",
@@ -3735,6 +3754,11 @@ function trimProgressToolName(toolName: string): string {
 
 function formatProgressToolName(toolName: string): string {
   return trimProgressToolName(summarizeToolName(toolName));
+}
+
+function trimProgressText(text: string): string {
+  const singleLine = text.replace(/\s+/g, " ").trim();
+  return singleLine.length <= 500 ? singleLine : `${singleLine.slice(0, 499)}...`;
 }
 
 function renderTodoList(items: Array<{ text: string; completed: boolean }>): string {
