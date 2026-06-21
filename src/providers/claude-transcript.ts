@@ -22,6 +22,12 @@ export interface ClaudeTranscriptProjection {
 
 export interface TranscriptTailerOptions {
   startAtEnd?: boolean;
+  /**
+   * Byte offset to begin reading from. Takes precedence over startAtEnd. Use this to
+   * resume reading a transcript that already holds this turn's content: capture the file
+   * size *before* the prompt is sent, then start the tailer there so nothing is skipped.
+   */
+  startOffset?: number;
   pollIntervalMs?: number;
 }
 
@@ -51,6 +57,104 @@ export async function findTranscript(
     await sleep(500);
   }
   return null;
+}
+
+/**
+ * Snapshot the set of transcript jsonl paths currently on disk across every project
+ * directory under the config dir. Used to detect the file Claude creates for a turn:
+ * interactive Claude ignores the --session-id we pass, so we cannot predict the
+ * filename and must spot the one that appears (or grows) instead.
+ */
+export async function snapshotTranscripts(configDir?: string): Promise<Set<string>> {
+  const baseConfigDir = configDir ?? path.join(homedir(), ".claude");
+  const projectsDir = path.join(baseConfigDir, "projects");
+  const result = new Set<string>();
+  let projectDirs: string[];
+  try {
+    projectDirs = await readdir(projectsDir);
+  } catch {
+    return result;
+  }
+  for (const projectDir of projectDirs) {
+    let files: string[];
+    try {
+      files = await readdir(path.join(projectsDir, projectDir));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (file.endsWith(".jsonl")) {
+        result.add(path.join(projectsDir, projectDir, file));
+      }
+    }
+  }
+  return result;
+}
+
+export interface ActiveTranscript {
+  path: string;
+  /** Byte offset to start the tailer at so only this turn's content is read. */
+  startOffset: number;
+}
+
+/**
+ * Find the transcript that is actively receiving this turn's content. Prefers a
+ * brand-new file (covers the first turn, where Claude ignores --session-id, and the
+ * case where --resume forks a new session id). Falls back to a known transcript that
+ * has grown past the offset captured before the prompt was sent (the in-process resume
+ * where Claude appends to the same file).
+ */
+export async function locateActiveTranscript(options: {
+  before: Set<string>;
+  knownPath?: string;
+  knownOffset: number;
+  timeoutMs: number;
+  configDir?: string;
+  pollIntervalMs?: number;
+}): Promise<ActiveTranscript | null> {
+  const deadline = Date.now() + options.timeoutMs;
+  const pollIntervalMs = options.pollIntervalMs ?? 400;
+  while (Date.now() <= deadline) {
+    const now = await snapshotTranscripts(options.configDir);
+    const fresh: string[] = [];
+    for (const candidate of now) {
+      if (!options.before.has(candidate)) {
+        fresh.push(candidate);
+      }
+    }
+    if (fresh.length > 0) {
+      return { path: await newestPath(fresh), startOffset: 0 };
+    }
+    if (options.knownPath && existsSync(options.knownPath)) {
+      const size = statSyncSize(options.knownPath);
+      if (size > options.knownOffset) {
+        return { path: options.knownPath, startOffset: options.knownOffset };
+      }
+    }
+    await sleep(pollIntervalMs);
+  }
+  return null;
+}
+
+export function sessionIdFromTranscriptPath(transcriptPath: string): string {
+  return path.basename(transcriptPath, ".jsonl");
+}
+
+async function newestPath(paths: string[]): Promise<string> {
+  let best = paths[0]!;
+  let bestMtime = -1;
+  for (const candidate of paths) {
+    try {
+      const mtime = (await stat(candidate)).mtimeMs;
+      if (mtime >= bestMtime) {
+        bestMtime = mtime;
+        best = candidate;
+      }
+    } catch {
+      // Ignore files that vanished between snapshot and stat.
+    }
+  }
+  return best;
 }
 
 export function projectClaudeTranscriptEntry(
@@ -165,7 +269,9 @@ export class TranscriptTailer {
     options: TranscriptTailerOptions = {},
   ) {
     this.pollIntervalMs = options.pollIntervalMs ?? 750;
-    if (options.startAtEnd && existsSync(transcriptPath)) {
+    if (typeof options.startOffset === "number") {
+      this.offset = Math.max(0, options.startOffset);
+    } else if (options.startAtEnd && existsSync(transcriptPath)) {
       this.offset = statSyncSize(transcriptPath);
     }
   }

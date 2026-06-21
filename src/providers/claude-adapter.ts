@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
 import type { ClaudePermissionMode, TeleCodexConfig } from "../config.js";
@@ -18,6 +18,9 @@ import {
 } from "./claude-pty.js";
 import {
   findTranscript,
+  locateActiveTranscript,
+  sessionIdFromTranscriptPath,
+  snapshotTranscripts,
   TranscriptTailer,
   type ClaudeUsageSnapshot,
 } from "./claude-transcript.js";
@@ -46,6 +49,8 @@ interface RuntimeSession {
   pty?: ClaudePty;
   busy: boolean;
   lastUsage?: ClaudeUsageSnapshot;
+  /** Path to the transcript Claude actually writes; discovered on the first turn. */
+  transcriptPath?: string;
 }
 
 export class ClaudeProviderAdapter implements AgentProviderAdapter {
@@ -104,15 +109,12 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
     try {
       await this.ensurePty(runtime, "resume");
-      const transcriptBeforePrompt = await findTranscript(runtime.providerSessionId, 1500, this.config.claudeConfigDir);
-      const startAtEnd = Boolean(transcriptBeforePrompt);
-      await runtime.pty!.sendPrompt(promptText);
-      const transcriptPath = transcriptBeforePrompt ?? await findTranscript(runtime.providerSessionId, 30000, this.config.claudeConfigDir);
-      if (!transcriptPath) {
-        throw new Error("Claude transcript was not created");
-      }
+      const { transcriptPath, startOffset } = await this.locateTurnTranscript(
+        runtime,
+        () => runtime.pty!.sendPrompt(promptText),
+      );
 
-      const tailer = new TranscriptTailer(transcriptPath, { startAtEnd });
+      const tailer = new TranscriptTailer(transcriptPath, { startOffset });
       for await (const event of tailer.eventsUntilTurnEnd({
         sessionId: runtime.descriptor.id,
         jobId: options.jobId,
@@ -149,13 +151,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime.busy = true;
     try {
       await this.ensurePty(runtime, "resume");
-      const transcriptBeforePrompt = await findTranscript(runtime.providerSessionId, 1500, this.config.claudeConfigDir);
-      await runtime.pty!.sendCommand("/compact");
-      const transcriptPath = transcriptBeforePrompt ?? await findTranscript(runtime.providerSessionId, 30000, this.config.claudeConfigDir);
-      if (!transcriptPath) {
-        throw new Error("Claude transcript was not created");
-      }
-      const tailer = new TranscriptTailer(transcriptPath, { startAtEnd: Boolean(transcriptBeforePrompt) });
+      const { transcriptPath, startOffset } = await this.locateTurnTranscript(
+        runtime,
+        () => runtime.pty!.sendCommand("/compact"),
+      );
+      const tailer = new TranscriptTailer(transcriptPath, { startOffset });
       const summary = await tailer.waitForCompact({
         sessionId,
         jobId: `compact-${Date.now()}`,
@@ -261,6 +261,47 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime.pty = ptySession;
   }
 
+  /**
+   * Send a turn and locate the transcript Claude writes for it. Interactive Claude
+   * ignores the --session-id we pass, so we cannot predict the filename. We snapshot the
+   * transcripts on disk before sending, then detect the file that appears or grows, and
+   * reconcile the runtime's session id to the real one so later --resume and reads work.
+   */
+  private async locateTurnTranscript(
+    runtime: RuntimeSession,
+    send: () => Promise<void>,
+  ): Promise<{ transcriptPath: string; startOffset: number }> {
+    const configDir = this.config.claudeConfigDir;
+    let knownPath = runtime.transcriptPath;
+    if (!knownPath) {
+      knownPath = (await findTranscript(runtime.providerSessionId, 1000, configDir)) ?? undefined;
+    }
+    const knownOffset = knownPath && existsSync(knownPath) ? safeFileSize(knownPath) : 0;
+
+    const before = await snapshotTranscripts(configDir);
+    await send();
+
+    const active = await locateActiveTranscript({
+      before,
+      knownPath,
+      knownOffset,
+      timeoutMs: 30000,
+      configDir,
+    });
+    if (!active) {
+      throw new Error("Claude transcript was not created");
+    }
+
+    runtime.transcriptPath = active.path;
+    const realSessionId = sessionIdFromTranscriptPath(active.path);
+    if (realSessionId && realSessionId !== runtime.providerSessionId) {
+      runtime.providerSessionId = realSessionId;
+      runtime.descriptor.providerSessionId = realSessionId;
+      runtime.descriptor.updatedAt = Date.now();
+    }
+    return { transcriptPath: active.path, startOffset: active.startOffset };
+  }
+
   private buildDescriptor(options: {
     id: string;
     providerSessionId: string;
@@ -330,6 +371,14 @@ function promptToText(input: AgentSendPromptOptions["input"]): string {
     parts.push(`File: ${filePath}`);
   }
   return parts.join("\n\n");
+}
+
+function safeFileSize(filePath: string): number {
+  try {
+    return statSync(filePath).size;
+  } catch {
+    return 0;
+  }
 }
 
 function asString(value: unknown): string {

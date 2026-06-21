@@ -1997,6 +1997,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
       }
 
+      // Claude reveals its real session id only once the first turn runs (it ignores the
+      // id we launch with), so the adapter reconciles it mid-turn. Pull the refreshed
+      // descriptor and propagate the real id into both state stores so --resume works.
+      try {
+        const refreshed = await claudeAdapter.getSessionInfo(descriptor.id);
+        if (
+          refreshed.providerSessionId &&
+          refreshed.providerSessionId !== descriptor.providerSessionId
+        ) {
+          descriptor = refreshed;
+          claudeSessions.set(contextKey, refreshed);
+          agentSessions.updateProviderSessionId(agentSession.id, refreshed.providerSessionId);
+          persistAgentSessionState();
+        }
+      } catch {
+        // Non-fatal: keep the existing descriptor if the adapter cannot be queried.
+      }
+
       finalText = finalText.trim() || (sentAssistantProgress ? "" : streamedText.trim());
       if (!finalText) {
         finalText = "Claude finished without text.";

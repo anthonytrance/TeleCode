@@ -143,6 +143,18 @@ export class AgentSessionManager {
     return cloneSession(session);
   }
 
+  /**
+   * Reconcile the provider session id of an existing record. Claude reveals its real
+   * session id only on the first turn (it ignores the id we launch with), so the record
+   * created up front holds a placeholder that must be corrected once the turn runs.
+   */
+  updateProviderSessionId(sessionId: string, providerSessionId: string): AgentSessionRecord {
+    const session = this.requireSession(sessionId);
+    session.providerSessionId = providerSessionId;
+    session.updatedAt = this.now();
+    return cloneSession(session);
+  }
+
   selectSession(laneKey: TelegramContextKey, sessionId: string): AgentSessionRecord {
     const lane = this.requireLane(laneKey);
     const session = this.requireSession(sessionId);
