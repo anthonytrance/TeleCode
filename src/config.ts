@@ -43,6 +43,7 @@ export interface TeleCodexConfig {
   enableClaudeProvider: boolean;
   claudeBin: string;
   claudeConfigDir: string;
+  claudeStrictMcpConfig: boolean;
   claudeDefaultModel: string;
   claudeWorkspace: string;
   claudePermissionMode: ClaudePermissionMode;
@@ -94,6 +95,13 @@ export function loadConfig(): TeleCodexConfig {
   const claudeConfigDir = path.resolve(
     optionalString(process.env.CLAUDE_CONFIG_DIR_OVERRIDE) ?? path.join(homedir(), ".telecodex", "claude-config"),
   );
+  // When true the child launches against the real ~/.claude with --strict-mcp-config,
+  // which keeps the user-scoped telegram plugin from starting a competing getUpdates
+  // poller (that poller 409s the live bridge). The trade-off is it disables ALL of the
+  // user's mcp servers, so it is a stopgap: production wants the real mcp servers running
+  // with only the telegram poller neutralized. When false, falls back to the isolated
+  // CLAUDE_CONFIG_DIR approach (where interactive turns currently do not execute).
+  const claudeStrictMcpConfig = parseBooleanEnv(optionalString(process.env.CLAUDE_STRICT_MCP_CONFIG), true);
   const claudeDefaultModel = optionalString(process.env.CLAUDE_DEFAULT_MODEL) ?? "sonnet";
   const claudeWorkspace = path.resolve(optionalString(process.env.CLAUDE_WORKSPACE) ?? workspace);
   const claudePermissionMode = parseClaudePermissionMode(optionalString(process.env.CLAUDE_PERMISSION_MODE));
@@ -135,6 +143,7 @@ export function loadConfig(): TeleCodexConfig {
     enableClaudeProvider,
     claudeBin,
     claudeConfigDir,
+    claudeStrictMcpConfig,
     claudeDefaultModel,
     claudeWorkspace,
     claudePermissionMode,

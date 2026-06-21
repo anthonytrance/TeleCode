@@ -120,6 +120,7 @@ describe("loadConfig", () => {
       enableClaudeProvider: false,
       claudeBin: "C:\\Users\\Anthony\\.local\\bin\\claude.exe",
       claudeConfigDir: path.join(homedir(), ".telecodex", "claude-config"),
+      claudeStrictMcpConfig: true,
       claudeDefaultModel: "sonnet",
       claudeWorkspace: process.cwd(),
       claudePermissionMode: "acceptEdits",
@@ -358,6 +359,7 @@ describe("loadConfig", () => {
     process.env.CLAUDE_DEFAULT_MODEL = "opus";
     process.env.CLAUDE_WORKSPACE = path.join(tempDir, "claude-workspace");
     process.env.CLAUDE_PERMISSION_MODE = "plan";
+    process.env.CLAUDE_STRICT_MCP_CONFIG = "false";
     process.env.CLAUDE_TURN_IDLE_TIMEOUT = "60";
     process.env.CLAUDE_CONTEXT_WINDOW = "123456";
 
@@ -366,6 +368,7 @@ describe("loadConfig", () => {
     expect(config.enableClaudeProvider).toBe(true);
     expect(config.claudeBin).toBe(path.join(tempDir, "claude.exe"));
     expect(config.claudeConfigDir).toBe(path.join(tempDir, "claude-config"));
+    expect(config.claudeStrictMcpConfig).toBe(false);
     expect(config.claudeDefaultModel).toBe("opus");
     expect(config.claudeWorkspace).toBe(path.join(tempDir, "claude-workspace"));
     expect(config.claudePermissionMode).toBe("plan");

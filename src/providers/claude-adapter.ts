@@ -228,12 +228,22 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           "--permission-mode",
           runtime.permissionMode,
         ];
-    ensureClaudeConfigDir(this.config.claudeConfigDir);
+
+    const strictMcp = this.config.claudeStrictMcpConfig;
+    if (strictMcp) {
+      // Launch against the real ~/.claude but ignore config-file mcp servers, so the
+      // user-scoped telegram plugin never starts a second getUpdates poller (which 409s
+      // the live bridge). Interactive turns do not execute under an isolated config dir,
+      // so this is the path that actually works end to end.
+      args.push("--strict-mcp-config");
+    } else {
+      ensureClaudeConfigDir(this.config.claudeConfigDir);
+    }
     ptySession.spawn({
       bin: this.config.claudeBin,
       args,
       cwd: runtime.workspace,
-      configDir: this.config.claudeConfigDir,
+      configDir: strictMcp ? undefined : this.config.claudeConfigDir,
     });
 
     const firstMarker = await ptySession.waitForMarker([
@@ -267,11 +277,19 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
    * transcripts on disk before sending, then detect the file that appears or grows, and
    * reconcile the runtime's session id to the real one so later --resume and reads work.
    */
+  /**
+   * Config dir to scan for transcripts. In strict-mcp mode the child runs against the
+   * real ~/.claude (undefined => homedir/.claude); otherwise the isolated config dir.
+   */
+  private get transcriptConfigDir(): string | undefined {
+    return this.config.claudeStrictMcpConfig ? undefined : this.config.claudeConfigDir;
+  }
+
   private async locateTurnTranscript(
     runtime: RuntimeSession,
     send: () => Promise<void>,
   ): Promise<{ transcriptPath: string; startOffset: number }> {
-    const configDir = this.config.claudeConfigDir;
+    const configDir = this.transcriptConfigDir;
     let knownPath = runtime.transcriptPath;
     if (!knownPath) {
       knownPath = (await findTranscript(runtime.providerSessionId, 1000, configDir)) ?? undefined;
