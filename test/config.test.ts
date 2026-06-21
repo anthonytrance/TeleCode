@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 import { loadConfig } from "../src/config.js";
@@ -119,6 +119,7 @@ describe("loadConfig", () => {
       enableTelegramReactions: false,
       enableClaudeProvider: false,
       claudeBin: "C:\\Users\\Anthony\\.local\\bin\\claude.exe",
+      claudeConfigDir: path.join(homedir(), ".telecodex", "claude-config"),
       claudeDefaultModel: "sonnet",
       claudeWorkspace: process.cwd(),
       claudePermissionMode: "acceptEdits",
@@ -353,6 +354,7 @@ describe("loadConfig", () => {
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
     process.env.ENABLE_CLAUDE_PROVIDER = "true";
     process.env.CLAUDE_BIN = path.join(tempDir, "claude.exe");
+    process.env.CLAUDE_CONFIG_DIR_OVERRIDE = path.join(tempDir, "claude-config");
     process.env.CLAUDE_DEFAULT_MODEL = "opus";
     process.env.CLAUDE_WORKSPACE = path.join(tempDir, "claude-workspace");
     process.env.CLAUDE_PERMISSION_MODE = "plan";
@@ -363,6 +365,7 @@ describe("loadConfig", () => {
 
     expect(config.enableClaudeProvider).toBe(true);
     expect(config.claudeBin).toBe(path.join(tempDir, "claude.exe"));
+    expect(config.claudeConfigDir).toBe(path.join(tempDir, "claude-config"));
     expect(config.claudeDefaultModel).toBe("opus");
     expect(config.claudeWorkspace).toBe(path.join(tempDir, "claude-workspace"));
     expect(config.claudePermissionMode).toBe("plan");

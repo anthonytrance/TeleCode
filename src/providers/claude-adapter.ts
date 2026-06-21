@@ -10,6 +10,7 @@ import type {
   AgentSessionDescriptor,
   CreateAgentSessionOptions,
 } from "./types.js";
+import { ensureClaudeConfigDir } from "./claude-config-dir.js";
 import {
   CLAUDE_READY_MARKERS,
   CLAUDE_TRUST_MARKERS,
@@ -103,10 +104,10 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
     try {
       await this.ensurePty(runtime, "resume");
-      const transcriptBeforePrompt = await findTranscript(runtime.providerSessionId, 1500);
+      const transcriptBeforePrompt = await findTranscript(runtime.providerSessionId, 1500, this.config.claudeConfigDir);
       const startAtEnd = Boolean(transcriptBeforePrompt);
       await runtime.pty!.sendPrompt(promptText);
-      const transcriptPath = transcriptBeforePrompt ?? await findTranscript(runtime.providerSessionId, 30000);
+      const transcriptPath = transcriptBeforePrompt ?? await findTranscript(runtime.providerSessionId, 30000, this.config.claudeConfigDir);
       if (!transcriptPath) {
         throw new Error("Claude transcript was not created");
       }
@@ -148,9 +149,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime.busy = true;
     try {
       await this.ensurePty(runtime, "resume");
-      const transcriptBeforePrompt = await findTranscript(runtime.providerSessionId, 1500);
+      const transcriptBeforePrompt = await findTranscript(runtime.providerSessionId, 1500, this.config.claudeConfigDir);
       await runtime.pty!.sendCommand("/compact");
-      const transcriptPath = transcriptBeforePrompt ?? await findTranscript(runtime.providerSessionId, 30000);
+      const transcriptPath = transcriptBeforePrompt ?? await findTranscript(runtime.providerSessionId, 30000, this.config.claudeConfigDir);
       if (!transcriptPath) {
         throw new Error("Claude transcript was not created");
       }
@@ -227,7 +228,13 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           "--permission-mode",
           runtime.permissionMode,
         ];
-    ptySession.spawn({ bin: this.config.claudeBin, args, cwd: runtime.workspace });
+    ensureClaudeConfigDir(this.config.claudeConfigDir);
+    ptySession.spawn({
+      bin: this.config.claudeBin,
+      args,
+      cwd: runtime.workspace,
+      configDir: this.config.claudeConfigDir,
+    });
 
     const firstMarker = await ptySession.waitForMarker([
       ...CLAUDE_TRUST_MARKERS,

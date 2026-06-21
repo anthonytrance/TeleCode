@@ -10,6 +10,8 @@ export interface ClaudePtySpawnOptions {
   bin: string;
   args: string[];
   cwd: string;
+  /** Isolated CLAUDE_CONFIG_DIR so the child does not load the user-scoped telegram plugin. */
+  configDir?: string;
   cols?: number;
   rows?: number;
 }
@@ -24,11 +26,16 @@ export class ClaudePty extends EventEmitter {
       throw new Error("Claude PTY is already spawned");
     }
 
+    const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+    if (options.configDir) {
+      env.CLAUDE_CONFIG_DIR = options.configDir;
+    }
+
     this.proc = pty.spawn(options.bin, options.args, {
       cwd: options.cwd,
       cols: options.cols ?? 120,
       rows: options.rows ?? 40,
-      env: process.env as Record<string, string>,
+      env,
       name: process.platform === "win32" ? "xterm-256color" : "xterm-color",
     });
 

@@ -37,10 +37,14 @@ const IGNORED_SYSTEM_SUBTYPES = new Set([
   "summary",
 ]);
 
-export async function findTranscript(sessionId: string, timeoutMs: number): Promise<string | null> {
+export async function findTranscript(
+  sessionId: string,
+  timeoutMs: number,
+  configDir?: string,
+): Promise<string | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
-    const found = await findTranscriptOnce(sessionId);
+    const found = await findTranscriptOnce(sessionId, configDir);
     if (found) {
       return found;
     }
@@ -294,8 +298,9 @@ export class TranscriptTailer {
   }
 }
 
-async function findTranscriptOnce(sessionId: string): Promise<string | null> {
-  const projectsDir = path.join(homedir(), ".claude", "projects");
+async function findTranscriptOnce(sessionId: string, configDir?: string): Promise<string | null> {
+  const baseConfigDir = configDir ?? path.join(homedir(), ".claude");
+  const projectsDir = path.join(baseConfigDir, "projects");
   let projectDirs: string[];
   try {
     projectDirs = await readdir(projectsDir);

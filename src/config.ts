@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 
 import {
@@ -41,6 +42,7 @@ export interface TeleCodexConfig {
   enableTelegramReactions: boolean;
   enableClaudeProvider: boolean;
   claudeBin: string;
+  claudeConfigDir: string;
   claudeDefaultModel: string;
   claudeWorkspace: string;
   claudePermissionMode: ClaudePermissionMode;
@@ -86,6 +88,12 @@ export function loadConfig(): TeleCodexConfig {
   );
   const enableClaudeProvider = parseBooleanEnv(optionalString(process.env.ENABLE_CLAUDE_PROVIDER), false);
   const claudeBin = optionalString(process.env.CLAUDE_BIN) ?? "C:\\Users\\Anthony\\.local\\bin\\claude.exe";
+  // Isolated config dir for TeleCodex-spawned claude.exe. Pointing CLAUDE_CONFIG_DIR
+  // at a folder that does NOT contain the user-scoped telegram plugin keeps the child
+  // from starting a competing getUpdates poller and 409ing the live Telegram bridge.
+  const claudeConfigDir = path.resolve(
+    optionalString(process.env.CLAUDE_CONFIG_DIR_OVERRIDE) ?? path.join(homedir(), ".telecodex", "claude-config"),
+  );
   const claudeDefaultModel = optionalString(process.env.CLAUDE_DEFAULT_MODEL) ?? "sonnet";
   const claudeWorkspace = path.resolve(optionalString(process.env.CLAUDE_WORKSPACE) ?? workspace);
   const claudePermissionMode = parseClaudePermissionMode(optionalString(process.env.CLAUDE_PERMISSION_MODE));
@@ -126,6 +134,7 @@ export function loadConfig(): TeleCodexConfig {
     enableTelegramReactions,
     enableClaudeProvider,
     claudeBin,
+    claudeConfigDir,
     claudeDefaultModel,
     claudeWorkspace,
     claudePermissionMode,
