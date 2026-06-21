@@ -16,6 +16,7 @@ import {
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
 export type ProgressDelivery = "none" | "messages" | "edit";
 export type CodexBackend = "sdk" | "app-server";
+export type ClaudePermissionMode = "default" | "acceptEdits" | "plan" | "bypassPermissions";
 
 export interface TeleCodexConfig {
   telegramBotToken: string;
@@ -38,6 +39,13 @@ export interface TeleCodexConfig {
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
+  enableClaudeProvider: boolean;
+  claudeBin: string;
+  claudeDefaultModel: string;
+  claudeWorkspace: string;
+  claudePermissionMode: ClaudePermissionMode;
+  claudeTurnIdleTimeoutSeconds: number;
+  claudeContextWindow: number;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -76,6 +84,24 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.ENABLE_TELEGRAM_REACTIONS),
     false,
   );
+  const enableClaudeProvider = parseBooleanEnv(optionalString(process.env.ENABLE_CLAUDE_PROVIDER), false);
+  const claudeBin = optionalString(process.env.CLAUDE_BIN) ?? "C:\\Users\\Anthony\\.local\\bin\\claude.exe";
+  const claudeDefaultModel = optionalString(process.env.CLAUDE_DEFAULT_MODEL) ?? "sonnet";
+  const claudeWorkspace = path.resolve(optionalString(process.env.CLAUDE_WORKSPACE) ?? workspace);
+  const claudePermissionMode = parseClaudePermissionMode(optionalString(process.env.CLAUDE_PERMISSION_MODE));
+  if (claudePermissionMode === "bypassPermissions" && !enableUnsafeLaunchProfiles) {
+    throw new Error("CLAUDE_PERMISSION_MODE=bypassPermissions requires ENABLE_UNSAFE_LAUNCH_PROFILES=true");
+  }
+  const claudeTurnIdleTimeoutSeconds = parsePositiveIntegerEnv(
+    optionalString(process.env.CLAUDE_TURN_IDLE_TIMEOUT),
+    180,
+    "CLAUDE_TURN_IDLE_TIMEOUT",
+  );
+  const claudeContextWindow = parsePositiveIntegerEnv(
+    optionalString(process.env.CLAUDE_CONTEXT_WINDOW),
+    200000,
+    "CLAUDE_CONTEXT_WINDOW",
+  );
 
   return {
     telegramBotToken,
@@ -98,6 +124,13 @@ export function loadConfig(): TeleCodexConfig {
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
+    enableClaudeProvider,
+    claudeBin,
+    claudeDefaultModel,
+    claudeWorkspace,
+    claudePermissionMode,
+    claudeTurnIdleTimeoutSeconds,
+    claudeContextWindow,
   };
 }
 
@@ -272,6 +305,19 @@ function parseToolVerbosity(raw: string | undefined): ToolVerbosity {
   }
 }
 
+function parsePositiveIntegerEnv(raw: string | undefined, defaultValue: number, name: string): number {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.warn(`Invalid ${name} value: "${raw}". Falling back to ${defaultValue}.`);
+    return defaultValue;
+  }
+  return parsed;
+}
+
 function parseProgressDelivery(raw: string | undefined): ProgressDelivery {
   if (!raw) {
     return "messages";
@@ -297,7 +343,7 @@ function parseProgressDelivery(raw: string | undefined): ProgressDelivery {
 
 function parseCodexBackend(raw: string | undefined): CodexBackend {
   if (!raw) {
-    return "sdk";
+    return "app-server";
   }
 
   switch (raw) {
@@ -306,9 +352,28 @@ function parseCodexBackend(raw: string | undefined): CodexBackend {
       return raw;
     default:
       console.warn(
-        `Invalid CODEX_BACKEND value: "${raw}". Expected one of: sdk, app-server. Falling back to "sdk".`,
+        `Invalid CODEX_BACKEND value: "${raw}". Expected one of: sdk, app-server. Falling back to "app-server".`,
       );
-      return "sdk";
+      return "app-server";
+  }
+}
+
+function parseClaudePermissionMode(raw: string | undefined): ClaudePermissionMode {
+  if (!raw) {
+    return "acceptEdits";
+  }
+
+  switch (raw) {
+    case "default":
+    case "acceptEdits":
+    case "plan":
+    case "bypassPermissions":
+      return raw;
+    default:
+      console.warn(
+        `Invalid CLAUDE_PERMISSION_MODE value: "${raw}". Expected one of: default, acceptEdits, plan, bypassPermissions. Falling back to "acceptEdits".`,
+      );
+      return "acceptEdits";
   }
 }
 

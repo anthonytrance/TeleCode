@@ -25,8 +25,9 @@
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
-    "@openai/codex-sdk": "^0.130.0",
-    "grammy": "^1.41.1"
+    "@openai/codex-sdk": "^0.133.0",
+    "grammy": "^1.41.1",
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",

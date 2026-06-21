@@ -6,6 +6,7 @@ $workspace = if ($env:CODEX_WORKSPACE) { $env:CODEX_WORKSPACE } else { $defaultW
 $logs = Join-Path $repo "logs"
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 Set-Location $repo
+$entry = Join-Path $repo "dist\index.js"
 
 function Get-ChildProcesses {
   param([int]$ParentProcessId)
@@ -22,7 +23,10 @@ function Test-HasTeleCodexNodeDescendant {
     $queue = @($queue | Select-Object -Skip 1)
 
     foreach ($child in Get-ChildProcesses -ParentProcessId $parent) {
-      if ($child.Name -eq "node.exe" -and $child.CommandLine -match "dist\\index\.js") {
+      if ($child.Name -eq "node.exe" -and (
+        $child.CommandLine -match [regex]::Escape($entry) -or
+        $child.CommandLine -match "dist\\index\.js"
+      )) {
         return $true
       }
 
@@ -74,7 +78,7 @@ Write-Host "Press Ctrl+C to stop."
 
 $process = Start-Process `
   -FilePath "C:\Program Files\nodejs\node.exe" `
-  -ArgumentList @("dist\index.js") `
+  -ArgumentList @($entry) `
   -WorkingDirectory $repo `
   -NoNewWindow `
   -Wait `

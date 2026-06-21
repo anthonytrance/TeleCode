@@ -12,11 +12,18 @@ type ThreadFixture = {
   archived?: number;
 };
 
+type SpawnEdgeFixture = {
+  parentThreadId: string;
+  childThreadId: string;
+  status: string;
+};
+
 type LoadOptions = {
   home?: string;
   files?: string[];
   stats?: Record<string, number>;
   threads?: ThreadFixture[];
+  spawnEdges?: SpawnEdgeFixture[];
   modelsJson?: string;
   betterSqliteAvailable?: boolean;
   openThrows?: boolean;
@@ -43,6 +50,7 @@ async function loadCodexState(options: LoadOptions = {}) {
   const files = options.files ?? [];
   const stats = options.stats ?? {};
   const threads = options.threads ?? [];
+  const spawnEdges = options.spawnEdges ?? [];
   process.env.HOME = home;
 
   vi.resetModules();
@@ -89,8 +97,8 @@ async function loadCodexState(options: LoadOptions = {}) {
 
         prepare(sql: string) {
           return {
-            all: (...args: unknown[]) => runAllQuery(sql, threads, args),
-            get: (...args: unknown[]) => runGetQuery(sql, threads, args),
+            all: (...args: unknown[]) => runAllQuery(sql, threads, spawnEdges, args),
+            get: (...args: unknown[]) => runGetQuery(sql, threads, spawnEdges, args),
           };
         }
 
@@ -102,14 +110,45 @@ async function loadCodexState(options: LoadOptions = {}) {
   return await import("../src/codex-state.js");
 }
 
-function runAllQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
+function runAllQuery(
+  sql: string,
+  threads: ThreadFixture[],
+  spawnEdges: SpawnEdgeFixture[],
+  args: unknown[],
+) {
   if (sql.includes("SELECT DISTINCT cwd")) {
     return [...new Set(threads.filter((thread) => thread.archived !== 1).map((thread) => thread.cwd).filter(Boolean))]
       .sort()
       .map((cwd) => ({ cwd }));
   }
 
+  if (sql.includes("FROM thread_spawn_edges")) {
+    const parentThreadId = String(args[0] ?? "");
+    return spawnEdges
+      .filter((edge) => edge.parentThreadId === parentThreadId)
+      .map((edge) => {
+        const child = threads.find((thread) => thread.archived !== 1 && thread.id === edge.childThreadId);
+        return child
+          ? {
+              ...child,
+              parent_thread_id: edge.parentThreadId,
+              spawn_status: edge.status,
+            }
+          : null;
+      })
+      .filter((row): row is ThreadFixture & { parent_thread_id: string; spawn_status: string } => Boolean(row))
+      .sort((left, right) => right.created_at - left.created_at);
+  }
+
   if (sql.includes("FROM threads")) {
+    if (sql.includes("id LIKE ?")) {
+      const prefix = String(args[0] ?? "").replace(/%$/, "");
+      return threads
+        .filter((thread) => thread.archived !== 1 && thread.id.startsWith(prefix))
+        .sort((left, right) => right.updated_at - left.updated_at)
+        .slice(0, 2);
+    }
+
     const limit = typeof args[0] === "number" ? args[0] : 20;
     return threads
       .filter((thread) => thread.archived !== 1)
@@ -120,7 +159,28 @@ function runAllQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
   return [];
 }
 
-function runGetQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
+function runGetQuery(
+  sql: string,
+  threads: ThreadFixture[],
+  spawnEdges: SpawnEdgeFixture[],
+  args: unknown[],
+) {
+  if (sql.includes("FROM thread_spawn_edges")) {
+    const childThreadId = String(args[0] ?? "");
+    const edge = spawnEdges.find((candidate) => candidate.childThreadId === childThreadId);
+    if (!edge) {
+      return undefined;
+    }
+    const parent = threads.find((thread) => thread.archived !== 1 && thread.id === edge.parentThreadId);
+    return parent
+      ? {
+          ...parent,
+          child_thread_id: edge.childThreadId,
+          spawn_status: edge.status,
+        }
+      : undefined;
+  }
+
   if (sql.includes("WHERE archived = 0 AND id = ?")) {
     const id = String(args[0] ?? "");
     return threads.find((thread) => thread.archived !== 1 && thread.id === id);
@@ -294,11 +354,92 @@ describe("codex-state", () => {
     expect(state.getThread("missing")).toBeNull();
   });
 
+  it("lists child threads for a parent thread", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      threads: [
+        {
+          id: "parent-thread",
+          title: "Parent",
+          cwd: "/workspace",
+          model: "gpt-5.4",
+          created_at: 10,
+          updated_at: 20,
+          first_user_message: "parent",
+        },
+        {
+          id: "child-old",
+          title: "Old child",
+          cwd: "/workspace",
+          model: "gpt-5.4",
+          created_at: 11,
+          updated_at: 21,
+          first_user_message: "old",
+        },
+        {
+          id: "child-new",
+          title: "New child",
+          cwd: "/workspace",
+          model: "gpt-5.4",
+          created_at: 12,
+          updated_at: 22,
+          first_user_message: "new",
+        },
+      ],
+      spawnEdges: [
+        { parentThreadId: "parent-thread", childThreadId: "child-old", status: "completed" },
+        { parentThreadId: "parent-thread", childThreadId: "child-new", status: "running" },
+      ],
+    });
+
+    expect(state.listChildThreads("parent-thread").map((thread) => thread.id)).toEqual(["child-new", "child-old"]);
+    expect(state.listChildThreads("parent-thread")[0]).toMatchObject({
+      id: "child-new",
+      parentThreadId: "parent-thread",
+      spawnStatus: "running",
+    });
+  });
+
+  it("gets a parent thread for a child thread", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      threads: [
+        {
+          id: "parent-thread",
+          title: "Parent",
+          cwd: "/workspace",
+          model: "gpt-5.4",
+          created_at: 10,
+          updated_at: 20,
+          first_user_message: "parent",
+        },
+        {
+          id: "child-thread",
+          title: "Child",
+          cwd: "/workspace",
+          model: "gpt-5.4",
+          created_at: 11,
+          updated_at: 21,
+          first_user_message: "child",
+        },
+      ],
+      spawnEdges: [{ parentThreadId: "parent-thread", childThreadId: "child-thread", status: "completed" }],
+    });
+
+    expect(state.getParentThread("child-thread")).toMatchObject({
+      id: "parent-thread",
+      childThreadId: "child-thread",
+      spawnStatus: "completed",
+    });
+  });
+
   it("returns empty results gracefully when opening the database fails", async () => {
     const state = await loadCodexState({ files: ["state_main.sqlite"], openThrows: true });
 
     expect(state.listThreads()).toEqual([]);
     expect(state.listWorkspaces()).toEqual([]);
     expect(state.getThread("thread-1")).toBeNull();
+    expect(state.listChildThreads("thread-1")).toEqual([]);
+    expect(state.getParentThread("thread-1")).toBeNull();
   });
 });

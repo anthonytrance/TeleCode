@@ -32,6 +32,13 @@ describe("loadConfig", () => {
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
+    delete process.env.ENABLE_CLAUDE_PROVIDER;
+    delete process.env.CLAUDE_BIN;
+    delete process.env.CLAUDE_DEFAULT_MODEL;
+    delete process.env.CLAUDE_WORKSPACE;
+    delete process.env.CLAUDE_PERMISSION_MODE;
+    delete process.env.CLAUDE_TURN_IDLE_TIMEOUT;
+    delete process.env.CLAUDE_CONTEXT_WINDOW;
     delete process.env.container;
   });
 
@@ -75,7 +82,7 @@ describe("loadConfig", () => {
       maxFileSize: 20 * 1024 * 1024,
       codexApiKey: "secret-key",
       codexModel: "o3",
-      codexBackend: "sdk",
+      codexBackend: "app-server",
       codexAppServerPath: undefined,
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "on-request",
@@ -110,6 +117,13 @@ describe("loadConfig", () => {
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
+      enableClaudeProvider: false,
+      claudeBin: "C:\\Users\\Anthony\\.local\\bin\\claude.exe",
+      claudeDefaultModel: "sonnet",
+      claudeWorkspace: process.cwd(),
+      claudePermissionMode: "acceptEdits",
+      claudeTurnIdleTimeoutSeconds: 180,
+      claudeContextWindow: 200000,
     });
   });
 
@@ -121,7 +135,7 @@ describe("loadConfig", () => {
 
     expect(config.codexApiKey).toBeUndefined();
     expect(config.codexModel).toBeUndefined();
-    expect(config.codexBackend).toBe("sdk");
+    expect(config.codexBackend).toBe("app-server");
     expect(config.codexAppServerPath).toBeUndefined();
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
     expect(config.codexSandboxMode).toBe("workspace-write");
@@ -156,6 +170,12 @@ describe("loadConfig", () => {
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
+    expect(config.enableClaudeProvider).toBe(false);
+    expect(config.claudeDefaultModel).toBe("sonnet");
+    expect(config.claudeWorkspace).toBe(process.cwd());
+    expect(config.claudePermissionMode).toBe("acceptEdits");
+    expect(config.claudeTurnIdleTimeoutSeconds).toBe(180);
+    expect(config.claudeContextWindow).toBe(200000);
     expect(config.workspace).toBe(process.cwd());
   });
 
@@ -328,6 +348,38 @@ describe("loadConfig", () => {
     expect(config.showTurnTokenUsage).toBe(false);
   });
 
+  it("parses Claude provider settings", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.ENABLE_CLAUDE_PROVIDER = "true";
+    process.env.CLAUDE_BIN = path.join(tempDir, "claude.exe");
+    process.env.CLAUDE_DEFAULT_MODEL = "opus";
+    process.env.CLAUDE_WORKSPACE = path.join(tempDir, "claude-workspace");
+    process.env.CLAUDE_PERMISSION_MODE = "plan";
+    process.env.CLAUDE_TURN_IDLE_TIMEOUT = "60";
+    process.env.CLAUDE_CONTEXT_WINDOW = "123456";
+
+    const config = loadConfig();
+
+    expect(config.enableClaudeProvider).toBe(true);
+    expect(config.claudeBin).toBe(path.join(tempDir, "claude.exe"));
+    expect(config.claudeDefaultModel).toBe("opus");
+    expect(config.claudeWorkspace).toBe(path.join(tempDir, "claude-workspace"));
+    expect(config.claudePermissionMode).toBe("plan");
+    expect(config.claudeTurnIdleTimeoutSeconds).toBe(60);
+    expect(config.claudeContextWindow).toBe(123456);
+  });
+
+  it("requires unsafe launch profiles for Claude bypass permissions", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.CLAUDE_PERMISSION_MODE = "bypassPermissions";
+
+    expect(() => loadConfig()).toThrow(
+      "CLAUDE_PERMISSION_MODE=bypassPermissions requires ENABLE_UNSAFE_LAUNCH_PROFILES=true",
+    );
+  });
+
   it("parses STREAM_ASSISTANT_TEXT boolean values", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
@@ -393,17 +445,23 @@ describe("loadConfig", () => {
     process.env.CODEX_APPROVAL_POLICY = "sometimes";
     process.env.TOOL_VERBOSITY = "loud";
     process.env.PROGRESS_DELIVERY = "loud";
+    process.env.CLAUDE_PERMISSION_MODE = "loud";
+    process.env.CLAUDE_TURN_IDLE_TIMEOUT = "soon";
+    process.env.CLAUDE_CONTEXT_WINDOW = "huge";
     process.env.MAX_FILE_SIZE = "nope";
 
     const config = loadConfig();
 
-    expect(config.codexBackend).toBe("sdk");
+    expect(config.codexBackend).toBe("app-server");
     expect(config.codexSandboxMode).toBe("workspace-write");
     expect(config.codexApprovalPolicy).toBe("never");
     expect(config.toolVerbosity).toBe("summary");
     expect(config.progressDelivery).toBe("messages");
+    expect(config.claudePermissionMode).toBe("acceptEdits");
+    expect(config.claudeTurnIdleTimeoutSeconds).toBe(180);
+    expect(config.claudeContextWindow).toBe(200000);
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
-    expect(warnSpy).toHaveBeenCalledTimes(6);
+    expect(warnSpy).toHaveBeenCalledTimes(9);
   });
 
   it("parses explicit launch profiles and default selection", () => {

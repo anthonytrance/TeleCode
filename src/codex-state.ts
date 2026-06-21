@@ -22,6 +22,16 @@ export interface CodexHistoryMessage {
   timestamp?: Date;
 }
 
+export interface CodexChildThreadRecord extends CodexThreadRecord {
+  parentThreadId: string;
+  spawnStatus: string;
+}
+
+export interface CodexParentThreadRecord extends CodexThreadRecord {
+  childThreadId: string;
+  spawnStatus: string;
+}
+
 export const FALLBACK_MODELS: CodexModelRecord[] = [
   { slug: "gpt-5.4", displayName: "GPT-5.4" },
   { slug: "gpt-5.4-mini", displayName: "GPT-5.4-Mini" },
@@ -55,6 +65,16 @@ type ThreadRow = {
 
 type WorkspaceRow = {
   cwd: unknown;
+};
+
+type ChildThreadRow = ThreadRow & {
+  parent_thread_id: unknown;
+  spawn_status: unknown;
+};
+
+type ParentThreadRow = ThreadRow & {
+  child_thread_id: unknown;
+  spawn_status: unknown;
 };
 
 const betterSqlite3Module = await import("better-sqlite3").catch(() => null);
@@ -136,6 +156,64 @@ export function getThreadByPrefix(idPrefix: string): CodexThreadRecord | null {
 
       const rows = query.all(`${normalized}%`) as ThreadRow[];
       return rows.length === 1 ? mapThreadRow(rows[0]!) : null;
+    }) ?? null
+  );
+}
+
+export function listChildThreads(parentThreadId: string): CodexChildThreadRecord[] {
+  const normalized = parentThreadId.trim();
+  if (!normalized) {
+    return [];
+  }
+
+  return (
+    withDatabase((db) => {
+      const query = db.prepare(`
+        SELECT e.parent_thread_id, e.status AS spawn_status,
+               t.id, t.title, t.cwd, t.model, t.created_at, t.updated_at, t.first_user_message
+        FROM thread_spawn_edges e
+        JOIN threads t ON t.id = e.child_thread_id
+        WHERE e.parent_thread_id = ? AND (t.archived = 0 OR t.archived IS NULL)
+        ORDER BY t.created_at DESC
+      `);
+
+      const rows = query.all(normalized) as ChildThreadRow[];
+      return rows.map((row) => ({
+        ...mapThreadRow(row),
+        parentThreadId: typeof row.parent_thread_id === "string" ? row.parent_thread_id : String(row.parent_thread_id ?? ""),
+        spawnStatus: typeof row.spawn_status === "string" ? row.spawn_status : String(row.spawn_status ?? ""),
+      }));
+    }) ?? []
+  );
+}
+
+export function getParentThread(childThreadId: string): CodexParentThreadRecord | null {
+  const normalized = childThreadId.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  return (
+    withDatabase((db) => {
+      const query = db.prepare(`
+        SELECT e.child_thread_id, e.status AS spawn_status,
+               t.id, t.title, t.cwd, t.model, t.created_at, t.updated_at, t.first_user_message
+        FROM thread_spawn_edges e
+        JOIN threads t ON t.id = e.parent_thread_id
+        WHERE e.child_thread_id = ? AND (t.archived = 0 OR t.archived IS NULL)
+        LIMIT 1
+      `);
+
+      const row = query.get(normalized) as ParentThreadRow | undefined;
+      if (!row) {
+        return null;
+      }
+
+      return {
+        ...mapThreadRow(row),
+        childThreadId: typeof row.child_thread_id === "string" ? row.child_thread_id : String(row.child_thread_id ?? ""),
+        spawnStatus: typeof row.spawn_status === "string" ? row.spawn_status : String(row.spawn_status ?? ""),
+      };
     }) ?? null
   );
 }

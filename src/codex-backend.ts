@@ -6,6 +6,8 @@ import {
   CodexSessionService,
   type CodexPromptInput,
   type CodexSessionCallbacks,
+  type CodexThreadGoal,
+  type CodexThreadGoalSetParams,
   type CodexSessionInfo,
   type CreateOptions,
 } from "./codex-session.js";
@@ -15,9 +17,15 @@ import type { CodexModelRecord, CodexThreadRecord } from "./codex-state.js";
 export interface CodexSessionRuntime {
   getInfo(): CodexSessionInfo;
   isProcessing(): boolean;
+  getProcessingKind?(): "prompt" | "goal" | null;
   hasActiveThread(): boolean;
   getCurrentWorkspace(): string;
   prompt(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void>;
+  getThreadGoal?(): Promise<CodexThreadGoal | null>;
+  setThreadGoal?(params: CodexThreadGoalSetParams): Promise<CodexThreadGoal>;
+  clearThreadGoal?(): Promise<boolean>;
+  runThreadGoal?(params: CodexThreadGoalSetParams, callbacks: CodexSessionCallbacks): Promise<CodexThreadGoal | null>;
+  pauseActiveGoal?(): Promise<CodexThreadGoal | null>;
   steer?(input: CodexPromptInput): Promise<void>;
   forkThread?(): Promise<CodexSessionInfo>;
   getTurnCount?(): Promise<number>;

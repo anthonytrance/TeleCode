@@ -5,6 +5,7 @@ import { createCodexSession, type CodexSessionRuntime } from "./codex-backend.js
 import { findLaunchProfile } from "./codex-launch.js";
 import type { CodexBackend, ProgressDelivery, TeleCodexConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
+import type { AgentProviderKind } from "./providers/types.js";
 
 export interface ContextMetadata {
   contextKey: TelegramContextKey;
@@ -14,6 +15,7 @@ export interface ContextMetadata {
   reasoningEffort?: string;
   launchProfileId?: string;
   backend?: CodexBackend;
+  activeProvider?: AgentProviderKind;
   progressDelivery?: ProgressDelivery;
   updatedAt: number;
 }
@@ -73,6 +75,27 @@ export class SessionRegistry {
     return this.metadata.get(contextKey)?.backend ?? this.config.codexBackend;
   }
 
+  getActiveProvider(contextKey: TelegramContextKey): AgentProviderKind {
+    return this.metadata.get(contextKey)?.activeProvider ?? "codex";
+  }
+
+  setActiveProvider(contextKey: TelegramContextKey, provider: AgentProviderKind): void {
+    const previous = this.metadata.get(contextKey);
+    this.metadata.set(contextKey, {
+      contextKey,
+      threadId: previous?.threadId ?? null,
+      workspace: previous?.workspace ?? this.config.workspace,
+      model: previous?.model ?? this.config.codexModel,
+      reasoningEffort: previous?.reasoningEffort,
+      launchProfileId: previous?.launchProfileId ?? this.config.defaultLaunchProfileId,
+      backend: previous?.backend ?? this.config.codexBackend,
+      activeProvider: provider,
+      progressDelivery: previous?.progressDelivery,
+      updatedAt: Date.now(),
+    });
+    this.persistMetadata();
+  }
+
   getProgressDelivery(contextKey: TelegramContextKey): ProgressDelivery {
     return this.metadata.get(contextKey)?.progressDelivery ?? this.config.progressDelivery;
   }
@@ -87,6 +110,7 @@ export class SessionRegistry {
       reasoningEffort: previous?.reasoningEffort,
       launchProfileId: previous?.launchProfileId ?? this.config.defaultLaunchProfileId,
       backend: previous?.backend ?? this.config.codexBackend,
+      activeProvider: previous?.activeProvider,
       progressDelivery,
       updatedAt: Date.now(),
     });
@@ -107,6 +131,7 @@ export class SessionRegistry {
       reasoningEffort: previous?.reasoningEffort,
       launchProfileId: previous?.launchProfileId ?? this.config.defaultLaunchProfileId,
       backend,
+      activeProvider: previous?.activeProvider,
       updatedAt: Date.now(),
     };
     if (previous?.progressDelivery) {
@@ -127,6 +152,7 @@ export class SessionRegistry {
       reasoningEffort: info.reasoningEffort,
       launchProfileId: info.nextLaunchProfileId ?? info.launchProfileId,
       backend: previous?.backend ?? this.config.codexBackend,
+      activeProvider: previous?.activeProvider,
       updatedAt: Date.now(),
     };
     if (previous?.progressDelivery) {

@@ -3,22 +3,22 @@ import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
 import { loadConfig } from "./config.js";
 import { SessionRegistry } from "./session-registry.js";
+import { assertTelegramPollingSafety } from "./startup-safety.js";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
 
 try {
   const config = loadConfig();
-  if (config.codexBackend !== "sdk") {
-    throw new Error(
-      "CODEX_BACKEND=app-server is not available for live Telegram sessions yet. Keep CODEX_BACKEND=sdk and use /appserver for diagnostics.",
-    );
-  }
+  const pollingSafety = assertTelegramPollingSafety({ token: config.telegramBotToken });
   registry = new SessionRegistry(config);
   bot = createBot(config, registry);
   await registerCommands(bot);
 
   console.log("TeleCodex running");
+  console.log(
+    `Telegram polling profile: role=${pollingSafety.tokenRole}, canary=${pollingSafety.canaryMode}, token=${pollingSafety.tokenFingerprint}`,
+  );
   console.log(`Codex backend: ${config.codexBackend}`);
   const authStatus = await checkAuthStatus(config.codexApiKey);
   console.log(`Auth: ${authStatus.authenticated ? "authenticated" : "not authenticated"} (${authStatus.method})`);

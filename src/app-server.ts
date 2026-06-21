@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -176,9 +177,11 @@ export class CodexAppServerClient {
   private readonly notifications: Array<{ method: string; params?: unknown }> = [];
   private readonly notificationHandlers = new Set<(notification: { method: string; params?: unknown }) => void>();
   private readonly requestHandlers = new Set<AppServerServerRequestHandler>();
+  private readonly exitHandlers = new Set<(error: Error) => void>();
   private readonly stderrChunks: Buffer[] = [];
   private readlineInterface: readline.Interface | null = null;
   private closing = false;
+  private exitEmitted = false;
 
   constructor(private readonly options: AppServerClientOptions = {}) {}
 
@@ -194,12 +197,17 @@ export class CodexAppServerClient {
     this.requestHandlers.add(handler);
   }
 
+  onExit(handler: (error: Error) => void): void {
+    this.exitHandlers.add(handler);
+  }
+
   async start(): Promise<void> {
     if (this.child) {
       return;
     }
 
     this.closing = false;
+    this.exitEmitted = false;
     const codexPath = this.options.codexPath ?? resolveBundledCodexPath();
     const env = this.options.env ?? buildAppServerEnv();
     const spawnProcess = this.options.spawnProcess ?? defaultSpawnAppServerProcess;
@@ -209,11 +217,18 @@ export class CodexAppServerClient {
     });
 
     this.child = child;
+    child.stdin.on("error", (error) => {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.rejectAllPending(normalized);
+      this.emitExit(normalized);
+    });
     child.stderr.on("data", (chunk: Buffer | string) => {
       this.stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
     });
     child.once("error", (error) => {
-      this.rejectAllPending(error instanceof Error ? error : new Error(String(error)));
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.rejectAllPending(normalized);
+      this.emitExit(normalized);
     });
     child.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
       this.readlineInterface?.close();
@@ -221,7 +236,9 @@ export class CodexAppServerClient {
       this.child = null;
       if (!this.closing) {
         const detail = signal ? `signal ${signal}` : `code ${code ?? 0}`;
-        this.rejectAllPending(new Error(`Codex app-server exited with ${detail}: ${this.stderrText()}`.trim()));
+        const error = new Error(`Codex app-server exited with ${detail}: ${this.stderrText()}`.trim());
+        this.rejectAllPending(error);
+        this.emitExit(error);
       }
     });
 
@@ -272,7 +289,27 @@ export class CodexAppServerClient {
       });
     });
 
-    child.stdin.write(line);
+    try {
+      child.stdin.write(line, (error) => {
+        if (!error) {
+          return;
+        }
+        const pending = this.pending.get(String(id));
+        if (!pending) {
+          return;
+        }
+        clearTimeout(pending.timer);
+        this.pending.delete(String(id));
+        pending.reject(new Error(`Failed writing app-server request ${method}: ${error.message}`));
+      });
+    } catch (error) {
+      const pending = this.pending.get(String(id));
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pending.delete(String(id));
+        pending.reject(new Error(`Failed writing app-server request ${method}: ${formatUnknownError(error)}`));
+      }
+    }
     return await resultPromise;
   }
 
@@ -282,7 +319,7 @@ export class CodexAppServerClient {
       throw new Error("Codex app-server is not started");
     }
     const payload = params === undefined ? { method } : { method, params };
-    child.stdin.write(`${JSON.stringify(payload)}\n`);
+    writeAppServerLine(child, `${JSON.stringify(payload)}\n`, `notification ${method}`);
   }
 
   async close(): Promise<void> {
@@ -366,6 +403,16 @@ export class CodexAppServerClient {
     this.pending.clear();
   }
 
+  private emitExit(error: Error): void {
+    if (this.closing || this.exitEmitted) {
+      return;
+    }
+    this.exitEmitted = true;
+    for (const handler of this.exitHandlers) {
+      handler(error);
+    }
+  }
+
   private async handleServerRequest(request: AppServerServerRequest): Promise<void> {
     for (const handler of this.requestHandlers) {
       const result = await handler(request);
@@ -385,16 +432,40 @@ export class CodexAppServerClient {
   }
 
   private sendResultResponse(id: number | string, result: JsonValue): void {
-    this.child?.stdin.write(`${JSON.stringify({ id, result })}\n`);
+    const child = this.child;
+    if (!child) {
+      return;
+    }
+    writeAppServerLine(child, `${JSON.stringify({ id, result })}\n`, `server response ${id}`);
   }
 
   private sendErrorResponse(id: number | string, message: string): void {
-    this.child?.stdin.write(`${JSON.stringify({ id, error: { code: -32601, message } })}\n`);
+    const child = this.child;
+    if (!child) {
+      return;
+    }
+    writeAppServerLine(child, `${JSON.stringify({ id, error: { code: -32601, message } })}\n`, `server error ${id}`);
   }
 
   private stderrText(): string {
     return Buffer.concat(this.stderrChunks).toString("utf8").trim();
   }
+}
+
+function writeAppServerLine(child: AppServerProcess, line: string, description: string): void {
+  try {
+    child.stdin.write(line, (error) => {
+      if (error) {
+        console.warn(`Failed writing app-server ${description}:`, error);
+      }
+    });
+  } catch (error) {
+    console.warn(`Failed writing app-server ${description}:`, error);
+  }
+}
+
+function formatUnknownError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function safeAppServerServerRequestResponse(method: string): JsonValue | undefined {
@@ -747,6 +818,21 @@ export function buildAppServerEnv(apiKey?: string): NodeJS.ProcessEnv {
   return env;
 }
 
+export function resolveCodexBinaryPath(vendorRoot: string, targetTriple: string, binaryName: string): string | null {
+  const packageRoot = path.join(vendorRoot, targetTriple);
+  const currentPath = path.join(packageRoot, "bin", binaryName);
+  if (existsSync(currentPath)) {
+    return currentPath;
+  }
+
+  const legacyPath = path.join(packageRoot, "codex", binaryName);
+  if (existsSync(legacyPath)) {
+    return legacyPath;
+  }
+
+  return null;
+}
+
 function resolveBundledCodexPath(): string {
   const platformPackage = getPlatformPackage();
   if (!platformPackage) {
@@ -760,7 +846,7 @@ function resolveBundledCodexPath(): string {
     const platformPackageJsonPath = codexRequire.resolve(`${platformPackage}/package.json`);
     const targetTriple = getTargetTriple();
     const binaryName = process.platform === "win32" ? "codex.exe" : "codex";
-    return path.join(path.dirname(platformPackageJsonPath), "vendor", targetTriple, "codex", binaryName);
+    return resolveCodexBinaryPath(path.join(path.dirname(platformPackageJsonPath), "vendor"), targetTriple, binaryName) ?? "codex";
   } catch {
     return "codex";
   }

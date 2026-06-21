@@ -19,6 +19,15 @@ describe("bot-ui", () => {
       expect(plain).toContain("/new");
       expect(plain).toContain("/help");
       expect(plain).toContain("/retry");
+      expect(plain).toContain("/goal");
+      expect(plain).toContain("/goal <task>");
+      expect(plain).toContain("/goal pause");
+      expect(plain).toContain("/goal resume");
+      expect(plain).toContain("/goal clear");
+      expect(plain).toContain("/goal no-agents <task>");
+      expect(plain).toContain("/children");
+      expect(plain).toContain("/follow latest");
+      expect(plain).toContain("/parent");
       expect(plain).toContain("/launch_profiles");
     });
 
@@ -125,6 +134,17 @@ describe("bot-ui", () => {
       expect(label).toContain("gpt-4o");
     });
 
+    it("appends short thread id when available", () => {
+      const label = formatSessionLabel({
+        id: "019e4123456789",
+        workspace: "/project",
+        title: "test",
+        relativeTime: "1m ago",
+        isActive: false,
+      });
+      expect(label).toContain("#019e4123");
+    });
+
     it("truncates long workspace names to 12 chars", () => {
       const label = formatSessionLabel({
         workspace: "/home/user/my-very-long-project-name",
@@ -178,6 +198,21 @@ describe("bot-ui", () => {
           "Output files: write any files the user should receive to C:\\Users\\Anthony\\.telecodex\\turns\\x\\out\n\nInstall Hermes agent",
         ),
       ).toBe("Install Hermes agent");
+    });
+
+    it("removes new-summary seed text and keeps the actual goal", () => {
+      expect(
+        cleanSessionTitle(
+          [
+            "You are continuing from a previous Codex session.",
+            "Treat the following handoff summary as the starting context for this new thread.",
+            "Do not redo work unless asked. Reply only: Summary loaded.",
+            "",
+            "Current goal:",
+            "Continue TeleCodex app-server progress cleanup.",
+          ].join("\n"),
+        ),
+      ).toBe("Continue TeleCodex app-server progress cleanup.");
     });
   });
 });

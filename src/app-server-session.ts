@@ -18,6 +18,8 @@ import {
 import {
   type CodexPromptInput,
   type CodexSessionCallbacks,
+  type CodexThreadGoal,
+  type CodexThreadGoalSetParams,
   type CodexSessionInfo,
   type CreateOptions,
 } from "./codex-session.js";
@@ -76,6 +78,7 @@ export interface AppServerClientLike {
   notifyInitialized(): void;
   request<T = unknown>(method: string, params: JsonValue | undefined): Promise<T>;
   close(): Promise<void>;
+  onExit?(handler: (error: Error) => void): void;
 }
 
 export type AppServerClientFactory = (options: AppServerClientOptions) => AppServerClientLike;
@@ -84,18 +87,29 @@ type AppServerCreateOptions = CreateOptions & {
   appServerClientFactory?: AppServerClientFactory;
 };
 
+const ABORT_SETTLE_GRACE_MS = 750;
+const ABORT_INTERRUPT_TIMEOUT_MS = 3_000;
+const GOAL_IDLE_PROGRESS_MS = 5 * 60_000;
+
+type ActiveRunKind = "prompt" | "goal";
+
 export class AppServerSessionService {
   private client: AppServerClientLike | null = null;
+  private appServerAttachedThreadId: string | null = null;
   private currentWorkspace: string;
   private currentThreadId: string | null = null;
   private currentModel: string | undefined;
   private currentReasoningEffort: ModelReasoningEffort | undefined;
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
+  private activeRunKind: ActiveRunKind | null = null;
   private activeTurnId: string | null = null;
   private activeCallbacks: CodexSessionCallbacks | null = null;
   private activeResolve: (() => void) | null = null;
   private activeReject: ((error: Error) => void) | null = null;
+  private activeGoal: CodexThreadGoal | null = null;
+  private activeGoalCleared = false;
+  private goalIdleTimer: ReturnType<typeof setTimeout> | null = null;
   private finalText = "";
   private readonly lastCommandOutput = new Map<string, string>();
   private sessionTokens = { input: 0, cached: 0, output: 0 };
@@ -168,7 +182,11 @@ export class AppServerSessionService {
   }
 
   isProcessing(): boolean {
-    return this.activeTurnId !== null;
+    return this.activeRunKind !== null || this.activeTurnId !== null;
+  }
+
+  getProcessingKind(): ActiveRunKind | null {
+    return this.activeRunKind;
   }
 
   hasActiveThread(): boolean {
@@ -185,7 +203,7 @@ export class AppServerSessionService {
     }
     this.ensureIdle("start a turn");
 
-    const client = await this.getClient();
+    this.activeRunKind = "prompt";
     this.activeCallbacks = callbacks;
     this.finalText = "";
     this.lastCommandOutput.clear();
@@ -196,34 +214,235 @@ export class AppServerSessionService {
     });
 
     try {
-      const response = await client.request<{ turn: AppServerTurn }>("turn/start", {
-        threadId: this.currentThreadId,
+      const response = await this.requestCurrentThread<{ turn: AppServerTurn }>("turn/start", (threadId) => ({
+        threadId,
         input: this.buildAppServerInput(input),
         cwd: this.currentWorkspace,
         approvalPolicy: this.currentLaunchProfile.approvalPolicy,
         model: this.currentModel ?? null,
         effort: this.currentReasoningEffort ?? null,
-      });
+      }));
       this.activeTurnId = response.turn.id;
       await completed;
     } finally {
-      this.activeTurnId = null;
-      this.activeCallbacks = null;
-      this.activeResolve = null;
-      this.activeReject = null;
-      this.lastCommandOutput.clear();
+      this.clearActiveRunState();
+    }
+  }
+
+  async getThreadGoal(): Promise<CodexThreadGoal | null> {
+    if (!this.currentThreadId) {
+      throw new Error("No active app-server thread to inspect");
+    }
+    if (this.activeRunKind === "goal" && this.activeGoal) {
+      return this.activeGoal;
+    }
+
+    const response = await this.requestCurrentThread<{ goal: CodexThreadGoal | null }>(
+      "thread/goal/get",
+      (threadId) => ({ threadId }),
+    );
+    return response.goal ? normalizeThreadGoal(response.goal) : null;
+  }
+
+  async setThreadGoal(params: CodexThreadGoalSetParams): Promise<CodexThreadGoal> {
+    if (!this.currentThreadId) {
+      throw new Error("No active app-server thread to update");
+    }
+
+    const response = await this.requestCurrentThread<{ goal: CodexThreadGoal }>(
+      "thread/goal/set",
+      (threadId) => buildThreadGoalSetRequest(threadId, params),
+    );
+    return normalizeThreadGoal(response.goal);
+  }
+
+  async clearThreadGoal(): Promise<boolean> {
+    if (!this.currentThreadId) {
+      throw new Error("No active app-server thread to update");
+    }
+
+    const response = await this.requestCurrentThread<{ cleared: boolean }>(
+      "thread/goal/clear",
+      (threadId) => ({ threadId }),
+    );
+    return Boolean(response.cleared);
+  }
+
+  async runThreadGoal(
+    params: CodexThreadGoalSetParams,
+    callbacks: CodexSessionCallbacks,
+  ): Promise<CodexThreadGoal | null> {
+    if (!this.currentThreadId) {
+      throw new Error("Codex thread is not initialized");
+    }
+    this.ensureIdle("start a goal");
+
+    this.activeRunKind = "goal";
+    this.activeCallbacks = callbacks;
+    this.activeGoal = null;
+    this.activeGoalCleared = false;
+    this.finalText = "";
+    this.lastCommandOutput.clear();
+
+    const completed = new Promise<void>((resolve, reject) => {
+      this.activeResolve = resolve;
+      this.activeReject = reject;
+    });
+
+    try {
+      const response = await this.requestCurrentThread<{ goal: CodexThreadGoal }>(
+        "thread/goal/set",
+        (threadId) => buildThreadGoalSetRequest(threadId, params),
+      );
+      const responseGoal = normalizeThreadGoal(response.goal);
+      if (!this.activeGoal || isActiveGoal(this.activeGoal)) {
+        this.activeGoal = responseGoal;
+      }
+      if (!isActiveGoal(this.activeGoal)) {
+        this.resolveActiveRun();
+      } else {
+        this.scheduleGoalIdleTimeout();
+      }
+
+      await completed;
+      return this.activeGoalCleared ? null : this.activeGoal;
+    } finally {
+      this.clearActiveRunState();
     }
   }
 
   async abort(): Promise<void> {
-    if (!this.currentThreadId || !this.activeTurnId) {
+    if (!this.currentThreadId || !this.activeRunKind) {
       return;
     }
+
+    const threadId = this.currentThreadId;
+    const turnId = this.activeTurnId;
     const client = await this.getClient();
-    await client.request("turn/interrupt", {
-      threadId: this.currentThreadId,
-      turnId: this.activeTurnId,
-    });
+    let interruptError: unknown;
+
+    if (turnId) {
+      try {
+        await withTimeout(
+          client.request("turn/interrupt", {
+            threadId,
+            turnId,
+          }),
+          ABORT_INTERRUPT_TIMEOUT_MS,
+          "turn/interrupt did not settle within 3 seconds",
+        );
+      } catch (error) {
+        interruptError = error;
+        console.warn("App-server turn/interrupt failed; forcing local turn reset", error);
+      }
+    } else if (this.activeRunKind === "goal") {
+      try {
+        await withTimeout(
+          client.request("thread/goal/set", {
+            threadId,
+            status: "paused",
+          }),
+          ABORT_INTERRUPT_TIMEOUT_MS,
+          "thread/goal/set pause did not settle within 3 seconds",
+        );
+      } catch (error) {
+        interruptError = error;
+        console.warn("App-server goal pause failed; forcing local goal reset", error);
+      }
+    }
+
+    await delay(ABORT_SETTLE_GRACE_MS);
+    if (turnId && this.activeTurnId !== turnId) {
+      return;
+    }
+    if (!turnId && this.activeRunKind !== "goal") {
+      return;
+    }
+
+    const message = interruptError
+      ? `App-server turn aborted locally after interrupt failed: ${formatErrorMessage(interruptError)}`
+      : "App-server turn aborted";
+    this.rejectActiveRun(new Error(message));
+
+    if (this.client === client) {
+      await client.close().catch((error) => {
+        console.warn("Failed to close app-server after abort", error);
+      });
+      this.client = null;
+      this.appServerAttachedThreadId = null;
+    }
+  }
+
+  async pauseActiveGoal(): Promise<CodexThreadGoal | null> {
+    if (this.activeRunKind !== "goal" || !this.currentThreadId) {
+      return this.activeGoalCleared ? null : this.activeGoal;
+    }
+
+    const threadId = this.currentThreadId;
+    const turnId = this.activeTurnId;
+    const client = await this.getClient();
+    const callbacks = this.activeCallbacks;
+    const itemId = "goal-pause";
+    let pausedGoal = this.activeGoalCleared ? null : this.activeGoal;
+    let pauseError: unknown;
+
+    callbacks?.onToolStart("goal_pause", itemId);
+    callbacks?.onToolUpdate(itemId, "Pausing native goal so Telegram can switch context.");
+
+    if (turnId) {
+      try {
+        await withTimeout(
+          client.request("turn/interrupt", {
+            threadId,
+            turnId,
+          }),
+          ABORT_INTERRUPT_TIMEOUT_MS,
+          "turn/interrupt did not settle within 3 seconds",
+        );
+      } catch (error) {
+        pauseError = error;
+        console.warn("App-server turn/interrupt failed while pausing goal", error);
+      }
+    }
+
+    try {
+      const response = await withTimeout(
+        client.request<{ goal: CodexThreadGoal }>("thread/goal/set", {
+          threadId,
+          status: "paused",
+        }),
+        ABORT_INTERRUPT_TIMEOUT_MS,
+        "thread/goal/set pause did not settle within 3 seconds",
+      );
+      this.activeGoal = normalizeThreadGoal(response.goal);
+      pausedGoal = this.activeGoal;
+    } catch (error) {
+      pauseError = pauseError ?? error;
+      console.warn("App-server goal pause failed", error);
+    }
+
+    await delay(ABORT_SETTLE_GRACE_MS);
+
+    callbacks?.onToolEnd(itemId, Boolean(pauseError));
+    if (this.activeGoalCleared) {
+      pausedGoal = null;
+    } else if (this.activeGoal) {
+      pausedGoal = this.activeGoal;
+    }
+    if (this.activeRunKind === "goal") {
+      this.resolveActiveRun();
+      await Promise.resolve();
+    }
+
+    if (turnId && this.client === client) {
+      await client.close().catch((error) => {
+        console.warn("Failed to close app-server after pausing active goal turn", error);
+      });
+      this.client = null;
+      this.appServerAttachedThreadId = null;
+    }
+
+    return pausedGoal;
   }
 
   async steer(input: CodexPromptInput): Promise<void> {
@@ -231,12 +450,12 @@ export class AppServerSessionService {
       throw new Error("No active app-server turn to steer");
     }
 
-    const client = await this.getClient();
-    await client.request("turn/steer", {
-      threadId: this.currentThreadId,
-      expectedTurnId: this.activeTurnId,
+    const expectedTurnId = this.activeTurnId;
+    await this.requestCurrentThread("turn/steer", (threadId) => ({
+      threadId,
+      expectedTurnId,
       input: this.buildAppServerInput(input),
-    });
+    }));
   }
 
   async forkThread(): Promise<CodexSessionInfo> {
@@ -245,21 +464,21 @@ export class AppServerSessionService {
     }
     this.ensureIdle("fork thread");
 
-    const client = await this.getClient();
-    const response = await client.request<{ thread: AppServerThread; model?: string; cwd?: string }>(
+    const response = await this.requestCurrentThread<{ thread: AppServerThread; model?: string; cwd?: string }>(
       "thread/fork",
-      {
-        threadId: this.currentThreadId,
+      (threadId) => ({
+        threadId,
         cwd: this.currentWorkspace,
         model: this.currentModel ?? null,
         approvalPolicy: this.currentLaunchProfile.approvalPolicy,
         sandbox: this.currentLaunchProfile.sandboxMode,
-      },
+      }),
     );
 
     this.resetSessionTokens();
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentThreadId = response.thread.id;
+    this.appServerAttachedThreadId = response.thread.id;
     this.currentWorkspace = response.cwd ?? response.thread.cwd ?? this.currentWorkspace;
     if (response.model) {
       this.currentModel = response.model;
@@ -273,11 +492,13 @@ export class AppServerSessionService {
     }
     this.ensureIdle("inspect thread history");
 
-    const client = await this.getClient();
-    const response = await client.request<{ thread?: AppServerThread }>("thread/read", {
-      threadId: this.currentThreadId,
-      includeTurns: true,
-    });
+    const response = await this.requestCurrentThread<{ thread?: AppServerThread }>(
+      "thread/read",
+      (threadId) => ({
+        threadId,
+        includeTurns: true,
+      }),
+    );
     return Array.isArray(response.thread?.turns) ? response.thread.turns.length : 0;
   }
 
@@ -287,8 +508,7 @@ export class AppServerSessionService {
     }
     this.ensureIdle("compact thread");
 
-    const client = await this.getClient();
-    await client.request("thread/compact/start", { threadId: this.currentThreadId });
+    await this.requestCurrentThread("thread/compact/start", (threadId) => ({ threadId }));
   }
 
   async renameThread(name: string): Promise<void> {
@@ -302,11 +522,10 @@ export class AppServerSessionService {
       throw new Error("Thread name cannot be empty");
     }
 
-    const client = await this.getClient();
-    await client.request("thread/name/set", {
-      threadId: this.currentThreadId,
+    await this.requestCurrentThread("thread/name/set", (threadId) => ({
+      threadId,
       name: trimmed,
-    });
+    }));
   }
 
   async rollbackThread(turnCount: number): Promise<void> {
@@ -319,11 +538,10 @@ export class AppServerSessionService {
       throw new Error("Rollback turn count must be a whole number of at least 1");
     }
 
-    const client = await this.getClient();
-    await client.request("thread/rollback", {
-      threadId: this.currentThreadId,
+    await this.requestCurrentThread("thread/rollback", (threadId) => ({
+      threadId,
       numTurns: turnCount,
-    });
+    }));
   }
 
   async newThread(workspace?: string, model?: string): Promise<CodexSessionInfo> {
@@ -346,6 +564,7 @@ export class AppServerSessionService {
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = response.cwd ?? response.thread.cwd ?? effectiveWorkspace;
     this.currentThreadId = response.thread.id;
+    this.appServerAttachedThreadId = response.thread.id;
     if (model || response.model) {
       this.currentModel = response.model ?? model;
     }
@@ -358,18 +577,13 @@ export class AppServerSessionService {
     const client = await this.getClient();
     const response = await client.request<{ thread: AppServerThread; model?: string; cwd?: string }>(
       "thread/resume",
-      {
-        threadId,
-        cwd: this.currentWorkspace,
-        model: this.currentModel ?? null,
-        approvalPolicy: this.currentLaunchProfile.approvalPolicy,
-        sandbox: this.currentLaunchProfile.sandboxMode,
-      },
+      this.buildThreadResumeRequest(threadId),
     );
 
     this.resetSessionTokens();
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentThreadId = response.thread.id;
+    this.appServerAttachedThreadId = response.thread.id;
     this.currentWorkspace = response.cwd ?? response.thread.cwd ?? this.currentWorkspace;
     if (response.model) {
       this.currentModel = response.model;
@@ -442,17 +656,20 @@ export class AppServerSessionService {
     const info = { threadId: this.currentThreadId, workspace: this.currentWorkspace };
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
+    this.clearActiveRunState();
     void this.client?.close();
     this.client = null;
+    this.appServerAttachedThreadId = null;
     return info;
   }
 
   dispose(): void {
     void this.client?.close();
     this.client = null;
+    this.appServerAttachedThreadId = null;
     this.currentThreadId = null;
-    this.activeTurnId = null;
     this.activeThreadLaunchProfile = null;
+    this.clearActiveRunState();
   }
 
   private async getClient(): Promise<AppServerClientLike> {
@@ -460,6 +677,7 @@ export class AppServerSessionService {
       return this.client;
     }
 
+    this.appServerAttachedThreadId = null;
     const client = this.createClient({
       codexPath: this.config.codexAppServerPath,
       cwd: this.config.workspace,
@@ -467,6 +685,7 @@ export class AppServerSessionService {
     });
     client.onNotification((notification) => this.handleNotification(notification));
     client.onRequest((request) => this.handleServerRequest(request));
+    client.onExit?.((error) => this.handleClientExit(client, error));
     await client.start();
     await client.initialize(DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS);
     client.notifyInitialized();
@@ -474,9 +693,108 @@ export class AppServerSessionService {
     return client;
   }
 
+  private async requestCurrentThread<T = unknown>(
+    method: string,
+    params: (threadId: string) => JsonValue | undefined,
+  ): Promise<T> {
+    const client = await this.getClient();
+    await this.ensureCurrentThreadAttached(client);
+
+    try {
+      return await client.request<T>(method, params(this.requireCurrentThreadId()));
+    } catch (error) {
+      if (!isThreadNotFoundError(error)) {
+        throw error;
+      }
+
+      this.appServerAttachedThreadId = null;
+      await this.ensureCurrentThreadAttached(client);
+      return await client.request<T>(method, params(this.requireCurrentThreadId()));
+    }
+  }
+
+  private async ensureCurrentThreadAttached(client: AppServerClientLike): Promise<void> {
+    const threadId = this.requireCurrentThreadId();
+    if (this.appServerAttachedThreadId === threadId) {
+      return;
+    }
+
+    const response = await client.request<{ thread: AppServerThread; model?: string; cwd?: string }>(
+      "thread/resume",
+      this.buildThreadResumeRequest(threadId),
+    );
+
+    this.resetSessionTokens();
+    this.activeThreadLaunchProfile = this.currentLaunchProfile;
+    this.currentThreadId = response.thread.id;
+    this.appServerAttachedThreadId = response.thread.id;
+    this.currentWorkspace = response.cwd ?? response.thread.cwd ?? this.currentWorkspace;
+    if (response.model) {
+      this.currentModel = response.model;
+    }
+  }
+
+  private requireCurrentThreadId(): string {
+    if (!this.currentThreadId) {
+      throw new Error("No active app-server thread");
+    }
+    return this.currentThreadId;
+  }
+
+  private buildThreadResumeRequest(threadId: string): JsonValue {
+    return {
+      threadId,
+      cwd: this.currentWorkspace,
+      model: this.currentModel ?? null,
+      approvalPolicy: this.currentLaunchProfile.approvalPolicy,
+      sandbox: this.currentLaunchProfile.sandboxMode,
+    };
+  }
+
+  private handleClientExit(client: AppServerClientLike, error: Error): void {
+    if (this.client === client) {
+      this.client = null;
+      this.appServerAttachedThreadId = null;
+    }
+    this.rejectActiveRun(error);
+  }
+
   private handleNotification(notification: AppServerNotification): void {
     const callbacks = this.activeCallbacks;
     if (!callbacks) {
+      return;
+    }
+
+    if (notification.method === "turn/started") {
+      const params = notification.params as { threadId?: string; turn?: AppServerTurn } | undefined;
+      if (params?.threadId !== this.currentThreadId || !params.turn?.id || !this.activeRunKind) {
+        return;
+      }
+      if (!this.activeTurnId) {
+        this.activeTurnId = params.turn.id;
+        this.finalText = "";
+        this.lastCommandOutput.clear();
+        this.clearGoalIdleTimeout();
+      }
+      return;
+    }
+
+    if (notification.method === "thread/goal/updated") {
+      this.handleGoalUpdatedNotification(notification);
+      return;
+    }
+
+    if (notification.method === "thread/goal/cleared") {
+      this.handleGoalClearedNotification(notification);
+      return;
+    }
+
+    if (notification.method === "thread/compacted") {
+      if (this.activeRunKind === "goal") {
+        const itemId = `context-compaction:${Date.now()}`;
+        callbacks.onToolStart("context_compaction", itemId);
+        callbacks.onToolEnd(itemId, false);
+      }
       return;
     }
 
@@ -491,6 +809,19 @@ export class AppServerSessionService {
       } else if (item.type === "webSearch" && item.query) {
         callbacks.onToolStart(`search ${item.query.slice(0, 60)}`, item.id);
         callbacks.onToolUpdate(item.id, item.query);
+      } else if (item.type === "collabAgentToolCall") {
+        callbacks.onToolStart(`mcp:codex_apps/${item.tool ?? "agent"}`, item.id);
+        if (item.prompt) {
+          callbacks.onToolUpdate(item.id, `Prompt: ${item.prompt}`);
+        }
+        if (item.receiverThreadIds?.length) {
+          callbacks.onChildThreads?.({
+            toolCallId: item.id,
+            toolName: item.tool ?? "agent",
+            threadIds: item.receiverThreadIds,
+            prompt: item.prompt ?? undefined,
+          });
+        }
       }
       return;
     }
@@ -533,11 +864,61 @@ export class AppServerSessionService {
         return;
       }
       if (params.turn.status === "failed") {
-        this.activeReject?.(new Error(formatTurnError(params.turn.error)));
+        this.rejectActiveRun(new Error(formatTurnError(params.turn.error)));
       } else {
         callbacks.onAgentEnd();
-        this.activeResolve?.();
+        if (this.activeRunKind === "goal") {
+          this.activeTurnId = null;
+          this.finalText = "";
+          this.lastCommandOutput.clear();
+          if (this.activeGoalCleared || (this.activeGoal && !isActiveGoal(this.activeGoal))) {
+            this.resolveActiveRun();
+          } else {
+            this.scheduleGoalIdleTimeout();
+          }
+        } else {
+          this.resolveActiveRun();
+        }
       }
+    }
+  }
+
+  private handleGoalUpdatedNotification(notification: AppServerNotification): void {
+    const params = notification.params as { threadId?: string; goal?: CodexThreadGoal } | undefined;
+    if (params?.threadId !== this.currentThreadId || !params.goal) {
+      return;
+    }
+
+    const goal = normalizeThreadGoal(params.goal);
+    this.activeGoal = goal;
+    if (this.activeRunKind !== "goal") {
+      return;
+    }
+
+    if (isActiveGoal(goal)) {
+      if (!this.activeTurnId) {
+        this.scheduleGoalIdleTimeout();
+      }
+      return;
+    }
+
+    this.clearGoalIdleTimeout();
+    if (!this.activeTurnId) {
+      this.resolveActiveRun();
+    }
+  }
+
+  private handleGoalClearedNotification(notification: AppServerNotification): void {
+    const params = notification.params as { threadId?: string } | undefined;
+    if (params?.threadId !== this.currentThreadId) {
+      return;
+    }
+
+    this.activeGoal = null;
+    this.activeGoalCleared = true;
+    this.clearGoalIdleTimeout();
+    if (this.activeRunKind === "goal" && !this.activeTurnId) {
+      this.resolveActiveRun();
     }
   }
 
@@ -596,6 +977,14 @@ export class AppServerSessionService {
       callbacks.onToolEnd(item.id, item.status === "failed" || item.success === false);
     } else if (item.type === "collabAgentToolCall") {
       callbacks.onToolStart(`mcp:codex_apps/${item.tool ?? "agent"}`, item.id);
+      if (item.receiverThreadIds?.length) {
+        callbacks.onChildThreads?.({
+          toolCallId: item.id,
+          toolName: item.tool ?? "agent",
+          threadIds: item.receiverThreadIds,
+          prompt: item.prompt ?? undefined,
+        });
+      }
       const detail = [
         item.prompt ? `Prompt: ${item.prompt}` : "",
         item.receiverThreadIds?.length ? `Threads: ${item.receiverThreadIds.join(", ")}` : "",
@@ -628,6 +1017,75 @@ export class AppServerSessionService {
     return typeof params?.turnId === "string" && params.turnId === this.activeTurnId;
   }
 
+  private resolveActiveRun(): void {
+    const resolve = this.activeResolve;
+    this.activeResolve = null;
+    this.activeReject = null;
+    resolve?.();
+  }
+
+  private rejectActiveRun(error: Error): void {
+    const reject = this.activeReject;
+    this.activeResolve = null;
+    this.activeReject = null;
+    reject?.(error);
+  }
+
+  private clearActiveRunState(): void {
+    this.clearGoalIdleTimeout();
+    this.activeRunKind = null;
+    this.activeTurnId = null;
+    this.activeCallbacks = null;
+    this.activeResolve = null;
+    this.activeReject = null;
+    this.activeGoal = null;
+    this.activeGoalCleared = false;
+    this.finalText = "";
+    this.lastCommandOutput.clear();
+  }
+
+  private scheduleGoalIdleTimeout(): void {
+    if (this.activeRunKind !== "goal" || this.activeTurnId || !this.activeGoal || !isActiveGoal(this.activeGoal)) {
+      return;
+    }
+
+    this.clearGoalIdleTimeout();
+    this.goalIdleTimer = setTimeout(() => {
+      this.goalIdleTimer = null;
+      this.reportIdleGoalMonitor();
+    }, GOAL_IDLE_PROGRESS_MS);
+  }
+
+  private clearGoalIdleTimeout(): void {
+    if (!this.goalIdleTimer) {
+      return;
+    }
+    clearTimeout(this.goalIdleTimer);
+    this.goalIdleTimer = null;
+  }
+
+  private reportIdleGoalMonitor(): void {
+    if (
+      this.activeRunKind !== "goal" ||
+      this.activeTurnId ||
+      !this.currentThreadId ||
+      !this.activeGoal ||
+      !isActiveGoal(this.activeGoal)
+    ) {
+      return;
+    }
+
+    const callbacks = this.activeCallbacks;
+    const itemId = `goal-idle-${Date.now()}`;
+    callbacks?.onToolStart("goal_idle_watchdog", itemId);
+    callbacks?.onToolUpdate(
+      itemId,
+      `Native goal is still active. Waiting for the next continuation turn while keeping Telegram attached. Use /goal pause to stop it, or /steer to add guidance when a turn is active.`,
+    );
+    callbacks?.onToolEnd(itemId, false);
+    this.scheduleGoalIdleTimeout();
+  }
+
   private buildAppServerInput(input: CodexPromptInput): JsonValue[] {
     if (typeof input === "string") {
       return [{ type: "text", text: input, text_elements: [] }];
@@ -647,7 +1105,7 @@ export class AppServerSessionService {
   }
 
   private ensureIdle(action: string): void {
-    if (this.activeTurnId) {
+    if (this.activeRunKind || this.activeTurnId) {
       throw new Error(`Cannot ${action} while a turn is in progress`);
     }
   }
@@ -674,6 +1132,41 @@ function getLaunchProfile(config: TeleCodexConfig, profileId: string): CodexLaun
     throw new Error(`Unknown launch profile: ${profileId}`);
   }
   return profile;
+}
+
+function buildThreadGoalSetRequest(threadId: string, params: CodexThreadGoalSetParams): JsonValue {
+  const request: { [key: string]: JsonValue } = { threadId };
+  if (params.objective !== undefined) {
+    request.objective = params.objective;
+  }
+  if (params.status !== undefined) {
+    request.status = params.status;
+  }
+  if ("tokenBudget" in params) {
+    request.tokenBudget = params.tokenBudget ?? null;
+  }
+  return request;
+}
+
+function normalizeThreadGoal(goal: CodexThreadGoal): CodexThreadGoal {
+  return {
+    threadId: goal.threadId,
+    objective: goal.objective,
+    status: goal.status,
+    tokenBudget: typeof goal.tokenBudget === "number" ? goal.tokenBudget : null,
+    tokensUsed: typeof goal.tokensUsed === "number" ? goal.tokensUsed : 0,
+    timeUsedSeconds: typeof goal.timeUsedSeconds === "number" ? goal.timeUsedSeconds : 0,
+    createdAt: typeof goal.createdAt === "number" ? goal.createdAt : 0,
+    updatedAt: typeof goal.updatedAt === "number" ? goal.updatedAt : 0,
+  };
+}
+
+function isActiveGoal(goal: CodexThreadGoal): boolean {
+  return goal.status === "active";
+}
+
+function isThreadNotFoundError(error: unknown): boolean {
+  return /\bthread not found\b/i.test(formatErrorMessage(error));
 }
 
 function getNotificationItem(notification: AppServerNotification): AppServerThreadItem | null {
@@ -707,6 +1200,28 @@ function formatTurnError(error: unknown): string {
   const record = error as { message?: unknown; code?: unknown };
   const message = typeof record.message === "string" ? record.message : "app-server turn failed";
   return typeof record.code === "string" ? `${message} (${record.code})` : message;
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function computeTextDelta(previousText: string, nextText: string): string {

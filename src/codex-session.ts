@@ -31,12 +31,44 @@ export interface CodexSessionCallbacks {
   onToolUpdate: (toolCallId: string, partialResult: string) => void;
   onToolEnd: (toolCallId: string, isError: boolean) => void;
   onAgentEnd: () => void;
+  onChildThreads?: (event: {
+    toolCallId: string;
+    toolName: string;
+    threadIds: string[];
+    prompt?: string;
+  }) => void;
   onTodoUpdate?: (items: Array<{ text: string; completed: boolean }>) => void;
   onTurnComplete?: (usage: {
     inputTokens: number;
     cachedInputTokens: number;
     outputTokens: number;
   }) => void;
+}
+
+export type CodexThreadGoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "usageLimited"
+  | "budgetLimited"
+  | "complete"
+  | (string & {});
+
+export interface CodexThreadGoal {
+  threadId: string;
+  objective: string;
+  status: CodexThreadGoalStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CodexThreadGoalSetParams {
+  objective?: string;
+  status?: CodexThreadGoalStatus;
+  tokenBudget?: number | null;
 }
 
 export interface CodexSessionInfo {

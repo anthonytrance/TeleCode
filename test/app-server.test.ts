@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 
 import { describe, expect, it } from "vitest";
@@ -7,6 +10,7 @@ import {
   CodexAppServerClient,
   DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS,
   probeCodexAppServer,
+  resolveCodexBinaryPath,
   runCodexAppServerSteeredTurn,
   runCodexAppServerTurn,
   type AppServerProcess,
@@ -14,6 +18,41 @@ import {
 } from "../src/app-server.js";
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
 import type { TeleCodexConfig } from "../src/config.js";
+
+describe("resolveCodexBinaryPath", () => {
+  it("prefers Codex 0.133+ bin layout over the legacy codex directory", () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "telecodex-codex-path-"));
+    try {
+      const vendorRoot = path.join(tempDir, "vendor");
+      const targetTriple = "x86_64-pc-windows-msvc";
+      const currentPath = path.join(vendorRoot, targetTriple, "bin", "codex.exe");
+      const legacyPath = path.join(vendorRoot, targetTriple, "codex", "codex.exe");
+      mkdirSync(path.dirname(currentPath), { recursive: true });
+      mkdirSync(path.dirname(legacyPath), { recursive: true });
+      writeFileSync(currentPath, "current");
+      writeFileSync(legacyPath, "legacy");
+
+      expect(resolveCodexBinaryPath(vendorRoot, targetTriple, "codex.exe")).toBe(currentPath);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the pre-0.133 legacy codex directory when bin is absent", () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "telecodex-codex-path-"));
+    try {
+      const vendorRoot = path.join(tempDir, "vendor");
+      const targetTriple = "x86_64-pc-windows-msvc";
+      const legacyPath = path.join(vendorRoot, targetTriple, "codex", "codex.exe");
+      mkdirSync(path.dirname(legacyPath), { recursive: true });
+      writeFileSync(legacyPath, "legacy");
+
+      expect(resolveCodexBinaryPath(vendorRoot, targetTriple, "codex.exe")).toBe(legacyPath);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
 
 class FakeAppServerProcess extends EventEmitter implements AppServerProcess {
   readonly stdin: Writable;

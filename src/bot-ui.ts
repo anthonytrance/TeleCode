@@ -40,12 +40,22 @@ export function renderHelpMessage(): DualText {
         ["/use previous", "Switch to previous thread"],
         ["/use latest", "Switch to latest thread"],
         ["/history", "Show recent local thread history"],
+        ["/children", "List child sessions"],
+        ["/follow latest", "Switch to newest child session"],
+        ["/follow <id>", "Switch to child session"],
+        ["/parent", "Return from child session"],
         ["/attach", "Bind a Codex thread to this topic"],
         ["/handback", "Hand thread back to Codex CLI"],
         ["/abort", "Cancel current operation"],
         ["/stop", "Alias for /abort"],
         ["/steer <text>", "Steer active app-server turn"],
         ["/retry", "Resend the last prompt"],
+        ["/goal", "Show native goal status"],
+        ["/goal <task>", "Start native goal mode"],
+        ["/goal pause", "Pause running goal"],
+        ["/goal resume", "Resume paused goal"],
+        ["/goal clear", "Clear thread goal"],
+        ["/goal no-agents <task>", "Goal mode without child sessions"],
         ["/clear", "Forget this Telegram context"],
         ["/copy", "Re-send last assistant reply"],
       ],
@@ -179,6 +189,7 @@ export function renderWelcomeReturning(
  */
 export function formatSessionLabel(
   options: {
+    id?: string;
     workspace: string;
     title: string;
     relativeTime: string;
@@ -198,14 +209,25 @@ export function formatSessionLabel(
     label += ` · ${shortModel}`;
   }
 
+  if (options.id) {
+    label += ` #${options.id.slice(0, 8)}`;
+  }
+
   return label;
 }
 
 export function cleanSessionTitle(title: string): string {
-  const normalized = title.replace(/\s+/g, " ").trim();
+  let normalized = title.replace(/\s+/g, " ").trim();
   const outputFilesPrefix =
     /^Output files:\s*write any files the user should receive to\s+.*?[\\/]out\b\s*/i;
-  return normalized.replace(outputFilesPrefix, "").trim();
+  normalized = normalized.replace(outputFilesPrefix, "").trim();
+
+  const summarySeedPrefix =
+    /^You are continuing from a previous Codex session\.\s*Treat the following handoff summary as the starting context for this new thread\.\s*Do not redo work unless asked\.\s*Reply only:\s*Summary loaded\.\s*/i;
+  normalized = normalized.replace(summarySeedPrefix, "").trim();
+  normalized = normalized.replace(/^Current goal:\s*/i, "").trim();
+
+  return normalized;
 }
 
 function trimLabel(text: string, maxLength: number): string {

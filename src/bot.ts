@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { readFile, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
@@ -23,6 +24,8 @@ import {
   type StagedFile,
 } from "./attachments.js";
 import { collectArtifactReport, ensureOutDir, formatArtifactSummary } from "./artifacts.js";
+import { AgentSessionManager, type AgentJobRecord, type AgentSessionRecord } from "./agent-session-manager.js";
+import { agentSessionStatePath, JsonAgentSessionStore } from "./agent-session-store.js";
 import {
   cleanSessionTitle,
   formatSessionLabel,
@@ -42,11 +45,30 @@ import {
   formatLaunchProfileBehavior,
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
-import { getThread, getThreadByPrefix, readThreadHistory } from "./codex-state.js";
+import {
+  getParentThread,
+  getThread,
+  getThreadByPrefix,
+  listChildThreads,
+  listThreads,
+  readThreadHistory,
+  type CodexThreadRecord,
+} from "./codex-state.js";
 import type { CodexBackend, ProgressDelivery, TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
+import { applyGoalModeConstraints, formatThreadGoal, parseGoalModeArgument } from "./goal-mode.js";
+import { OutputBuffer, type BufferedOutputEvent } from "./output-buffer.js";
+import { ClaudeProviderAdapter } from "./providers/claude-adapter.js";
+import { classifyClaudeSlashCommand } from "./providers/claude-commands.js";
+import {
+  ClaudeSessionStateIndex,
+  ClaudeStateStore,
+  claudeProviderStatePath,
+  type ClaudeSessionStateRecord,
+} from "./providers/claude-state.js";
+import type { AgentProviderEvent, AgentProviderKind, AgentSessionDescriptor } from "./providers/types.js";
 import { SessionRegistry } from "./session-registry.js";
 import { readLatestCodexUsage, renderUsagePlain } from "./usage.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
@@ -57,6 +79,7 @@ const FIRST_INTERMEDIATE_UPDATE_MS = 2500;
 const INTERMEDIATE_UPDATE_MIN_MS = 30000;
 const SUMMARY_PROGRESS_UPDATE_MIN_MS = 30000;
 const SUMMARY_PROGRESS_RECENT_LIMIT = 5;
+const BACKGROUND_NOTICE_PREVIEW_LIMIT = 700;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
@@ -64,6 +87,8 @@ const STREAM_MESSAGE_TARGET = 1200;
 const FORMATTED_CHUNK_TARGET = 3600;
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const KEYBOARD_PAGE_SIZE = 6;
+const DEFAULT_PROVIDER_SESSION_LIST_LIMIT = 20;
+const MAX_PROVIDER_SESSION_LIST_LIMIT = 50;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
 const NATIVE_CODEX_COMMANDS = [
@@ -80,6 +105,23 @@ const NATIVE_CODEX_COMMANDS = [
   "config",
   "limits",
 ] as const;
+const TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
+  "start",
+  "help",
+  "health",
+  "claude",
+  "codex",
+  "provider",
+  "new",
+  "fork",
+  "workspaces",
+  "workspace",
+  "backend",
+  "verbosity",
+  "velocity",
+  "progress",
+  "voice",
+]);
 const NEW_FROM_SUMMARY_PROMPT = [
   "Create a compact handoff summary for continuing this Codex session in a fresh thread.",
   "Include: current goal, important decisions, files changed or inspected, commands run, current state, open problems, and recommended next steps.",
@@ -122,6 +164,38 @@ type QueuedPrompt = {
   userInput: CodexPromptInput;
 };
 
+type ProviderSessionPick =
+  | {
+      kind: "agent";
+      session: AgentSessionRecord;
+      provider: AgentProviderKind;
+      title: string;
+      workspace: string;
+      updatedAt: number;
+      status: AgentSessionRecord["status"];
+      providerSessionId?: string;
+    }
+  | {
+      kind: "codex-thread";
+      thread: CodexThreadRecord;
+      provider: "codex";
+      title: string;
+      workspace: string;
+      updatedAt: number;
+      status: "old";
+      providerSessionId: string;
+    }
+  | {
+      kind: "claude-transcript";
+      provider: "claude";
+      title: string;
+      workspace: string;
+      updatedAt: number;
+      status: "old";
+      providerSessionId: string;
+      metadata?: Record<string, unknown>;
+    };
+
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
   const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
@@ -152,12 +226,21 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
 export function createBot(config: TeleCodexConfig, registry: SessionRegistry): Bot<Context> {
   const bot = new Bot<Context>(config.telegramBotToken);
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
+  const startedAt = Date.now();
+  const agentSessionStore = new JsonAgentSessionStore(agentSessionStatePath(config.workspace));
+  const agentSessions = new AgentSessionManager({ state: agentSessionStore.load() });
+  const outputBuffer = new OutputBuffer();
+  const busyProviders = new Map<TelegramContextKey, Set<AgentProviderKind>>();
+  agentSessions.importLegacyContexts(registry.listContexts(), { defaultProvider: "codex", selectImported: true });
+  persistSafe(agentSessionStore, agentSessions);
 
   const contextBusy = new Map<
     TelegramContextKey,
     { processing: boolean; switching: boolean; transcribing: boolean }
   >();
   const pendingSessionPicks = new Map<TelegramContextKey, string[]>();
+  const pendingAgentSessionPicks = new Map<TelegramContextKey, ProviderSessionPick[]>();
+  const pendingChildPicks = new Map<TelegramContextKey, string[]>();
   const pendingWorkspacePicks = new Map<TelegramContextKey, string[]>();
   const pendingSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingWorkspaceButtons = new Map<TelegramContextKey, KeyboardItem[]>();
@@ -166,20 +249,40 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingUnsafeLaunchConfirmations = new Map<TelegramContextKey, string>();
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const inspectedThreads = new Map<TelegramContextKey, { threadId: string; parentThreadId?: string }>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const lastAssistantReply = new Map<TelegramContextKey, string>();
   const queuedPrompts = new Map<TelegramContextKey, QueuedPrompt>();
+  const activeProgressRefreshers = new Map<TelegramContextKey, () => Promise<void>>();
+  const claudeAdapter = config.enableClaudeProvider ? new ClaudeProviderAdapter(config) : undefined;
+  const claudeState = config.enableClaudeProvider
+    ? new ClaudeSessionStateIndex(new ClaudeStateStore(claudeProviderStatePath(config.workspace)))
+    : undefined;
+  const claudeSessions = new Map<TelegramContextKey, AgentSessionDescriptor>();
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
+    busyProviders.delete(key);
     pendingSessionPicks.delete(key);
+    pendingAgentSessionPicks.delete(key);
+    pendingChildPicks.delete(key);
     pendingSessionButtons.delete(key);
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
+    inspectedThreads.delete(key);
     lastPromptInput.delete(key);
     lastAssistantReply.delete(key);
     queuedPrompts.delete(key);
+    activeProgressRefreshers.delete(key);
+    const claudeSession = claudeSessions.get(key);
+    if (claudeSession && claudeAdapter) {
+      void claudeAdapter.dispose(claudeSession.id).catch((error) => {
+        console.warn("Failed to dispose Claude session after context removal", error);
+      });
+    }
+    claudeSessions.delete(key);
+    claudeState?.remove(key);
   });
 
   const getBusyState = (
@@ -193,10 +296,411 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     return state;
   };
 
-  const isBusy = (contextKey: TelegramContextKey): boolean => {
+  const markProviderBusy = (
+    contextKey: TelegramContextKey,
+    provider: AgentProviderKind,
+    busy: boolean,
+  ): void => {
+    const providers = busyProviders.get(contextKey) ?? new Set<AgentProviderKind>();
+    if (busy) {
+      providers.add(provider);
+    } else {
+      providers.delete(provider);
+    }
+
+    if (providers.size > 0) {
+      busyProviders.set(contextKey, providers);
+    } else {
+      busyProviders.delete(contextKey);
+    }
+  };
+
+  const isProviderBusy = (contextKey: TelegramContextKey, provider: AgentProviderKind): boolean =>
+    busyProviders.get(contextKey)?.has(provider) ?? false;
+
+  const isAnyProviderBusy = (contextKey: TelegramContextKey): boolean =>
+    (busyProviders.get(contextKey)?.size ?? 0) > 0;
+
+  const isBusy = (
+    contextKey: TelegramContextKey,
+    provider: AgentProviderKind = registry.getActiveProvider(contextKey),
+  ): boolean => {
     const state = contextBusy.get(contextKey);
-    const session = registry.get(contextKey);
-    return Boolean(state?.processing || state?.switching || state?.transcribing || session?.isProcessing());
+    if (state?.switching || state?.transcribing) {
+      return true;
+    }
+
+    if (isProviderBusy(contextKey, provider)) {
+      return true;
+    }
+
+    if (provider === "codex") {
+      return Boolean(registry.get(contextKey)?.isProcessing());
+    }
+
+    return false;
+  };
+
+  const isClaudeActive = (contextKey: TelegramContextKey): boolean =>
+    registry.getActiveProvider(contextKey) === "claude";
+
+  const isProviderForeground = (contextKey: TelegramContextKey, provider: AgentProviderKind): boolean =>
+    registry.getActiveProvider(contextKey) === provider;
+
+  const persistAgentSessionState = (): void => {
+    try {
+      agentSessionStore.save(agentSessions.serialize());
+    } catch (error) {
+      console.warn("Failed to persist agent session state", error);
+    }
+  };
+
+  const ensureAgentSessionRecord = (
+    contextKey: TelegramContextKey,
+    provider: AgentProviderKind,
+    options: {
+      workspace: string;
+      displayName?: string;
+      providerSessionId?: string;
+      select?: boolean;
+      metadata?: Record<string, unknown>;
+    },
+  ): AgentSessionRecord => {
+    agentSessions.ensureLane(contextKey, { defaultProvider: provider });
+    const existing = agentSessions.listLaneSessions(contextKey).find((session) => {
+      if (session.provider !== provider) {
+        return false;
+      }
+      return options.providerSessionId ? session.providerSessionId === options.providerSessionId : true;
+    });
+
+    if (existing) {
+      if (options.select) {
+        agentSessions.selectSession(contextKey, existing.id);
+        persistAgentSessionState();
+      }
+      return existing;
+    }
+
+    const created = agentSessions.createSession(contextKey, provider, {
+      workspace: options.workspace,
+      displayName: options.displayName,
+      providerSessionId: options.providerSessionId,
+      select: options.select,
+      metadata: options.metadata,
+    });
+    persistAgentSessionState();
+    return created;
+  };
+
+  const startAgentJob = (sessionId: string, jobId: string): void => {
+    const session = agentSessions.getSession(sessionId);
+    if (session?.currentJobId) {
+      agentSessions.abortJob(session.currentJobId);
+    }
+    agentSessions.startJob(sessionId, { id: jobId });
+    persistAgentSessionState();
+  };
+
+  const finishAgentJob = (
+    jobId: string,
+    status: "completed" | "failed" | "aborted",
+    error?: string,
+  ): void => {
+    try {
+      if (status === "completed") {
+        agentSessions.completeJob(jobId);
+      } else if (status === "aborted") {
+        agentSessions.abortJob(jobId);
+      } else {
+        agentSessions.failJob(jobId, error ?? "failed");
+      }
+      persistAgentSessionState();
+    } catch (finishError) {
+      console.warn("Failed to finish agent job", finishError);
+    }
+  };
+
+  const buildClaudeDescriptor = (record: ClaudeSessionStateRecord): AgentSessionDescriptor => ({
+    id: `claude-${record.sessionId.slice(0, 12)}`,
+    provider: "claude",
+    workspace: record.workspace,
+    displayName: record.displayName,
+    providerSessionId: record.sessionId,
+    status: "idle",
+    capabilities: claudeAdapter?.capabilities ?? {
+      streamingText: true,
+      streamingInput: false,
+      abort: true,
+      fork: false,
+      rename: false,
+      compact: true,
+      usage: true,
+      context: true,
+      slashCommands: true,
+      permissions: false,
+      userQuestions: false,
+      artifacts: false,
+    },
+    createdAt: record.createdAt,
+    updatedAt: record.lastUsedAt,
+    metadata: {
+      model: record.model,
+      permissionMode: record.permissionMode,
+    },
+  });
+
+  const persistClaudeSession = (
+    contextKey: TelegramContextKey,
+    descriptor: AgentSessionDescriptor,
+  ): void => {
+    if (!claudeState || !descriptor.providerSessionId) {
+      return;
+    }
+    claudeState.upsert({
+      telegramContextKey: contextKey,
+      sessionId: descriptor.providerSessionId,
+      workspace: descriptor.workspace,
+      displayName: descriptor.displayName,
+      model: String(descriptor.metadata?.model ?? config.claudeDefaultModel),
+      permissionMode: config.claudePermissionMode,
+      createdAt: descriptor.createdAt,
+      lastUsedAt: Date.now(),
+    });
+  };
+
+  const ensureClaudeSession = async (
+    contextKey: TelegramContextKey,
+  ): Promise<AgentSessionDescriptor> => {
+    if (!claudeAdapter) {
+      throw new Error("Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.");
+    }
+    const existing = claudeSessions.get(contextKey);
+    if (existing) {
+      return existing;
+    }
+
+    const persisted = claudeState?.get(contextKey);
+    const descriptor = persisted
+      ? await claudeAdapter.resumeSession(buildClaudeDescriptor(persisted))
+      : await claudeAdapter.createSession({
+          workspace: config.claudeWorkspace,
+          displayName: `TeleCodex ${contextKey}`,
+          metadata: {
+            model: config.claudeDefaultModel,
+            permissionMode: config.claudePermissionMode,
+          },
+        });
+    claudeSessions.set(contextKey, descriptor);
+    persistClaudeSession(contextKey, descriptor);
+    return descriptor;
+  };
+
+  const createFreshClaudeSession = async (
+    contextKey: TelegramContextKey,
+  ): Promise<AgentSessionDescriptor> => {
+    if (!claudeAdapter) {
+      throw new Error("Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.");
+    }
+
+    const descriptor = await claudeAdapter.createSession({
+      workspace: config.claudeWorkspace,
+      displayName: `TeleCodex ${contextKey}`,
+      metadata: {
+        model: config.claudeDefaultModel,
+        permissionMode: config.claudePermissionMode,
+      },
+    });
+    claudeSessions.set(contextKey, descriptor);
+    persistClaudeSession(contextKey, descriptor);
+    ensureAgentSessionRecord(contextKey, "claude", {
+      workspace: descriptor.workspace,
+      displayName: descriptor.displayName ?? "Claude Code",
+      providerSessionId: descriptor.providerSessionId,
+      select: true,
+      metadata: descriptor.metadata,
+    });
+    return descriptor;
+  };
+
+  const resumeClaudeAgentSession = async (
+    contextKey: TelegramContextKey,
+    session: AgentSessionRecord,
+  ): Promise<AgentSessionDescriptor> => {
+    if (!claudeAdapter || !session.providerSessionId) {
+      throw new Error("Claude session cannot be resumed.");
+    }
+
+    const descriptor = await claudeAdapter.resumeSession({
+      id: `claude-${session.providerSessionId.slice(0, 12)}`,
+      provider: "claude",
+      workspace: session.workspace,
+      displayName: session.displayName,
+      providerSessionId: session.providerSessionId,
+      status: session.status === "running" ? "running" : "idle",
+      capabilities: claudeAdapter.capabilities,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      metadata: session.metadata,
+    });
+    claudeSessions.set(contextKey, descriptor);
+    persistClaudeSession(contextKey, descriptor);
+    return descriptor;
+  };
+
+  const forgetClaudeSession = async (contextKey: TelegramContextKey): Promise<void> => {
+    const descriptor = claudeSessions.get(contextKey);
+    if (descriptor && claudeAdapter) {
+      await claudeAdapter.dispose(descriptor.id);
+    }
+    claudeSessions.delete(contextKey);
+    claudeState?.remove(contextKey);
+  };
+
+  const pauseActiveGoalForTakeover = async (
+    contextKey: TelegramContextKey,
+    session: CodexSessionRuntime,
+  ): Promise<boolean> => {
+    if (!isBusy(contextKey)) {
+      if (session.hasActiveThread() && session.getThreadGoal && session.setThreadGoal) {
+        try {
+          const goal = await session.getThreadGoal();
+          if (goal?.status === "active") {
+            await session.setThreadGoal({ status: "paused" });
+          }
+        } catch (error) {
+          console.warn("Failed to pause active native goal for session takeover", error);
+          return false;
+        }
+      }
+      return true;
+    }
+
+    const busyState = getBusyState(contextKey);
+    if (busyState.switching || busyState.transcribing) {
+      return false;
+    }
+    if (session.getProcessingKind?.() !== "goal" || !session.pauseActiveGoal) {
+      return false;
+    }
+
+    try {
+      await session.pauseActiveGoal();
+      queuedPrompts.delete(contextKey);
+      activeProgressRefreshers.delete(contextKey);
+      busyState.processing = false;
+      return true;
+    } catch (error) {
+      console.warn("Failed to pause active goal for session takeover", error);
+      return false;
+    }
+  };
+
+  const ensureSessionTakeoverAllowed = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    session: CodexSessionRuntime,
+    blockedMessage: string,
+  ): Promise<boolean> => {
+    if (await pauseActiveGoalForTakeover(contextKey, session)) {
+      return true;
+    }
+
+    await safeReply(ctx, escapeHTML(blockedMessage), { fallbackText: blockedMessage });
+    return false;
+  };
+
+  const getViewedThreadId = (contextKey: TelegramContextKey, session: CodexSessionRuntime): string | null => {
+    return inspectedThreads.get(contextKey)?.threadId ?? session.getInfo().threadId;
+  };
+
+  const isNativeGoalActive = async (session: CodexSessionRuntime): Promise<boolean> => {
+    if (session.getProcessingKind?.() === "goal") {
+      return true;
+    }
+    if (!session.getThreadGoal || !session.hasActiveThread()) {
+      return false;
+    }
+    try {
+      return (await session.getThreadGoal())?.status === "active";
+    } catch {
+      return false;
+    }
+  };
+
+  const renderThreadInspection = (
+    label: string,
+    record: CodexThreadRecord,
+    options: { parentThreadId?: string; goalIsActive: boolean },
+  ): { html: string; plain: string } => {
+    const title = cleanSessionTitle(record.title || record.firstUserMessage) || "(untitled)";
+    const history = readThreadHistory(record.id, 6);
+    const plainLines = [
+      label,
+      options.goalIsActive ? "Goal keeps running in its current thread." : undefined,
+      options.parentThreadId ? `Parent: ${options.parentThreadId.slice(0, 8)}` : undefined,
+      `Thread ID: ${record.id}`,
+      `Workspace: ${record.cwd}`,
+      record.model ? `Model: ${record.model}` : undefined,
+      `Updated: ${formatRelativeTime(record.updatedAt)}`,
+      `Title: ${title}`,
+      "",
+      history.length ? "Recent history:" : "No local history entries found for this thread yet.",
+      ...history.map((message) => {
+        const role = message.role === "assistant" ? "Assistant" : "User";
+        return `${role}: ${truncateForHistory(message.text)}`;
+      }),
+      "",
+      options.goalIsActive
+        ? `Use /history to refresh this inspection. Use /use ${record.id.slice(0, 8)} to pause the goal and take control.`
+        : `Use /use ${record.id.slice(0, 8)} to take control.`,
+    ].filter((line): line is string => line !== undefined);
+
+    const htmlLines = [
+      `<b>${escapeHTML(label)}</b>`,
+      options.goalIsActive ? "Goal keeps running in its current thread." : undefined,
+      options.parentThreadId ? `Parent: <code>${escapeHTML(options.parentThreadId.slice(0, 8))}</code>` : undefined,
+      `<b>Thread ID:</b> <code>${escapeHTML(record.id)}</code>`,
+      `<b>Workspace:</b> <code>${escapeHTML(record.cwd)}</code>`,
+      record.model ? `<b>Model:</b> <code>${escapeHTML(record.model)}</code>` : undefined,
+      `<b>Updated:</b> ${escapeHTML(formatRelativeTime(record.updatedAt))}`,
+      `<b>Title:</b> ${escapeHTML(title)}`,
+      "",
+      history.length ? "<b>Recent history:</b>" : "No local history entries found for this thread yet.",
+      ...history.map((message) => {
+        const role = message.role === "assistant" ? "Assistant" : "User";
+        return `<b>${role}:</b> ${escapeHTML(truncateForHistory(message.text))}`;
+      }),
+      "",
+      options.goalIsActive
+        ? `Use <code>/history</code> to refresh this inspection. Use <code>/use ${escapeHTML(record.id.slice(0, 8))}</code> to pause the goal and take control.`
+        : `Use <code>/use ${escapeHTML(record.id.slice(0, 8))}</code> to take control.`,
+    ].filter((line): line is string => line !== undefined);
+
+    return { html: htmlLines.join("\n"), plain: plainLines.join("\n") };
+  };
+
+  const rejectPromptWhileInspecting = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+  ): Promise<boolean> => {
+    const inspected = inspectedThreads.get(contextKey);
+    if (!inspected) {
+      return false;
+    }
+
+    const thread = getThread(inspected.threadId);
+    const label = thread
+      ? `${thread.id.slice(0, 8)} ${cleanSessionTitle(thread.title || thread.firstUserMessage) || "(untitled)"}`
+      : inspected.threadId.slice(0, 8);
+    const text = [
+      `You are inspecting ${label} read-only.`,
+      "I did not send this as a prompt.",
+      `Use /use ${inspected.threadId.slice(0, 8)} to pause the goal and take control of that thread, or /parent to return to the main session view.`,
+      "/steer still goes to the active main goal turn when there is one.",
+    ].join("\n");
+    await safeReply(ctx, formatTelegramHTML(text), { fallbackText: text });
+    return true;
   };
 
   const getContextSession = async (
@@ -227,6 +731,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const clearSessionSelectionState = (contextKey: TelegramContextKey): void => {
     pendingSessionPicks.delete(contextKey);
     pendingSessionButtons.delete(contextKey);
+  };
+
+  const clearChildSelectionState = (contextKey: TelegramContextKey): void => {
+    pendingChildPicks.delete(contextKey);
   };
 
   const handlePageCallback = (
@@ -344,12 +852,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     chatId: TelegramChatId,
     session: CodexSessionRuntime,
     userInput: CodexPromptInput,
+    options: {
+      execute?: (callbacks: CodexSessionCallbacks) => Promise<void>;
+      finalizeOnAgentEnd?: boolean;
+      addOutputInstructions?: boolean;
+    } = {},
   ): Promise<void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
     const getProgressDelivery = (): ProgressDelivery => registry.getProgressDelivery(contextKey);
     const shouldStreamAssistantText = (): boolean =>
       config.streamAssistantText && getProgressDelivery() === "messages" && !shouldHoldFinalResponse(userInput);
+    const finalizeOnAgentEnd = options.finalizeOnAgentEnd ?? true;
+    const addOutputInstructionsToPrompt = options.addOutputInstructions ?? true;
 
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
@@ -358,6 +873,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const busyState = getBusyState(contextKey);
     busyState.processing = true;
+    markProviderBusy(contextKey, "codex", true);
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
@@ -378,6 +894,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let lastProgressText = "";
     let progressUpdateInFlight = false;
     let pendingProgress: RenderedText | undefined;
+    let lastAssistantProgressText = "";
     let isFlushing = false;
     let flushPending = false;
     let finalized = false;
@@ -386,19 +903,44 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let planMessageSending = false;
     let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
     let autoArtifactOutDir: string | undefined;
+    const announcedChildThreads = new Set<string>();
+    let codexAgentSession: AgentSessionRecord | undefined;
+    let agentJobId: string | undefined;
+    let completedSuccessfully = false;
+    let backgroundCompletionText: string | undefined;
 
-    const typingInterval = setInterval(() => {
+    const isCodexForeground = (): boolean => isProviderForeground(contextKey, "codex");
+    const bufferCodexOutput = (
+      kind: BufferedOutputEvent["kind"],
+      outputText: string,
+      priority?: boolean,
+      artifactPath?: string,
+    ): void => {
+      if (!codexAgentSession || (!outputText.trim() && !artifactPath)) {
+        return;
+      }
+
+      outputBuffer.append(codexAgentSession.id, {
+        kind,
+        text: outputText,
+        artifactPath,
+        priority,
+        metadata: { provider: "codex" },
+      });
+    };
+    const sendCodexTyping = (): void => {
+      if (!isCodexForeground()) {
+        return;
+      }
       void bot.api
         .sendChatAction(chatId, "typing", {
           ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
         })
         .catch(() => {});
-    }, TYPING_INTERVAL_MS);
-    void bot.api
-      .sendChatAction(chatId, "typing", {
-        ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-      })
-      .catch(() => {});
+    };
+
+    const typingInterval = setInterval(sendCodexTyping, TYPING_INTERVAL_MS);
+    sendCodexTyping();
 
     const stopTyping = (): void => {
       clearInterval(typingInterval);
@@ -438,6 +980,41 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       if (recentAssistantProgress.length > SUMMARY_PROGRESS_RECENT_LIMIT) {
         recentAssistantProgress.splice(0, recentAssistantProgress.length - SUMMARY_PROGRESS_RECENT_LIMIT);
       }
+    };
+
+    const announceChildThreads = async (event: {
+      toolName: string;
+      threadIds: string[];
+      prompt?: string;
+    }): Promise<void> => {
+      const newThreadIds = event.threadIds.filter((threadId) => {
+        if (announcedChildThreads.has(threadId)) {
+          return false;
+        }
+        announcedChildThreads.add(threadId);
+        return true;
+      });
+      if (newThreadIds.length === 0) {
+        return;
+      }
+
+      const lines = [
+        `Goal spawned ${newThreadIds.length === 1 ? "a child session" : "child sessions"} for ${event.toolName}.`,
+        ...newThreadIds.map((threadId) => `- ${threadId.slice(0, 8)}: /follow ${threadId.slice(0, 8)} or /use ${threadId.slice(0, 8)}`),
+        "Use /children to list child sessions, /follow latest to switch to the newest child, and /parent to return.",
+        event.prompt ? `Prompt: ${trimLine(event.prompt, 280)}` : "",
+      ].filter(Boolean);
+      const plain = lines.join("\n");
+      if (!isCodexForeground()) {
+        bufferCodexOutput("status", plain, false);
+        return;
+      }
+
+      await sendTextMessage(bot.api, chatId, lines.map((line) => escapeHTML(line)).join("\n"), {
+        parseMode: "HTML",
+        fallbackText: plain,
+        messageThreadId,
+      });
     };
 
     const extractStreamParts = (force = false): string[] => {
@@ -523,6 +1100,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const ensureResponseMessage = async (): Promise<void> => {
+      if (!isCodexForeground()) {
+        return;
+      }
       if (responseMessageId) {
         return;
       }
@@ -557,6 +1137,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
       if (!pendingStreamText) {
+        return;
+      }
+      if (!isCodexForeground()) {
         return;
       }
       if (isFlushing) {
@@ -617,6 +1200,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const sendProgressUpdate = async (rendered: RenderedText): Promise<void> => {
       const progressDelivery = getProgressDelivery();
       if (finalized || progressDelivery === "none" || rendered.text === lastProgressText) {
+        return;
+      }
+      if (!isCodexForeground()) {
+        bufferCodexOutput("status", rendered.fallbackText ?? rendered.text, false);
+        lastProgressText = rendered.text;
+        lastProgressEditAt = Date.now();
         return;
       }
 
@@ -702,8 +1291,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     };
 
-    const deliverRenderedChunks = async (chunks: RenderedChunk[]): Promise<void> => {
+    const deliverRenderedChunks = async (
+      chunks: RenderedChunk[],
+      kind: BufferedOutputEvent["kind"] = "assistant",
+      priority?: boolean,
+    ): Promise<void> => {
       if (chunks.length === 0) {
+        return;
+      }
+
+      if (!isCodexForeground()) {
+        const text = chunks.map((chunk) => chunk.fallbackText ?? chunk.text).join("\n\n").trim();
+        bufferCodexOutput(kind, text, priority);
         return;
       }
 
@@ -733,14 +1332,40 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     };
 
-    const deliverFinalMarkdown = async (markdown: string): Promise<void> => {
-      await deliverRenderedChunks(splitMarkdownForTelegram(markdown));
+    const deliverFinalMarkdown = async (
+      markdown: string,
+      kind: BufferedOutputEvent["kind"] = "assistant",
+      priority?: boolean,
+    ): Promise<void> => {
+      await deliverRenderedChunks(splitMarkdownForTelegram(markdown), kind, priority);
     };
+
+    const refreshAssistantProgress = async (): Promise<void> => {
+      if (getProgressDelivery() !== "edit") {
+        return;
+      }
+      if (!isCodexForeground()) {
+        return;
+      }
+      const text = pendingStreamText.trim();
+      if (!text || text === lastAssistantProgressText) {
+        return;
+      }
+      lastAssistantProgressText = text;
+      recordAssistantProgress(text);
+      accumulatedText = "";
+      pendingStreamText = "";
+      await sendProgressUpdate(renderAssistantProgressMessage(recentAssistantProgress));
+    };
+    activeProgressRefreshers.set(contextKey, refreshAssistantProgress);
 
     const deliverIntermediateAssistantText = async (): Promise<void> => {
       const progressDelivery = getProgressDelivery();
       const text = accumulatedText.trim();
       if (!text || progressDelivery === "none") {
+        return;
+      }
+      if (!isCodexForeground()) {
         return;
       }
 
@@ -752,10 +1377,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
 
       if (progressDelivery === "edit") {
-        accumulatedText = "";
-        pendingStreamText = "";
-        recordAssistantProgress(text);
-        await sendProgressUpdate(renderAssistantProgressMessage(recentAssistantProgress));
+        await refreshAssistantProgress();
       }
     };
 
@@ -780,7 +1402,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const finalUndeliveredText = buildFinalResponseText(pendingStreamText);
       if (finalUndeliveredText) {
         pendingStreamText = "";
-        if (getProgressDelivery() === "edit" && responseMessageId && !sentResponseText) {
+        if (isCodexForeground() && getProgressDelivery() === "edit" && responseMessageId && !sentResponseText) {
           const completed = renderProgressCompletedMessage();
           await safeEditMessage(bot, chatId, responseMessageId, completed.text, {
             parseMode: completed.parseMode,
@@ -790,11 +1412,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
             console.error("Failed to complete progress message", error);
           });
         }
-        await deliverFinalMarkdown(finalUndeliveredText);
+        await deliverFinalMarkdown(finalUndeliveredText, "final", true);
         sentResponseText = true;
       }
 
       if (!sentResponseText) {
+        if (!isCodexForeground()) {
+          bufferCodexOutput("status", "Codex finished without text.", true);
+          return;
+        }
+
         const html = "<b>✅ Done</b>";
         const plainText = "✅ Done";
 
@@ -839,23 +1466,28 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
 
         toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
-        toolStates.set(toolCallId, { toolName, partialResult: "" });
+        recordProgressLine(`Started ${toolName}`);
 
         if (toolVerbosity === "summary") {
-          recordProgressLine(`Started ${formatProgressToolName(toolName)}`);
-          void sendProgressUpdate(
-            renderSummaryProgressMessage(toolName, toolCounts, recentProgressLines),
-          ).catch((error) => {
-            console.error(`Failed to send summary progress for ${toolName}`, error);
-          });
+          void sendProgressUpdate(renderSummaryProgressMessage(toolName, toolCounts, recentProgressLines)).catch(
+            (error) => {
+              console.error(`Failed to send summary progress for ${toolName}`, error);
+            },
+          );
           return;
         }
+
+        toolStates.set(toolCallId, { toolName, partialResult: "" });
 
         if (toolVerbosity !== "all") {
           return;
         }
 
         const messageText = renderToolStartMessage(toolName);
+        if (!isCodexForeground()) {
+          bufferCodexOutput("tool", messageText.fallbackText, false);
+          return;
+        }
 
         void (async () => {
           const message = await sendTextMessage(bot.api, chatId, messageText.text, {
@@ -920,6 +1552,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
             return;
           }
 
+          if (!isCodexForeground()) {
+            bufferCodexOutput("tool", state.finalStatus.fallbackText, true);
+            return;
+          }
+
           void sendTextMessage(bot.api, chatId, state.finalStatus.text, {
             parseMode: state.finalStatus.parseMode,
             fallbackText: state.finalStatus.fallbackText,
@@ -927,6 +1564,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           }).catch((error) => {
             console.error(`Failed to send tool error message for ${state.toolName}`, error);
           });
+          return;
+        }
+
+        if (!isCodexForeground()) {
+          bufferCodexOutput("tool", state.finalStatus.fallbackText, isError);
           return;
         }
 
@@ -939,6 +1581,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           fallbackText: state.finalStatus.fallbackText,
         }).catch((error) => {
           console.error(`Failed to update tool message for ${state.toolName}`, error);
+        });
+      },
+      onChildThreads: (event) => {
+        recordProgressLine(`Child sessions: ${event.threadIds.map((id) => id.slice(0, 8)).join(", ")}`);
+        void announceChildThreads(event).catch((error) => {
+          console.error("Failed to announce child sessions", error);
         });
       },
       onTodoUpdate: (items) => {
@@ -957,6 +1605,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
 
         lastRenderedPlan = rendered;
+        if (!isCodexForeground()) {
+          bufferCodexOutput("status", rendered, false);
+          return;
+        }
+
         if (!planMessageId) {
           if (planMessageSending) return;
           planMessageSending = true;
@@ -980,9 +1633,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         lastTurnUsage = usage;
       },
       onAgentEnd: () => {
-        void finalizeResponse().catch((error) => {
-          console.error("Failed to finalize Telegram response message", error);
-        });
+        if (finalizeOnAgentEnd) {
+          void finalizeResponse().catch((error) => {
+            console.error("Failed to finalize Telegram response message", error);
+          });
+        } else {
+          void deliverIntermediateAssistantText().catch((error) => {
+            console.error("Failed to deliver intermediate goal response", error);
+          });
+        }
       },
     };
 
@@ -1015,7 +1674,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      const promptInput = userInputHasOutputInstructions(userInput)
+      const promptInput = !addOutputInstructionsToPrompt || userInputHasOutputInstructions(userInput)
         ? userInput
         : await (async (): Promise<CodexPromptInput> => {
             const turnId = randomUUID().slice(0, 12);
@@ -1024,9 +1683,31 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
             return addOutputInstructions(userInput, autoArtifactOutDir);
           })();
 
-      await session.prompt(promptInput, callbacks);
+      const infoBeforePrompt = session.getInfo();
+      const agentSession = ensureAgentSessionRecord(contextKey, "codex", {
+        workspace: infoBeforePrompt.workspace,
+        displayName: "Codex",
+        providerSessionId: infoBeforePrompt.threadId ?? undefined,
+        select: isProviderForeground(contextKey, "codex"),
+        metadata: {
+          model: infoBeforePrompt.model,
+          reasoningEffort: infoBeforePrompt.reasoningEffort,
+          backend: registry.getBackend(contextKey),
+        },
+      });
+      codexAgentSession = agentSession;
+      agentJobId = `codex-job-${randomUUID().slice(0, 12)}`;
+      startAgentJob(agentSession.id, agentJobId);
+
+      if (options.execute) {
+        await options.execute(callbacks);
+      } else {
+        await session.prompt(promptInput, callbacks);
+      }
       updateSessionMetadata(contextKey, session);
       await finalizeResponse();
+      backgroundCompletionText = lastAssistantReply.get(contextKey) ?? "Codex finished.";
+      completedSuccessfully = true;
     } catch (error) {
       stopTyping();
       clearFlushTimer();
@@ -1045,8 +1726,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         finalized = true;
 
         const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
+        backgroundCompletionText = combinedText;
         try {
-          await deliverFinalMarkdown(combinedText);
+          await deliverFinalMarkdown(combinedText, "error", true);
         } catch (telegramError) {
           console.error("Failed to send error message to Telegram:", telegramError);
         }
@@ -1056,11 +1738,37 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       clearFlushTimer();
       if (autoArtifactOutDir) {
         try {
-          await deliverArtifacts(ctx, chatId, autoArtifactOutDir, messageThreadId);
+          if (isCodexForeground()) {
+            await deliverArtifacts(ctx, chatId, autoArtifactOutDir, messageThreadId);
+          } else {
+            const { artifacts, skippedCount } = await collectArtifactReport(autoArtifactOutDir);
+            const summary = formatArtifactSummary(artifacts, skippedCount);
+            if (summary) {
+              bufferCodexOutput("status", summary, artifacts.length > 0 || skippedCount > 0);
+            }
+            for (const artifact of artifacts) {
+              bufferCodexOutput("artifact", artifact.name, true, artifact.localPath);
+            }
+            if (skippedCount > 0) {
+              bufferCodexOutput("status", `${skippedCount} generated file${skippedCount === 1 ? "" : "s"} too large to send.`, true);
+            }
+          }
         } catch (artifactError) {
           console.error("Failed to deliver artifacts:", artifactError);
         }
       }
+      if (codexAgentSession && backgroundCompletionText && !isCodexForeground()) {
+        try {
+          await sendBackgroundCompletionNotice(ctx, contextKey, codexAgentSession, backgroundCompletionText, messageThreadId);
+        } catch (noticeError) {
+          console.error("Failed to send Codex background completion notice:", noticeError);
+        }
+      }
+      activeProgressRefreshers.delete(contextKey);
+      if (agentJobId) {
+        finishAgentJob(agentJobId, completedSuccessfully ? "completed" : "failed");
+      }
+      markProviderBusy(contextKey, "codex", false);
       busyState.processing = false;
     }
   };
@@ -1072,6 +1780,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     session: CodexSessionRuntime,
     userInput: CodexPromptInput,
     options: {
+      execute?: (callbacks: CodexSessionCallbacks) => Promise<void>;
+      finalizeOnAgentEnd?: boolean;
+      addOutputInstructions?: boolean;
       setSuccessReaction?: boolean;
       onFinally?: () => Promise<void>;
     } = {},
@@ -1080,7 +1791,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     void (async () => {
       try {
-        await handleUserPrompt(ctx, contextKey, chatId, session, userInput);
+        await handleUserPrompt(ctx, contextKey, chatId, session, userInput, {
+          execute: options.execute,
+          finalizeOnAgentEnd: options.finalizeOnAgentEnd,
+          addOutputInstructions: options.addOutputInstructions,
+        });
         if (setSuccessReaction) {
           await setReaction(ctx, "👍");
         }
@@ -1104,6 +1819,773 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
       }
     })();
+  };
+
+  const handleClaudePrompt = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    text: string,
+  ): Promise<void> => {
+    const messageThreadId = parseContextKey(contextKey).messageThreadId;
+    const busyState = getBusyState(contextKey);
+    if (busyState.switching || busyState.transcribing || isProviderBusy(contextKey, "claude")) {
+      await sendBusyReply(ctx);
+      return;
+    }
+    if (!claudeAdapter) {
+      const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    busyState.processing = true;
+    markProviderBusy(contextKey, "claude", true);
+    const typingInterval = setInterval(() => {
+      if (!isProviderForeground(contextKey, "claude")) {
+        return;
+      }
+      void ctx.api.sendChatAction(chatId, "typing", {
+        ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+      }).catch(() => {});
+    }, TYPING_INTERVAL_MS);
+
+    let finalText = "";
+    let streamedText = "";
+    let pendingAssistantProgressText = "";
+    let sentAssistantProgress = false;
+    let progressMessageId: number | undefined;
+    let lastProgressEdit = 0;
+    let descriptor: AgentSessionDescriptor | undefined;
+    let agentJobId: string | undefined;
+    let completedSuccessfully = false;
+
+    const bufferClaudeOutput = (
+      kind: BufferedOutputEvent["kind"],
+      outputText: string,
+      priority?: boolean,
+    ): void => {
+      if (!descriptor || !outputText.trim()) {
+        return;
+      }
+      outputBuffer.append(descriptor.id, {
+        kind,
+        text: outputText,
+        priority,
+        metadata: { provider: "claude" },
+      });
+    };
+
+    const deliverClaudeAssistantProgress = async (progressText: string): Promise<void> => {
+      const trimmed = progressText.trim();
+      if (!trimmed || registry.getProgressDelivery(contextKey) !== "messages") {
+        return;
+      }
+
+      if (!isProviderForeground(contextKey, "claude")) {
+        bufferClaudeOutput("assistant", trimmed, false);
+        return;
+      }
+
+      for (const chunk of splitMarkdownForTelegram(trimmed)) {
+        await sendTextMessage(ctx.api, chatId, chunk.text, {
+          parseMode: chunk.parseMode,
+          fallbackText: chunk.fallbackText,
+          messageThreadId,
+        });
+      }
+      sentAssistantProgress = true;
+    };
+
+    const flushPendingClaudeAssistantProgress = async (): Promise<void> => {
+      if (!pendingAssistantProgressText.trim()) {
+        return;
+      }
+      await deliverClaudeAssistantProgress(pendingAssistantProgressText);
+      pendingAssistantProgressText = "";
+    };
+
+    const maybeUpdateStreamingProgress = async (): Promise<void> => {
+      if (!config.streamAssistantText || registry.getProgressDelivery(contextKey) !== "edit") {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastProgressEdit < EDIT_DEBOUNCE_MS) {
+        return;
+      }
+      if (!isProviderForeground(contextKey, "claude")) {
+        return;
+      }
+      lastProgressEdit = now;
+      const preview = streamedText.trim().slice(-STREAMING_PREVIEW_LIMIT);
+      if (!preview) {
+        return;
+      }
+      const rendered = formatMarkdownMessage(preview);
+      if (!progressMessageId) {
+        const message = await sendTextMessage(ctx.api, chatId, rendered.text, {
+          parseMode: rendered.parseMode,
+          fallbackText: rendered.fallbackText,
+          messageThreadId,
+        });
+        progressMessageId = message.message_id;
+        return;
+      }
+      await safeEditMessage(bot, chatId, progressMessageId, rendered.text, {
+        parseMode: rendered.parseMode,
+        fallbackText: rendered.fallbackText,
+      }).catch(() => {});
+    };
+
+    try {
+      descriptor = await ensureClaudeSession(contextKey);
+      const jobId = `claude-job-${randomUUID().slice(0, 12)}`;
+      const agentSession = ensureAgentSessionRecord(contextKey, "claude", {
+        workspace: descriptor.workspace,
+        displayName: descriptor.displayName ?? "Claude Code",
+        providerSessionId: descriptor.providerSessionId,
+        select: isProviderForeground(contextKey, "claude"),
+        metadata: descriptor.metadata,
+      });
+      agentJobId = jobId;
+      startAgentJob(agentSession.id, jobId);
+      for await (const event of claudeAdapter.sendPrompt({
+        sessionId: descriptor.id,
+        jobId,
+        input: { text },
+      })) {
+        switch (event.type) {
+          case "assistant_text_delta":
+            if (registry.getProgressDelivery(contextKey) === "messages" && pendingAssistantProgressText.trim()) {
+              await flushPendingClaudeAssistantProgress();
+            }
+            pendingAssistantProgressText = event.text;
+            streamedText += event.text;
+            await maybeUpdateStreamingProgress();
+            break;
+          case "assistant_message_complete":
+            finalText = registry.getProgressDelivery(contextKey) === "messages"
+              ? pendingAssistantProgressText.trim()
+              : event.text;
+            pendingAssistantProgressText = "";
+            break;
+          case "tool_started":
+            await flushPendingClaudeAssistantProgress();
+            if (registry.getProgressDelivery(contextKey) !== "none" && config.toolVerbosity !== "none") {
+              const line = event.text ? `Claude started ${event.toolName}: ${event.text}` : `Claude started ${event.toolName}`;
+              if (isProviderForeground(contextKey, "claude")) {
+                await safeReply(ctx, escapeHTML(line), { fallbackText: line, messageThreadId });
+              } else {
+                bufferClaudeOutput("tool", line, false);
+              }
+            }
+            break;
+          case "tool_failed":
+          case "error": {
+            const message = event.type === "error"
+              ? `Claude error: ${event.message}`
+              : `Claude tool failed: ${event.toolName}${event.text ? `: ${event.text}` : ""}`;
+            if (isProviderForeground(contextKey, "claude")) {
+              await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+            } else {
+              bufferClaudeOutput("error", message, true);
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      }
+
+      finalText = finalText.trim() || (sentAssistantProgress ? "" : streamedText.trim());
+      if (!finalText) {
+        finalText = "Claude finished without text.";
+      }
+      lastAssistantReply.set(contextKey, finalText);
+      if (isProviderForeground(contextKey, "claude")) {
+        for (const chunk of splitMarkdownForTelegram(finalText)) {
+          await sendTextMessage(ctx.api, chatId, chunk.text, {
+            parseMode: chunk.parseMode,
+            fallbackText: chunk.fallbackText,
+            messageThreadId,
+          });
+        }
+      } else {
+        bufferClaudeOutput("final", finalText, true);
+        if (descriptor) {
+          await sendBackgroundCompletionNotice(ctx, contextKey, descriptor, finalText, messageThreadId);
+        }
+      }
+      if (descriptor) {
+        persistClaudeSession(contextKey, descriptor);
+      }
+      completedSuccessfully = true;
+      await setReaction(ctx, "👍");
+    } catch (error) {
+      const message = `Claude failed: ${friendlyErrorText(error)}`;
+      if (isProviderForeground(contextKey, "claude")) {
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      } else {
+        bufferClaudeOutput("error", message, true);
+        if (descriptor) {
+          await sendBackgroundCompletionNotice(ctx, contextKey, descriptor, message, messageThreadId);
+        }
+      }
+      await clearReaction(ctx);
+    } finally {
+      clearInterval(typingInterval);
+      if (agentJobId) {
+        finishAgentJob(agentJobId, completedSuccessfully ? "completed" : "failed");
+      }
+      markProviderBusy(contextKey, "claude", false);
+      busyState.processing = false;
+    }
+  };
+
+  const startClaudePrompt = (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    text: string,
+  ): void => {
+    void handleClaudePrompt(ctx, contextKey, chatId, text).catch((error) => {
+      console.error("Claude prompt task failed:", error);
+    });
+  };
+
+  const sendBackgroundCompletionNotice = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    descriptor: AgentSessionDescriptor | AgentSessionRecord,
+    finalText: string,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    if (isProviderForeground(contextKey, descriptor.provider)) {
+      return;
+    }
+
+    const lane = agentSessions.getLane(contextKey);
+    if (lane?.notifyOnBackgroundCompletion === false) {
+      return;
+    }
+
+    const providerName = formatProviderDisplayName(descriptor.provider);
+    const providerCommand = descriptor.provider === "claude"
+      ? "/claude"
+      : descriptor.provider === "codex"
+        ? "/codex"
+        : "/provider";
+    const label = descriptor.displayName || descriptor.providerSessionId?.slice(0, 8) || descriptor.id;
+    const preview = truncateBackgroundPreview(finalText, BACKGROUND_NOTICE_PREVIEW_LIMIT);
+    const plain = [
+      `${providerName} finished in background: ${label}`,
+      preview ? `Preview: ${preview}` : undefined,
+      `Use ${providerCommand} to switch back. Use /copy to resend the latest final reply.`,
+    ].filter((line): line is string => Boolean(line)).join("\n");
+
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+  };
+
+  const flushBufferedPriority = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    descriptor: AgentSessionDescriptor | AgentSessionRecord,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    const events = outputBuffer.drainWhere(descriptor.id, (event) => event.priority);
+    if (events.length === 0) {
+      return;
+    }
+
+    const lines = events
+      .map((event) => formatBufferedOutputEvent(event))
+      .filter((line) => line.trim());
+    if (lines.length > 0) {
+      const plain = [`Buffered ${formatProviderDisplayName(descriptor.provider)} output:`, ...lines].join("\n\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+    }
+
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    const artifactEvents = events.filter((event) => event.kind === "artifact" && event.artifactPath);
+    for (const event of artifactEvents) {
+      try {
+        await ctx.api.sendDocument(chatId, new InputFile(event.artifactPath!), {
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        });
+      } catch (error) {
+        console.error(`Failed to send buffered artifact ${event.artifactPath}:`, error);
+      }
+    }
+  };
+
+  const handleClaudeSlashCommand = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    text: string,
+  ): Promise<boolean> => {
+    const classified = classifyClaudeSlashCommand(text);
+    if (!classified) {
+      return false;
+    }
+
+    const { parsed, spec } = classified;
+    if (TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE.has(parsed.name)) {
+      return false;
+    }
+
+    const messageThreadId = parseContextKey(contextKey).messageThreadId;
+
+    if (!spec) {
+      const message = `Claude command /${parsed.name} is not classified yet, so I did not run it.`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return true;
+    }
+
+    if (spec.class === "dispatch" || spec.class === "dispatch_arg") {
+      if (spec.class === "dispatch_arg" && !parsed.argument) {
+        const hint = renderClaudeArgumentCommandHint(parsed.name);
+        await safeReply(ctx, formatTelegramHTML(hint), { fallbackText: hint, messageThreadId });
+        return true;
+      }
+
+      if (parsed.name === "compact") {
+        await compactClaudeSession(ctx, contextKey, messageThreadId);
+        return true;
+      }
+
+      await setReaction(ctx, "👀");
+      startClaudePrompt(ctx, contextKey, chatId, text.trim());
+      return true;
+    }
+
+    if (spec.class === "surface") {
+      await handleClaudeSurfaceCommand(ctx, contextKey, parsed.name, messageThreadId);
+      return true;
+    }
+
+    if (spec.class === "emulate") {
+      await handleClaudeEmulatedCommand(ctx, contextKey, parsed.name, parsed.argument, messageThreadId);
+      return true;
+    }
+
+    if (spec.class === "na") {
+      const message = `/${parsed.name} is recognized, but it is not applicable over Telegram. ${spec.description}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return true;
+    }
+
+    if (spec.class === "block") {
+      const message = `/${parsed.name} is blocked from Telegram. ${spec.description}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return true;
+    }
+
+    return false;
+  };
+
+  const compactClaudeSession = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    if (!claudeAdapter) {
+      const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+    if (isBusy(contextKey)) {
+      const message = "Cannot compact Claude while a prompt is running.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    try {
+      const descriptor = await ensureClaudeSession(contextKey);
+      await safeReply(ctx, escapeHTML("Compacting Claude session..."), {
+        fallbackText: "Compacting Claude session...",
+        messageThreadId,
+      });
+      await claudeAdapter.compact?.(descriptor.id);
+      const message = "Claude compaction completed.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      persistClaudeSession(contextKey, descriptor);
+    } catch (error) {
+      const message = `Failed: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: message,
+        messageThreadId,
+      });
+    }
+  };
+
+  const handleClaudeSurfaceCommand = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    commandName: string,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    if (["usage", "context", "cost", "stats"].includes(commandName)) {
+      await sendClaudeUsage(ctx, contextKey, messageThreadId);
+      return;
+    }
+
+    if (commandName === "heapdump") {
+      const message = "Claude heapdump is not available over Telegram.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    if (commandName === "doctor" || commandName === "debug") {
+      const descriptor = claudeSessions.get(contextKey);
+      const persisted = claudeState?.get(contextKey);
+      const lines = [
+        "Claude provider diagnostics:",
+        `Enabled: ${config.enableClaudeProvider}`,
+        `Binary: ${config.claudeBin}`,
+        `Workspace: ${config.claudeWorkspace}`,
+        `Default model: ${config.claudeDefaultModel}`,
+        `Permission mode: ${config.claudePermissionMode}`,
+        `Attached session: ${descriptor?.providerSessionId ?? "(none)"}`,
+        `Persisted session: ${persisted?.sessionId ?? "(none)"}`,
+      ];
+      const plain = lines.join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+      return;
+    }
+
+    await sendClaudeSessionStatus(ctx, contextKey, messageThreadId);
+  };
+
+  const handleClaudeEmulatedCommand = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    commandName: string,
+    argument: string,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    if (commandName === "stop" || commandName === "abort") {
+      await abortClaudeSession(ctx, contextKey, messageThreadId);
+      return;
+    }
+
+    if (commandName === "clear") {
+      if (isBusy(contextKey)) {
+        const message = "Cannot clear while a Claude prompt is running. Use /stop first.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+        return;
+      }
+      await forgetClaudeSession(contextKey);
+      const message = "Cleared this Claude session. The next message will start a fresh Claude session.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    if (commandName === "copy") {
+      const reply = lastAssistantReply.get(contextKey);
+      if (!reply) {
+        const message = "No assistant reply is available to copy yet.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+        return;
+      }
+      const rendered = formatMarkdownMessage(reply);
+      await safeReply(ctx, rendered.text, {
+        parseMode: rendered.parseMode,
+        fallbackText: rendered.fallbackText,
+        messageThreadId,
+      });
+      return;
+    }
+
+    if (commandName === "exit") {
+      const descriptor = claudeSessions.get(contextKey);
+      if (descriptor && claudeAdapter) {
+        await claudeAdapter.dispose(descriptor.id);
+        claudeSessions.delete(contextKey);
+      }
+      const message = "Claude process disposed. The saved session will resume on the next message.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    if (commandName === "resume") {
+      const descriptor = await ensureClaudeSession(contextKey);
+      persistClaudeSession(contextKey, descriptor);
+      const message = argument
+        ? "Explicit Claude resume targets are not implemented yet. The saved session is attached."
+        : "Claude session is attached. Send a normal message to continue.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    const message = `/${commandName} is recognized for Claude, but the TeleCodex implementation is not complete yet. No action was taken.`;
+    await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+  };
+
+  const abortClaudeSession = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    const descriptor = claudeSessions.get(contextKey);
+    if (!descriptor || !claudeAdapter) {
+      const message = "No Claude operation is active here.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    try {
+      await claudeAdapter.abort(descriptor.id);
+      await safeReply(ctx, escapeHTML("Abort sent to Claude."), {
+        fallbackText: "Abort sent to Claude.",
+        messageThreadId,
+      });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        messageThreadId,
+      });
+    } finally {
+      getBusyState(contextKey).processing = false;
+    }
+  };
+
+  const sendClaudeSessionStatus = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    const descriptor = claudeSessions.get(contextKey);
+    const persisted = claudeState?.get(contextKey);
+    const lines = descriptor
+      ? renderClaudeSessionPlain(descriptor, await claudeAdapter?.getContext(descriptor.id))
+      : persisted
+        ? [
+            "Claude session:",
+            `Session UUID: ${persisted.sessionId}`,
+            `Workspace: ${persisted.workspace}`,
+            `Model: ${persisted.model}`,
+            `Permission mode: ${persisted.permissionMode}`,
+            "Status: not attached, will resume on next message",
+          ].join("\n")
+        : [
+            "Claude session:",
+            "Status: not started yet",
+            `Workspace: ${config.claudeWorkspace}`,
+            `Model: ${config.claudeDefaultModel}`,
+            `Permission mode: ${config.claudePermissionMode}`,
+          ].join("\n");
+    await safeReply(ctx, formatTelegramHTML(lines), { fallbackText: lines, messageThreadId });
+  };
+
+  const sendClaudeUsage = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    const descriptor = claudeSessions.get(contextKey);
+    if (!descriptor || !claudeAdapter) {
+      const message = "No Claude usage is available yet. Send a message to Claude first.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    const usage = await claudeAdapter.getUsage(descriptor.id);
+    const context = await claudeAdapter.getContext(descriptor.id);
+    const used = Number(context.usedTokens ?? 0);
+    const window = Number(context.contextWindow ?? config.claudeContextWindow);
+    const percent = window > 0 ? Math.round((used / window) * 100) : 0;
+    const plain = [
+      `Context: ${used} of ${window} tokens (${percent}%).`,
+      `Last turn: in ${Number(usage.inputTokens ?? 0)}, cached ${Number(usage.cachedInputTokens ?? 0)}, out ${Number(usage.outputTokens ?? 0)}.`,
+    ].join("\n");
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+  };
+
+  const mirrorCurrentCodexAgentSession = (contextKey: TelegramContextKey, select?: boolean): AgentSessionRecord | undefined => {
+    const codexSession = registry.get(contextKey);
+    if (!codexSession) {
+      return undefined;
+    }
+
+    const info = codexSession.getInfo();
+    return ensureAgentSessionRecord(contextKey, "codex", {
+      workspace: info.workspace,
+      displayName: cleanSessionTitle(info.threadId ?? "Codex") || "Codex",
+      providerSessionId: info.threadId ?? undefined,
+      select,
+      metadata: {
+        model: info.model,
+        reasoningEffort: info.reasoningEffort,
+        backend: registry.getBackend(contextKey),
+      },
+    });
+  };
+
+  const buildRecentProviderSessionPicks = (
+    contextKey: TelegramContextKey,
+    limit: number,
+  ): ProviderSessionPick[] => {
+    const selectedSessionId = agentSessions.getLane(contextKey)?.selectedSessionId;
+    const picksByKey = new Map<string, ProviderSessionPick>();
+
+    for (const session of agentSessions.listLaneSessions(contextKey)) {
+      const pick = providerSessionPickFromAgentSession(session);
+      picksByKey.set(providerSessionPickKey(pick), pick);
+    }
+
+    for (const thread of listThreads(MAX_PROVIDER_SESSION_LIST_LIMIT)) {
+      const pick = providerSessionPickFromCodexThread(thread);
+      if (!picksByKey.has(providerSessionPickKey(pick))) {
+        picksByKey.set(providerSessionPickKey(pick), pick);
+      }
+    }
+
+    if (config.enableClaudeProvider) {
+      for (const transcript of listClaudeTranscriptSessions(MAX_PROVIDER_SESSION_LIST_LIMIT)) {
+        const pick = providerSessionPickFromClaudeTranscript(transcript, {
+          model: config.claudeDefaultModel,
+          permissionMode: config.claudePermissionMode,
+        });
+        if (!picksByKey.has(providerSessionPickKey(pick))) {
+          picksByKey.set(providerSessionPickKey(pick), pick);
+        }
+      }
+    }
+
+    return [...picksByKey.values()]
+      .sort((left, right) => {
+        const selectedDelta = Number(providerSessionPickAgentId(right) === selectedSessionId) - Number(providerSessionPickAgentId(left) === selectedSessionId);
+        if (selectedDelta !== 0) {
+          return selectedDelta;
+        }
+        return right.updatedAt - left.updatedAt;
+      })
+      .slice(0, limit);
+  };
+
+  const materializeProviderSessionPick = async (
+    contextKey: TelegramContextKey,
+    pick: ProviderSessionPick,
+  ): Promise<AgentSessionRecord> => {
+    if (pick.kind === "agent") {
+      return pick.session;
+    }
+
+    if (pick.kind === "codex-thread") {
+      return ensureAgentSessionRecord(contextKey, "codex", {
+        workspace: pick.workspace,
+        displayName: pick.title,
+        providerSessionId: pick.providerSessionId,
+        select: true,
+        metadata: {
+          model: pick.thread.model,
+          importedFrom: "codex-state",
+        },
+      });
+    }
+
+    return ensureAgentSessionRecord(contextKey, "claude", {
+      workspace: pick.workspace,
+      displayName: pick.title,
+      providerSessionId: pick.providerSessionId,
+      select: true,
+      metadata: pick.metadata,
+    });
+  };
+
+  const renderUnifiedSessions = (contextKey: TelegramContextKey, rawArg = ""): string => {
+    mirrorCurrentCodexAgentSession(contextKey, isProviderForeground(contextKey, "codex"));
+    const lane = agentSessions.ensureLane(contextKey, { defaultProvider: registry.getActiveProvider(contextKey) });
+    const limit = parseProviderSessionListLimit(rawArg);
+    const picks = buildRecentProviderSessionPicks(contextKey, limit);
+    if (picks.length === 0) {
+      return "No recent provider sessions found. Use /new codex or /new claude.";
+    }
+
+    pendingAgentSessionPicks.set(contextKey, picks);
+    const lines = [
+      `Recent provider sessions. Showing ${picks.length}. Selected: ${formatSelectedProviderSessionLabel(picks, lane.selectedSessionId)}.`,
+      ...picks.map((pick, index) => formatProviderSessionPickLine(index + 1, pick, lane.selectedSessionId)),
+      "",
+      limit < MAX_PROVIDER_SESSION_LIST_LIMIT ? "Use /sessions 50 for more." : undefined,
+      "Use /switch 1 or /use 1. Use /session for technical IDs.",
+    ];
+    return lines.filter((line): line is string => Boolean(line)).join("\n");
+  };
+
+  const selectUnifiedAgentSession = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    rawSelection: string,
+  ): Promise<boolean> => {
+    const picks = pendingAgentSessionPicks.get(contextKey) ?? buildRecentProviderSessionPicks(contextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
+    const targetPick = resolveProviderSessionPick(rawSelection, picks);
+    if (!targetPick) {
+      const matches = findProviderSessionPickMatches(rawSelection, picks);
+      const message = matches.length > 1
+        ? "Ambiguous provider session. Use more characters or a list number from /sessions."
+        : "Unknown provider session. Run /sessions, then use /switch 1.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return true;
+    }
+
+    const listNumber = targetPick ? picks.indexOf(targetPick) + 1 : undefined;
+    if (targetPick.provider === "claude") {
+      const currentClaude = claudeSessions.get(contextKey);
+      const switchingClaudeSession = currentClaude?.providerSessionId !== targetPick.providerSessionId;
+      if (isProviderBusy(contextKey, "claude") && switchingClaudeSession) {
+        const message = "Claude is running. You can switch to the running Claude session, but not to another Claude session until it finishes.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return true;
+      }
+
+      const target = await materializeProviderSessionPick(contextKey, targetPick);
+      registry.setActiveProvider(contextKey, "claude");
+      agentSessions.selectSession(contextKey, target.id);
+      persistAgentSessionState();
+      const descriptor = switchingClaudeSession
+        ? await resumeClaudeAgentSession(contextKey, target)
+        : currentClaude ?? await resumeClaudeAgentSession(contextKey, target);
+      await flushBufferedPriority(ctx, contextKey, descriptor, parseContextKey(contextKey).messageThreadId);
+      const message = formatProviderSessionSelectionMessage(target, listNumber);
+      await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
+      return true;
+    }
+
+    if (targetPick.provider === "codex") {
+      if (isProviderBusy(contextKey, "codex")) {
+        const message = "Codex is running. Switching between Codex sessions while Codex is busy is not supported yet.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return true;
+      }
+
+      const target = await materializeProviderSessionPick(contextKey, targetPick);
+      const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+      if (!contextSession) {
+        return true;
+      }
+      const codexSession = contextSession.session;
+      if (target.providerSessionId) {
+        await codexSession.switchSession(target.providerSessionId);
+        updateSessionMetadata(contextKey, codexSession);
+      }
+      registry.setActiveProvider(contextKey, "codex");
+      agentSessions.selectSession(contextKey, target.id);
+      persistAgentSessionState();
+      await flushBufferedPriority(ctx, contextKey, target, parseContextKey(contextKey).messageThreadId);
+      const message = formatProviderSessionSelectionMessage(target, listNumber);
+      await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
+      return true;
+    }
+
+    const message = `Provider ${targetPick.provider} is not supported yet.`;
+    await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    return true;
   };
 
   const deliverArtifacts = async (
@@ -1156,7 +2638,37 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await next();
   });
 
+  bot.use(async (ctx, next) => {
+    const text = ctx.message?.text?.trim();
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!text?.startsWith("/") || !contextKey || !isClaudeActive(contextKey) || !ctx.chat) {
+      await next();
+      return;
+    }
+
+    if (await handleClaudeSlashCommand(ctx, contextKey, ctx.chat.id, text)) {
+      return;
+    }
+
+    await next();
+  });
+
   bot.command("start", async (ctx) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (rawContextKey && isClaudeActive(rawContextKey)) {
+      const lines = [
+        "TeleCodex is running.",
+        "Active provider: Claude Code",
+        `Workspace: ${config.claudeWorkspace}`,
+        `Model: ${config.claudeDefaultModel}`,
+        "Use /codex to switch this context back to Codex.",
+      ];
+      await safeReply(ctx, lines.map((line) => escapeHTML(line)).join("\n"), {
+        fallbackText: lines.join("\n"),
+      });
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -1188,6 +2700,177 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.command("help", async (ctx) => {
     const help = renderHelpMessage();
     await safeReply(ctx, help.html, { fallbackText: help.plain });
+  });
+
+  bot.command("health", async (ctx) => {
+    const contexts = registry.listContexts();
+    const busyContexts = new Set<TelegramContextKey>();
+    for (const context of contexts) {
+      if (isBusy(context.contextKey)) {
+        busyContexts.add(context.contextKey);
+      }
+    }
+    for (const contextKey of busyProviders.keys()) {
+      if (isAnyProviderBusy(contextKey)) {
+        busyContexts.add(contextKey);
+      }
+    }
+    for (const [contextKey, state] of contextBusy) {
+      if (state.processing || state.switching || state.transcribing) {
+        busyContexts.add(contextKey);
+      }
+    }
+
+    const lines = [
+      "Status: ok",
+      `Uptime: ${formatDuration(Date.now() - startedAt)}`,
+      `Known lanes: ${contexts.length}`,
+      `Busy lanes: ${busyContexts.size}`,
+      `Backend: ${config.codexBackend}`,
+      `Workspace: ${config.workspace}`,
+      `State file: ${path.join(config.workspace, ".telecodex", "contexts.json")}`,
+    ];
+    await safeReply(ctx, lines.map((line) => escapeHTML(line)).join("\n"), {
+      fallbackText: lines.join("\n"),
+    });
+  });
+
+  bot.command(["jobs", "alljobs"], async (ctx) => {
+    const text = ctx.message?.text ?? "";
+    const wantsAll = /^\/alljobs(?:@\w+)?(?:\s|$)/i.test(text);
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!wantsAll && !contextKey) {
+      return;
+    }
+
+    const laneKey = wantsAll ? undefined : contextKey ?? undefined;
+    const jobs = agentSessions
+      .listJobs(laneKey)
+      .filter((job) => job.status === "running" || job.status === "waiting" || job.completedAt);
+
+    if (jobs.length === 0) {
+      const message = wantsAll ? "No provider jobs recorded." : "No provider jobs recorded in this lane.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    const lines = [
+      wantsAll ? "Provider jobs across all lanes:" : "Provider jobs in this lane:",
+      ...jobs.slice(0, 20).map((job, index) => formatAgentJobLine(index + 1, job, agentSessions.getSession(job.sessionId))),
+    ];
+    const plain = lines.join("\n");
+    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+  });
+
+  bot.command("provider", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+
+    const rawProvider = getCommandArgument(ctx);
+    if (!rawProvider) {
+      const lane = agentSessions.ensureLane(contextKey, { defaultProvider: registry.getActiveProvider(contextKey) });
+      const plain = [
+        `Selected provider: ${registry.getActiveProvider(contextKey)}`,
+        `Default provider for new sessions: ${lane.defaultProvider}`,
+        "",
+        "Use /provider codex or /provider claude.",
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      return;
+    }
+
+    const provider = parseProviderName(rawProvider);
+    if (!provider || (provider !== "codex" && provider !== "claude")) {
+      const message = "Usage: /provider codex or /provider claude";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+    if (provider === "claude" && !config.enableClaudeProvider) {
+      const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    agentSessions.ensureLane(contextKey, { defaultProvider: provider });
+    agentSessions.setDefaultProvider(contextKey, provider);
+    registry.setActiveProvider(contextKey, provider);
+    persistAgentSessionState();
+    const message = `Provider set to ${provider}. New bare /new sessions will use ${provider}.`;
+    await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+  });
+
+  bot.command("claude", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+    if (!config.enableClaudeProvider) {
+      const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+    const busyState = getBusyState(contextKey);
+    if (busyState.switching || busyState.transcribing) {
+      await safeReply(ctx, escapeHTML("Cannot switch providers while this lane is changing state."), {
+        fallbackText: "Cannot switch providers while this lane is changing state.",
+      });
+      return;
+    }
+
+    registry.setActiveProvider(contextKey, "claude");
+    const descriptor = claudeSessions.get(contextKey);
+    if (descriptor) {
+      ensureAgentSessionRecord(contextKey, "claude", {
+        workspace: descriptor.workspace,
+        displayName: descriptor.displayName ?? "Claude Code",
+        providerSessionId: descriptor.providerSessionId,
+        select: true,
+        metadata: descriptor.metadata,
+      });
+      await flushBufferedPriority(ctx, contextKey, descriptor, parseContextKey(contextKey).messageThreadId);
+    }
+    const message = isProviderBusy(contextKey, "claude")
+      ? "Claude Code selected. A Claude turn is still running and future updates will be foreground here."
+      : "Claude Code selected for this Telegram context. The next normal message will start or resume Claude.";
+    await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+  });
+
+  bot.command("codex", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+    const busyState = getBusyState(contextKey);
+    if (busyState.switching || busyState.transcribing) {
+      await safeReply(ctx, escapeHTML("Cannot switch providers while this lane is changing state."), {
+        fallbackText: "Cannot switch providers while this lane is changing state.",
+      });
+      return;
+    }
+
+    registry.setActiveProvider(contextKey, "codex");
+    const codexSession = registry.get(contextKey);
+    if (codexSession) {
+      const info = codexSession.getInfo();
+      const record = ensureAgentSessionRecord(contextKey, "codex", {
+        workspace: info.workspace,
+        displayName: "Codex",
+        providerSessionId: info.threadId ?? undefined,
+        select: true,
+        metadata: {
+          model: info.model,
+          reasoningEffort: info.reasoningEffort,
+          backend: registry.getBackend(contextKey),
+        },
+      });
+      await flushBufferedPriority(ctx, contextKey, record, parseContextKey(contextKey).messageThreadId);
+    }
+    const message = isProviderBusy(contextKey, "codex")
+      ? "Codex selected. A Codex turn is still running and future updates will be foreground here."
+      : "Codex selected for this Telegram context.";
+    await safeReply(ctx, escapeHTML(message), { fallbackText: message });
   });
 
   bot.command("auth", async (ctx) => {
@@ -1355,6 +3038,31 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!chatId) {
       return;
     }
+    const rawContextKey = contextKeyFromCtx(ctx);
+    const rawText = ctx.message?.text ?? "";
+    const rawNewArg = rawText.replace(/^\/(?:new|fork)(?:@\w+)?\s*/i, "").trim();
+    const providerPrefix = parseProviderPrefix(rawNewArg);
+    const requestedProvider = providerPrefix?.provider;
+    const remainingArg = providerPrefix?.rest ?? rawNewArg;
+
+    if (rawContextKey && (requestedProvider === "claude" || (!requestedProvider && isClaudeActive(rawContextKey)))) {
+      if (!config.enableClaudeProvider) {
+        const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+      if (isProviderBusy(rawContextKey, "claude")) {
+        await safeReply(ctx, escapeHTML("Cannot create a new Claude session while a prompt is running."), {
+          fallbackText: "Cannot create a new Claude session while a prompt is running.",
+        });
+        return;
+      }
+      registry.setActiveProvider(rawContextKey, "claude");
+      await createFreshClaudeSession(rawContextKey);
+      const message = "New Claude session selected. The next normal message will use it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
 
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
@@ -1362,15 +3070,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const { contextKey, session } = contextSession;
-    if (isBusy(contextKey)) {
+    if (isProviderBusy(contextKey, "codex")) {
       await safeReply(ctx, escapeHTML("Cannot create a new thread while a prompt is running."), {
         fallbackText: "Cannot create a new thread while a prompt is running.",
       });
       return;
     }
 
-    const rawText = ctx.message?.text ?? "";
-    const workspaceArg = rawText.replace(/^\/(?:new|fork)(?:@\w+)?\s*/i, "").trim();
+    if (requestedProvider === "codex") {
+      registry.setActiveProvider(contextKey, "codex");
+    }
+
+    const workspaceArg = remainingArg;
     if (workspaceArg) {
       if (/^(?:choose|list|workspace|workspaces)$/i.test(workspaceArg)) {
         await showWorkspacePicker(ctx, contextKey, session);
@@ -1384,6 +3095,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const info = await session.newThread(session.getCurrentWorkspace());
       updateSessionMetadata(contextKey, session);
+      registry.setActiveProvider(contextKey, "codex");
+      ensureAgentSessionRecord(contextKey, "codex", {
+        workspace: info.workspace,
+        displayName: cleanSessionTitle(info.threadId ?? "Codex") || "Codex",
+        providerSessionId: info.threadId ?? undefined,
+        select: true,
+        metadata: {
+          model: info.model,
+          reasoningEffort: info.reasoningEffort,
+          backend: registry.getBackend(contextKey),
+        },
+      });
       clearSessionSelectionState(contextKey);
       const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
       const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
@@ -1463,6 +3186,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const info = await session.newThread(workspace);
       updateSessionMetadata(contextKey, session);
+      registry.setActiveProvider(contextKey, "codex");
+      ensureAgentSessionRecord(contextKey, "codex", {
+        workspace: info.workspace,
+        displayName: cleanSessionTitle(info.threadId ?? "Codex") || "Codex",
+        providerSessionId: info.threadId ?? undefined,
+        select: true,
+        metadata: {
+          model: info.model,
+          reasoningEffort: info.reasoningEffort,
+          backend: registry.getBackend(contextKey),
+        },
+      });
       clearSessionSelectionState(contextKey);
       const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
       const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
@@ -1478,12 +3213,35 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   };
 
   bot.command(["abort", "stop"], async (ctx) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (rawContextKey && isClaudeActive(rawContextKey)) {
+      const descriptor = claudeSessions.get(rawContextKey);
+      if (!descriptor || !claudeAdapter) {
+        const message = "No Claude operation is active here.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+      try {
+        await claudeAdapter.abort(descriptor.id);
+        await safeReply(ctx, escapeHTML("Abort sent to Claude."), {
+          fallbackText: "Abort sent to Claude.",
+        });
+      } catch (error) {
+        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+          fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        });
+      } finally {
+        getBusyState(rawContextKey).processing = false;
+      }
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
     }
 
-    const { session } = contextSession;
+    const { contextKey, session } = contextSession;
     try {
       await session.abort();
       await safeReply(ctx, escapeHTML("Aborted current operation"), {
@@ -1493,6 +3251,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed: ${friendlyErrorText(error)}`,
       });
+    } finally {
+      queuedPrompts.delete(contextKey);
+      activeProgressRefreshers.delete(contextKey);
+      getBusyState(contextKey).processing = false;
     }
   });
 
@@ -1526,6 +3288,152 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         fallbackText: `Failed: ${friendlyErrorText(error)}`,
       });
     }
+  });
+
+  bot.command("goal", async (ctx) => {
+    const parsedGoal = parseGoalModeArgument(getCommandArgument(ctx));
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const getThreadGoal = session.getThreadGoal?.bind(session);
+    const setThreadGoal = session.setThreadGoal?.bind(session);
+    const clearThreadGoal = session.clearThreadGoal?.bind(session);
+    const runThreadGoal = session.runThreadGoal?.bind(session);
+    if (!getThreadGoal || !setThreadGoal || !clearThreadGoal || !runThreadGoal) {
+      const text = "Native goal controls require the app-server backend. Use /backend appserver.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    const replyGoal = async (goal: Awaited<ReturnType<typeof getThreadGoal>>): Promise<void> => {
+      const text = formatThreadGoal(goal);
+      await safeReply(ctx, formatTelegramHTML(text), { fallbackText: text });
+    };
+
+    if (parsedGoal.kind === "status") {
+      if (!session.hasActiveThread()) {
+        await replyGoal(null);
+        return;
+      }
+      try {
+        const goal = await getThreadGoal();
+        if (goal?.status === "active" && session.getProcessingKind?.() !== "goal") {
+          const note = [
+            "Goal is marked active, but TeleCodex is not currently attached to a running goal monitor.",
+            "Use /goal resume to reattach and continue progress updates, or /goal pause to stop it.",
+            "",
+            formatThreadGoal(goal),
+          ].join("\n");
+          await safeReply(ctx, formatTelegramHTML(note), { fallbackText: note });
+          return;
+        }
+        await replyGoal(goal);
+      } catch (error) {
+        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+          fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        });
+      }
+      return;
+    }
+
+    if (parsedGoal.kind === "pause" || parsedGoal.kind === "clear") {
+      try {
+        if (isBusy(contextKey)) {
+          if (session.getProcessingKind?.() === "goal" && session.pauseActiveGoal) {
+            await session.pauseActiveGoal();
+          } else {
+            await session.abort();
+          }
+          queuedPrompts.delete(contextKey);
+          activeProgressRefreshers.delete(contextKey);
+          getBusyState(contextKey).processing = false;
+        }
+
+        if (!session.hasActiveThread()) {
+          await replyGoal(null);
+          return;
+        }
+
+        if (parsedGoal.kind === "clear") {
+          const cleared = await clearThreadGoal();
+          const text = cleared ? "Goal cleared." : "No goal is currently set for this thread.";
+          await safeReply(ctx, formatTelegramHTML(text), { fallbackText: text });
+          return;
+        }
+
+        const existingGoal = await getThreadGoal();
+        if (!existingGoal) {
+          await replyGoal(null);
+          return;
+        }
+        await replyGoal(await setThreadGoal({ status: "paused" }));
+      } catch (error) {
+        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+          fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        });
+      }
+      return;
+    }
+
+    if (isBusy(contextKey)) {
+      const text =
+        parsedGoal.kind === "resume"
+          ? "A goal or prompt is already running. Use /goal pause or /abort to stop it."
+          : "Cannot start or replace a goal while Codex is working. Use /goal pause first if this is a running goal.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    await setReaction(ctx, "👀");
+    if (parsedGoal.kind === "resume") {
+      if (!session.hasActiveThread()) {
+        await replyGoal(null);
+        return;
+      }
+      const existingGoal = await getThreadGoal().catch(() => null);
+      if (!existingGoal) {
+        await replyGoal(null);
+        return;
+      }
+
+      startUserPrompt(ctx, contextKey, chatId, session, `Resume goal: ${existingGoal.objective}`, {
+        addOutputInstructions: false,
+        finalizeOnAgentEnd: false,
+        execute: async (callbacks) => {
+          const finalGoal = await runThreadGoal({ status: "active" }, callbacks);
+          callbacks.onTextDelta(`\n\n${formatThreadGoal(finalGoal)}`);
+        },
+      });
+      return;
+    }
+
+    const objective = applyGoalModeConstraints(parsedGoal.objective, { noAgents: parsedGoal.noAgents });
+    if (!objective.trim()) {
+      const text = "Usage: /goal [no-agents] <task>";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+
+    if (!(await ensureActiveThread(ctx, contextKey, session))) {
+      return;
+    }
+
+    startUserPrompt(ctx, contextKey, chatId, session, `Goal: ${parsedGoal.objective}`, {
+      addOutputInstructions: false,
+      finalizeOnAgentEnd: false,
+      execute: async (callbacks) => {
+        const finalGoal = await runThreadGoal({ objective, status: "active" }, callbacks);
+        callbacks.onTextDelta(`\n\n${formatThreadGoal(finalGoal)}`);
+      },
+    });
   });
 
   bot.command("forkthread", async (ctx) => {
@@ -1743,6 +3651,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
+    if (isClaudeActive(contextKey)) {
+      await forgetClaudeSession(contextKey);
+      const message = "Cleared this Claude session. The next message will start a fresh Claude session.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
     registry.remove(contextKey);
     await safeReply(ctx, escapeHTML("Cleared this Telegram context. The next message will start a fresh Codex thread."), {
       fallbackText: "Cleared this Telegram context. The next message will start a fresh Codex thread.",
@@ -1750,6 +3665,32 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   });
 
   bot.command(["session", "status"], async (ctx) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (rawContextKey && isClaudeActive(rawContextKey)) {
+      const descriptor = claudeSessions.get(rawContextKey);
+      const persisted = claudeState?.get(rawContextKey);
+      const lines = descriptor
+        ? renderClaudeSessionPlain(descriptor, await claudeAdapter?.getContext(descriptor.id))
+        : persisted
+          ? [
+              "Claude session:",
+              `Session UUID: ${persisted.sessionId}`,
+              `Workspace: ${persisted.workspace}`,
+              `Model: ${persisted.model}`,
+              `Permission mode: ${persisted.permissionMode}`,
+              "Status: not attached, will resume on next message",
+            ].join("\n")
+          : [
+              "Claude session:",
+              "Status: not started yet",
+              `Workspace: ${config.claudeWorkspace}`,
+              `Model: ${config.claudeDefaultModel}`,
+              `Permission mode: ${config.claudePermissionMode}`,
+            ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(lines), { fallbackText: lines });
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -1766,6 +3707,27 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   });
 
   bot.command("usage", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (contextKey && isClaudeActive(contextKey)) {
+      const descriptor = claudeSessions.get(contextKey);
+      if (!descriptor || !claudeAdapter) {
+        const message = "No Claude usage is available yet. Send a message to Claude first.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+      const usage = await claudeAdapter.getUsage(descriptor.id);
+      const context = await claudeAdapter.getContext(descriptor.id);
+      const used = Number(context.usedTokens ?? 0);
+      const window = Number(context.contextWindow ?? config.claudeContextWindow);
+      const percent = window > 0 ? Math.round((used / window) * 100) : 0;
+      const plain = [
+        `Context: ${used} of ${window} tokens (${percent}%).`,
+        `Last turn: in ${Number(usage.inputTokens ?? 0)}, cached ${Number(usage.cachedInputTokens ?? 0)}, out ${Number(usage.outputTokens ?? 0)}.`,
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      return;
+    }
+
     try {
       const plain = renderUsagePlain(await readLatestCodexUsage());
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
@@ -2018,6 +3980,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     registry.setProgressDelivery(contextKey, requested);
+    if (requested === "edit") {
+      void activeProgressRefreshers.get(contextKey)?.().catch((error) => {
+        console.error("Failed to refresh progress after verbosity switch", error);
+      });
+    }
     const busyNote = isBusy(contextKey)
       ? "This applies to future progress updates. Messages already sent in the current turn stay as they are."
       : "";
@@ -2251,13 +4218,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const { contextKey, session } = contextSession;
-    if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot attach while a prompt is running."), {
-        fallbackText: "Cannot attach while a prompt is running.",
-      });
-      return;
-    }
-
     const rawText = ctx.message?.text ?? "";
     const threadId = rawText.replace(/^\/attach(?:@\w+)?\s*/, "").trim();
 
@@ -2275,10 +4235,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
+    if (!(await ensureSessionTakeoverAllowed(ctx, contextKey, session, "Cannot attach while a prompt is running."))) {
+      return;
+    }
+
     const busyState = getBusyState(contextKey);
     busyState.switching = true;
     try {
       const info = await session.switchSession(threadId);
+      inspectedThreads.delete(contextKey);
       updateSessionMetadata(contextKey, session);
       const html = `<b>Attached to thread.</b>\n\n${renderSessionInfoHTML(info)}`;
       const plain = `Attached to thread.\n\n${renderSessionInfoPlain(info)}`;
@@ -2297,161 +4262,28 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!chatId) {
       return;
     }
-
-    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
-    if (!contextSession) {
+    const contextKeyForAgent = contextKeyFromCtx(ctx);
+    if (!contextKeyForAgent) {
       return;
     }
 
-    const { contextKey, session } = contextSession;
-    if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot switch sessions while a prompt is running."), {
-        fallbackText: "Cannot switch sessions while a prompt is running.",
-      });
+    const rawTextForAgent = ctx.message?.text ?? "";
+    const agentArg = rawTextForAgent.replace(/^\/(?:sessions|switch|use)(?:@\w+)?\s*/, "").trim();
+    if (commandNameFromText(rawTextForAgent) === "sessions") {
+      const plain = renderUnifiedSessions(contextKeyForAgent, agentArg);
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
     }
 
-    const rawText = ctx.message?.text ?? "";
-    const threadArg = rawText.replace(/^\/(?:sessions|switch|use)(?:@\w+)?\s*/, "").trim();
-    const pendingThreadIds = pendingSessionPicks.get(contextKey);
-    if (/^\d+$/.test(threadArg) && !pendingThreadIds) {
-      await safeReply(ctx, escapeHTML("Numbered session selection needs a fresh list. Run /sessions, then use /sessions 1 or /use 1."), {
-        fallbackText: "Numbered session selection needs a fresh list. Run /sessions, then use /sessions 1 or /use 1.",
-      });
-      return;
-    }
-    const threadId = resolveSessionSelectionArgument(threadArg, pendingThreadIds);
-
-    if (threadId) {
-      const busyState = getBusyState(contextKey);
-      busyState.switching = true;
-      try {
-        const info = await session.switchSession(threadId);
-        updateSessionMetadata(contextKey, session);
-        const html = `<b>Switched thread.</b>\n\n${renderSessionInfoHTML(info)}`;
-        const plain = `Switched thread.\n\n${renderSessionInfoPlain(info)}`;
-        await safeReply(ctx, html, { fallbackText: plain });
-      } catch (error) {
-        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-          fallbackText: `Failed: ${friendlyErrorText(error)}`,
-        });
-      } finally {
-        busyState.switching = false;
-      }
-      return;
-    }
-
-    const sessions = session.listAllSessions(50);
-    if (sessions.length === 0) {
-      await safeReply(ctx, escapeHTML("No recent threads found."), {
-        fallbackText: "No recent threads found.",
-      });
-      return;
-    }
-
-    const groupedSessions = new Map<string, typeof sessions>();
-    for (const listedSession of sessions) {
-      const workspaceSessions = groupedSessions.get(listedSession.cwd);
-      if (workspaceSessions) {
-        workspaceSessions.push(listedSession);
-      } else {
-        groupedSessions.set(listedSession.cwd, [listedSession]);
-      }
-    }
-
-    const orderedSessions: typeof sessions = [];
-
-    for (const workspaceSessions of groupedSessions.values()) {
-      orderedSessions.push(...workspaceSessions);
-    }
-
-    pendingSessionPicks.set(
-      contextKey,
-      orderedSessions.map((listedSession) => listedSession.id),
-    );
-
-    const activeThreadId = session.getInfo().threadId;
-    const sessionButtons = orderedSessions.map((listedSession, index) => {
-      return {
-        label: formatSessionLabel({
-          workspace: listedSession.cwd,
-          title: listedSession.title || listedSession.firstUserMessage || "",
-          relativeTime: formatRelativeTime(listedSession.updatedAt),
-          model: listedSession.model || undefined,
-          isActive: listedSession.id === activeThreadId,
-        }),
-        callbackData: `sess_${index}`,
-      };
-    });
-    pendingSessionButtons.set(contextKey, sessionButtons);
-    const keyboard = paginateKeyboard(sessionButtons, 0, "sess");
-    const numberedPlain = orderedSessions
-      .map((listedSession, index) => {
-        const active = listedSession.id === activeThreadId ? " active" : "";
-        const title = cleanSessionTitle(listedSession.title || listedSession.firstUserMessage || "") || "(untitled)";
-        return `${index + 1}. ${getWorkspaceShortName(listedSession.cwd)} - ${trimLine(title, 48)} - ${formatRelativeTime(listedSession.updatedAt)}${active}`;
-      })
-      .join("\n");
-    const numberedHtml = orderedSessions
-      .map((listedSession, index) => {
-        const active = listedSession.id === activeThreadId ? " <i>active</i>" : "";
-        const title = cleanSessionTitle(listedSession.title || listedSession.firstUserMessage || "") || "(untitled)";
-        return `${index + 1}. <code>${escapeHTML(getWorkspaceShortName(listedSession.cwd))}</code> - ${escapeHTML(trimLine(title, 48))} - ${escapeHTML(formatRelativeTime(listedSession.updatedAt))}${active}`;
-      })
-      .join("\n");
-
-    await safeReply(ctx, `<b>Recent threads</b> (${orderedSessions.length}):\nSend <code>/use 1</code> or tap to switch.\n\n${numberedHtml}`, {
-      fallbackText: `Recent threads (${orderedSessions.length}):\nSend /use 1 or tap to switch.\n\n${numberedPlain}`,
-      replyMarkup: keyboard,
-    });
+    await selectUnifiedAgentSession(ctx, contextKeyForAgent, agentArg);
   });
 
   bot.hears(/^(?:use|switch)\s+(.+)/i, async (ctx) => {
-    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
-    if (!contextSession) {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
       return;
     }
-
-    const { contextKey, session } = contextSession;
-    if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot switch sessions while a prompt is running."), {
-        fallbackText: "Cannot switch sessions while a prompt is running.",
-      });
-      return;
-    }
-
-    const rawSelection = ctx.match[1] ?? "";
-    const pendingThreadIds = pendingSessionPicks.get(contextKey);
-    if (/^\d+$/.test(rawSelection.trim()) && !pendingThreadIds) {
-      await safeReply(ctx, escapeHTML("Numbered session selection needs a fresh list. Run /sessions, then use /sessions 1 or /use 1."), {
-        fallbackText: "Numbered session selection needs a fresh list. Run /sessions, then use /sessions 1 or /use 1.",
-      });
-      return;
-    }
-
-    const threadId = resolveSessionSelectionArgument(rawSelection, pendingThreadIds);
-    if (!threadId) {
-      await safeReply(ctx, escapeHTML("Usage: use <number|thread-id|latest>"), {
-        fallbackText: "Usage: use <number|thread-id|latest>",
-      });
-      return;
-    }
-
-    const busyState = getBusyState(contextKey);
-    busyState.switching = true;
-    try {
-      const info = await session.switchSession(threadId);
-      updateSessionMetadata(contextKey, session);
-      const html = `<b>Switched thread.</b>\n\n${renderSessionInfoHTML(info)}`;
-      const plain = `Switched thread.\n\n${renderSessionInfoPlain(info)}`;
-      await safeReply(ctx, html, { fallbackText: plain });
-    } catch (error) {
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed: ${friendlyErrorText(error)}`,
-      });
-    } finally {
-      busyState.switching = false;
-    }
+    await selectUnifiedAgentSession(ctx, contextKey, ctx.match[1] ?? "");
   });
 
   bot.hears(/^(?:fork|new thread)\s+(.+)/i, async (ctx) => {
@@ -2566,8 +4398,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const { session } = contextSession;
-    const threadId = session.getInfo().threadId;
+    const { contextKey, session } = contextSession;
+    const inspected = inspectedThreads.get(contextKey);
+    const threadId = getViewedThreadId(contextKey, session);
     if (!threadId) {
       await safeReply(ctx, escapeHTML("No Codex thread is selected here yet. Use /use latest or send a prompt first."), {
         fallbackText: "No Codex thread is selected here yet. Use /use latest or send a prompt first.",
@@ -2583,13 +4416,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const plain = messages
+    const prefixPlain = inspected ? `Inspecting thread ${threadId.slice(0, 8)}. Goal remains in the main thread.\n\n` : "";
+    const prefixHtml = inspected
+      ? `<b>Inspecting thread</b> <code>${escapeHTML(threadId.slice(0, 8))}</code>. Goal remains in the main thread.\n\n`
+      : "";
+    const plain = prefixPlain + messages
       .map((message) => {
         const role = message.role === "assistant" ? "Assistant" : "User";
         return `${role}: ${truncateForHistory(message.text)}`;
       })
       .join("\n\n");
-    const html = messages
+    const html = prefixHtml + messages
       .map((message) => {
         const role = message.role === "assistant" ? "Assistant" : "User";
         return `<b>${role}:</b> ${escapeHTML(truncateForHistory(message.text))}`;
@@ -2599,9 +4436,264 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await safeReply(ctx, html, { fallbackText: plain });
   });
 
+  bot.command(["children", "childsessions"], async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const threadId = getViewedThreadId(contextKey, session);
+    if (!threadId) {
+      await safeReply(ctx, escapeHTML("No Codex thread is selected here yet."), {
+        fallbackText: "No Codex thread is selected here yet.",
+      });
+      return;
+    }
+
+    const parent = getParentThread(threadId);
+    const parentThreadId = parent?.id ?? threadId;
+    const children = listChildThreads(parentThreadId);
+    if (children.length === 0) {
+      clearChildSelectionState(contextKey);
+      const message = parent
+        ? "No child sessions found for the parent thread."
+        : "No child sessions found for the current thread.";
+      await safeReply(ctx, escapeHTML(message), {
+        fallbackText: message,
+      });
+      return;
+    }
+
+    pendingChildPicks.set(
+      contextKey,
+      children.map((child) => child.id),
+    );
+
+    const plainLines = [
+      parent
+        ? `Child sessions for parent ${parentThreadId.slice(0, 8)}. Current child: ${threadId.slice(0, 8)}.`
+        : `Child sessions for ${parentThreadId.slice(0, 8)}:`,
+      ...children.map((child, index) => {
+        const title = trimLine(cleanSessionTitle(child.title || child.firstUserMessage) || "(untitled)", 120);
+        const active = child.id === threadId ? " active" : "";
+        return `${index + 1}. ${child.id.slice(0, 8)}${active} ${child.spawnStatus} ${formatRelativeTime(child.updatedAt)} - ${title} - /follow ${index + 1} or /follow ${child.id.slice(0, 8)}`;
+      }),
+      parent ? "Use /parent to return to the parent thread." : "Use /follow latest to inspect the newest child.",
+    ];
+    const htmlLines = [
+      parent
+        ? `<b>Child sessions for parent</b> <code>${escapeHTML(parentThreadId.slice(0, 8))}</code>. <b>Current child:</b> <code>${escapeHTML(threadId.slice(0, 8))}</code>.`
+        : `<b>Child sessions for</b> <code>${escapeHTML(parentThreadId.slice(0, 8))}</code>:`,
+      ...children.map((child, index) => {
+        const title = trimLine(cleanSessionTitle(child.title || child.firstUserMessage) || "(untitled)", 120);
+        const active = child.id === threadId ? " <i>active</i>" : "";
+        return `${index + 1}. <code>${escapeHTML(child.id.slice(0, 8))}</code>${active} ${escapeHTML(child.spawnStatus)} ${escapeHTML(formatRelativeTime(child.updatedAt))} - ${escapeHTML(title)} - <code>/follow ${index + 1}</code> or <code>/follow ${escapeHTML(child.id.slice(0, 8))}</code>`;
+      }),
+      parent ? "Use <code>/parent</code> to return to the parent thread." : "Use <code>/follow latest</code> to inspect the newest child.",
+    ];
+    await safeReply(ctx, htmlLines.join("\n"), { fallbackText: plainLines.join("\n") });
+  });
+
+  bot.command("parent", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const inspected = inspectedThreads.get(contextKey);
+    if (inspected) {
+      const inspectedParent = getParentThread(inspected.threadId);
+      const activeThreadId = session.getInfo().threadId;
+      const parentThreadId = inspectedParent?.id ?? inspected.parentThreadId ?? activeThreadId;
+      if (!parentThreadId) {
+        inspectedThreads.delete(contextKey);
+        await safeReply(ctx, escapeHTML("Stopped inspecting child session."), {
+          fallbackText: "Stopped inspecting child session.",
+        });
+        return;
+      }
+
+      if (parentThreadId === activeThreadId) {
+        inspectedThreads.delete(contextKey);
+        const info = session.getInfo();
+        const label = "Returned to main session view. Goal was not interrupted.";
+        await safeReply(ctx, `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`, {
+          fallbackText: `${label}\n\n${renderSessionInfoPlain(info)}`,
+        });
+        return;
+      }
+
+      const parentRecord = getThread(parentThreadId);
+      if (!parentRecord) {
+        inspectedThreads.delete(contextKey);
+        await safeReply(ctx, escapeHTML("Parent session is no longer available locally."), {
+          fallbackText: "Parent session is no longer available locally.",
+        });
+        return;
+      }
+
+      inspectedThreads.set(contextKey, { threadId: parentRecord.id });
+      const rendered = renderThreadInspection("Inspecting parent session.", parentRecord, {
+        goalIsActive: await isNativeGoalActive(session),
+      });
+      await safeReply(ctx, rendered.html, { fallbackText: rendered.plain });
+      return;
+    }
+
+    const threadId = session.getInfo().threadId;
+    if (!threadId) {
+      await safeReply(ctx, escapeHTML("No Codex thread is selected here yet."), {
+        fallbackText: "No Codex thread is selected here yet.",
+      });
+      return;
+    }
+
+    const parent = getParentThread(threadId);
+    if (!parent) {
+      await safeReply(ctx, escapeHTML("Current thread is not a child session."), {
+        fallbackText: "Current thread is not a child session.",
+      });
+      return;
+    }
+
+    if (!(await ensureSessionTakeoverAllowed(ctx, contextKey, session, "Cannot switch sessions while a prompt is running."))) {
+      return;
+    }
+
+    const busyState = getBusyState(contextKey);
+    busyState.switching = true;
+    try {
+      const info = await session.switchSession(parent.id);
+      inspectedThreads.delete(contextKey);
+      updateSessionMetadata(contextKey, session);
+      clearChildSelectionState(contextKey);
+      const html = `<b>Switched to parent session.</b>\nChild was <code>${escapeHTML(threadId.slice(0, 8))}</code>.\n\n${renderSessionInfoHTML(info)}`;
+      const plain = `Switched to parent session.\nChild was ${threadId.slice(0, 8)}.\n\n${renderSessionInfoPlain(info)}`;
+      await safeReply(ctx, html, { fallbackText: plain });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    } finally {
+      busyState.switching = false;
+    }
+  });
+
+  bot.command("follow", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const threadId = getViewedThreadId(contextKey, session);
+    if (!threadId) {
+      await safeReply(ctx, escapeHTML("No Codex thread is selected here yet."), {
+        fallbackText: "No Codex thread is selected here yet.",
+      });
+      return;
+    }
+
+    const rawArg = getCommandArgument(ctx);
+    const arg = rawArg.trim() || "latest";
+    const parent = getParentThread(threadId);
+    const parentThreadId = parent?.id ?? threadId;
+    const children = listChildThreads(parentThreadId);
+    if (children.length === 0) {
+      const message = parent
+        ? "No child sessions found for the parent thread."
+        : "No child sessions found for the current thread.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    let targetThreadId = "";
+    if (/^(?:latest|newest|last)$/i.test(arg)) {
+      targetThreadId = children[0]?.id ?? "";
+    } else {
+      const pendingChildThreadIds = pendingChildPicks.get(contextKey);
+      if (/^\d+$/.test(arg) && !pendingChildThreadIds) {
+        await safeReply(ctx, escapeHTML("Numbered child selection needs a fresh list. Run /children, then use /follow 1."), {
+          fallbackText: "Numbered child selection needs a fresh list. Run /children, then use /follow 1.",
+        });
+        return;
+      }
+
+      const resolvedArg = resolveSessionSelectionArgument(arg, pendingChildThreadIds);
+      const matches = children.filter((child) => child.id === resolvedArg || child.id.startsWith(resolvedArg));
+      if (matches.length > 1) {
+        const matchList = matches.map((child) => child.id.slice(0, 8)).join(", ");
+        await safeReply(ctx, escapeHTML(`Ambiguous child ID. Use more characters. Matches: ${matchList}`), {
+          fallbackText: `Ambiguous child ID. Use more characters. Matches: ${matchList}`,
+        });
+        return;
+      }
+      targetThreadId = matches[0]?.id ?? "";
+    }
+
+    if (!targetThreadId) {
+      await safeReply(ctx, escapeHTML("Unknown child session. Use /children, then /follow 1 or /follow latest."), {
+        fallbackText: "Unknown child session. Use /children, then /follow 1 or /follow latest.",
+      });
+      return;
+    }
+
+    const goalIsActive = await isNativeGoalActive(session);
+    if (goalIsActive) {
+      const targetRecord = getThread(targetThreadId) ?? children.find((child) => child.id === targetThreadId);
+      if (!targetRecord) {
+        await safeReply(ctx, escapeHTML("Child session is not available locally yet. Try /children again in a moment."), {
+          fallbackText: "Child session is not available locally yet. Try /children again in a moment.",
+        });
+        return;
+      }
+
+      inspectedThreads.set(contextKey, { threadId: targetThreadId, parentThreadId });
+      const rendered = renderThreadInspection("Inspecting child session.", targetRecord, {
+        parentThreadId,
+        goalIsActive: true,
+      });
+      await safeReply(ctx, rendered.html, { fallbackText: rendered.plain });
+      return;
+    }
+
+    if (!(await ensureSessionTakeoverAllowed(ctx, contextKey, session, "Cannot switch sessions while a prompt is running."))) {
+      return;
+    }
+
+    const busyState = getBusyState(contextKey);
+    busyState.switching = true;
+    try {
+      const info = await session.switchSession(targetThreadId);
+      inspectedThreads.delete(contextKey);
+      updateSessionMetadata(contextKey, session);
+      const html = `<b>Following child session.</b>\nParent: <code>${escapeHTML(parentThreadId.slice(0, 8))}</code>. Use <code>/parent</code> to return.\n\n${renderSessionInfoHTML(info)}`;
+      const plain = `Following child session.\nParent: ${parentThreadId.slice(0, 8)}. Use /parent to return.\n\n${renderSessionInfoPlain(info)}`;
+      await safeReply(ctx, html, { fallbackText: plain });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    } finally {
+      busyState.switching = false;
+    }
+  });
+
   bot.command("model", async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
+      return;
+    }
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (rawContextKey && isClaudeActive(rawContextKey)) {
+      const message = [
+        `Claude model: ${config.claudeDefaultModel}`,
+        "Claude model changes apply when the Claude process is spawned.",
+        "Change CLAUDE_DEFAULT_MODEL and use /new to start a fresh Claude session.",
+      ].join("\n");
+      await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
       return;
     }
 
@@ -2703,6 +4795,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   });
 
   const setEffortFromCommand = async (ctx: Context, effortText: string): Promise<boolean> => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (rawContextKey && isClaudeActive(rawContextKey)) {
+      const message = "Reasoning effort is not exposed for Claude Code sessions. Use /codex to switch back to Codex.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return true;
+    }
+
     const normalized = effortText.trim().toLowerCase();
     const efforts: ModelReasoningEffort[] = ["minimal", "low", "medium", "high", "xhigh"];
     if (!efforts.includes(normalized as ModelReasoningEffort)) {
@@ -2735,6 +4834,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.command("effort", async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
+      return;
+    }
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (rawContextKey && isClaudeActive(rawContextKey)) {
+      const message = "Reasoning effort is not exposed for Claude Code sessions. Use /codex to switch back to Codex.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       return;
     }
 
@@ -2773,6 +4878,42 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   });
 
   bot.command([...NATIVE_CODEX_COMMANDS], async (ctx) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (rawContextKey && isClaudeActive(rawContextKey)) {
+      const command = ctx.message?.text?.trim().split(/\s+/, 1)[0]?.replace(/^\/|@.*$/g, "") ?? "";
+      if (command !== "compact") {
+        const message = `/${command} is not supported for Claude sessions. Use /codex to switch back to Codex.`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+      if (!claudeAdapter) {
+        const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+      if (isBusy(rawContextKey)) {
+        await safeReply(ctx, escapeHTML("Cannot compact Claude while a prompt is running."), {
+          fallbackText: "Cannot compact Claude while a prompt is running.",
+        });
+        return;
+      }
+      try {
+        const descriptor = await ensureClaudeSession(rawContextKey);
+        await safeReply(ctx, escapeHTML("Compacting Claude session..."), {
+          fallbackText: "Compacting Claude session...",
+        });
+        await claudeAdapter.compact?.(descriptor.id);
+        const message = "Claude compaction completed.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        persistClaudeSession(rawContextKey, descriptor);
+      } catch (error) {
+        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+          fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        });
+      }
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -2782,6 +4923,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const chatId = ctx.chat?.id;
     const text = ctx.message?.text?.trim();
     if (!chatId || !text) {
+      return;
+    }
+
+    if (await rejectPromptWhileInspecting(ctx, contextKey)) {
       return;
     }
 
@@ -2836,7 +4981,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await ctx.answerCallbackQuery({ text: "Aborting..." });
-    await session.abort();
+    try {
+      await session.abort();
+    } catch (error) {
+      console.warn("Abort callback failed", error);
+    } finally {
+      queuedPrompts.delete(contextKey as TelegramContextKey);
+      activeProgressRefreshers.delete(contextKey as TelegramContextKey);
+      getBusyState(contextKey as TelegramContextKey).processing = false;
+    }
   });
 
   bot.callbackQuery(/^sess_(\d+)$/, async (ctx) => {
@@ -2861,7 +5014,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    if (isBusy(contextKey)) {
+    if (isBusy(contextKey) && !(await pauseActiveGoalForTakeover(contextKey, session))) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -2873,9 +5026,26 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     busyState.switching = true;
     try {
       const info = await session.switchSession(threadId);
+      inspectedThreads.delete(contextKey);
       updateSessionMetadata(contextKey, session);
-      const plainText = `Switched session.\n\n${renderSessionInfoPlain(info)}`;
-      const html = `<b>Switched session.</b>\n\n${renderSessionInfoHTML(info)}`;
+      const record = ensureAgentSessionRecord(contextKey, "codex", {
+        workspace: info.workspace,
+        displayName: cleanSessionTitle(info.threadId ?? "Codex") || "Codex",
+        providerSessionId: info.threadId ?? undefined,
+        select: true,
+        metadata: {
+          model: info.model,
+          reasoningEffort: info.reasoningEffort,
+          backend: registry.getBackend(contextKey),
+        },
+      });
+      persistAgentSessionState();
+      const plainText = [
+        "Selected provider session from legacy button.",
+        "",
+        formatProviderSessionSelectionMessage(record, index + 1),
+      ].join("\n");
+      const html = formatTelegramHTML(plainText);
 
       if (messageId) {
         await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
@@ -3220,19 +5390,34 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   });
 
   bot.on("message:text", async (ctx) => {
-    const contextSession = await getContextSession(ctx);
-    if (!contextSession) {
+    const userText = ctx.message.text.trim();
+    if (!userText || userText.startsWith("/")) {
       return;
     }
 
-    const userText = ctx.message.text.trim();
-    if (!userText || userText.startsWith("/")) {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (!rawContextKey) {
+      return;
+    }
+    if (isClaudeActive(rawContextKey)) {
+      lastPromptInput.set(rawContextKey, userText);
+      await setReaction(ctx, "👀");
+      startClaudePrompt(ctx, rawContextKey, ctx.chat.id, userText);
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx);
+    if (!contextSession) {
       return;
     }
 
     const { contextKey, session } = contextSession;
     if (/^\d+$/.test(userText) && pendingWorkspacePicks.has(contextKey)) {
       await createNewThreadFromWorkspaceText(ctx, userText);
+      return;
+    }
+
+    if (await rejectPromptWhileInspecting(ctx, contextKey)) {
       return;
     }
 
@@ -3248,13 +5433,22 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
-    const contextSession = await getContextSession(ctx);
-    if (!contextSession) {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (!rawContextKey) {
       return;
     }
 
-    const { contextKey, session } = contextSession;
+    const contextSession = isClaudeActive(rawContextKey) ? undefined : await getContextSession(ctx);
+    if (!isClaudeActive(rawContextKey) && !contextSession) {
+      return;
+    }
+
+    const contextKey = rawContextKey;
+    const session = contextSession?.session;
     const chatId = ctx.chat.id;
+    if (session && await rejectPromptWhileInspecting(ctx, contextKey)) {
+      return;
+    }
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
       return;
@@ -3303,10 +5497,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     lastPromptInput.set(contextKey, transcript);
     await setReaction(ctx, "👀");
-    startUserPrompt(ctx, contextKey, chatId, session, transcript);
+    if (isClaudeActive(contextKey)) {
+      startClaudePrompt(ctx, contextKey, chatId, transcript);
+    } else if (session) {
+      startUserPrompt(ctx, contextKey, chatId, session, transcript);
+    }
   });
 
   bot.on("message:photo", async (ctx) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (!rawContextKey) {
+      return;
+    }
+    if (isClaudeActive(rawContextKey)) {
+      const message = "Photo input is not supported for Claude sessions yet. Send text, or use /codex for Codex image handling.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
     const contextSession = await getContextSession(ctx);
     if (!contextSession) {
       return;
@@ -3314,6 +5522,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
+    if (await rejectPromptWhileInspecting(ctx, contextKey)) {
+      return;
+    }
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
       return;
@@ -3359,6 +5570,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   });
 
   bot.on("message:document", async (ctx) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (!rawContextKey) {
+      return;
+    }
+    if (isClaudeActive(rawContextKey)) {
+      const message = "Document input is not supported for Claude sessions yet. Send text, or use /codex for Codex file handling.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
     const contextSession = await getContextSession(ctx);
     if (!contextSession) {
       return;
@@ -3366,6 +5587,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const chatId = ctx.chat.id;
+    if (await rejectPromptWhileInspecting(ctx, contextKey)) {
+      return;
+    }
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
       return;
@@ -3471,6 +5695,12 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
   await bot.api.setMyCommands([
     { command: "start", description: "Welcome & status" },
     { command: "help", description: "Command reference" },
+    { command: "health", description: "Bot health summary" },
+    { command: "claude", description: "Switch this context to Claude Code" },
+    { command: "codex", description: "Switch this context to Codex" },
+    { command: "provider", description: "Show or set default provider" },
+    { command: "jobs", description: "Show provider jobs in this lane" },
+    { command: "alljobs", description: "Show provider jobs across lanes" },
     { command: "new", description: "Start in current workspace" },
     { command: "fork", description: "Start in current workspace" },
     { command: "workspaces", description: "Choose workspace for new thread" },
@@ -3488,13 +5718,17 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "appserversteer", description: "Run isolated app-server steer test" },
     { command: "appbackendtest", description: "Smoke-test app-server backend" },
     { command: "artifacttest", description: "Send a generated test file" },
-    { command: "sessions", description: "Browse & switch threads" },
+    { command: "sessions", description: "Browse provider sessions" },
     { command: "history", description: "Show recent local thread history" },
-    { command: "use", description: "Switch to a thread by ID or latest" },
+    { command: "children", description: "List child sessions" },
+    { command: "follow", description: "Switch to a child session" },
+    { command: "parent", description: "Return from child session" },
+    { command: "use", description: "Switch provider session" },
     { command: "compact", description: "Ask Codex to compact this thread" },
     { command: "clear", description: "Forget this Telegram context" },
     { command: "copy", description: "Re-send last assistant reply" },
     { command: "retry", description: "Resend the last prompt" },
+    { command: "goal", description: "Control native goal mode" },
     { command: "abort", description: "Cancel current operation" },
     { command: "stop", description: "Cancel current operation" },
     { command: "steer", description: "Steer active app-server turn" },
@@ -3507,7 +5741,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "voice", description: "Voice transcription status" },
     { command: "handback", description: "Hand thread to Codex CLI" },
     { command: "attach", description: "Bind a Codex thread to this topic" },
-    { command: "switch", description: "Switch to a thread by ID" },
+    { command: "switch", description: "Switch provider session" },
   ]);
 }
 
@@ -3539,6 +5773,26 @@ function renderSessionInfoHTML(info: CodexSessionInfo): string {
     info.model ? `<b>Model:</b> <code>${escapeHTML(info.model)}</code>` : undefined,
     info.reasoningEffort ? `<b>Reasoning effort:</b> <code>${escapeHTML(info.reasoningEffort)}</code>` : undefined,
     info.sessionTokens ? `<b>Session tokens:</b> <code>${escapeHTML(formatSessionTokensValue(info.sessionTokens))}</code>` : undefined,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
+function renderClaudeSessionPlain(
+  descriptor: AgentSessionDescriptor,
+  context?: Record<string, unknown>,
+): string {
+  const used = Number(context?.usedTokens ?? 0);
+  const window = Number(context?.contextWindow ?? 0);
+  const percent = window > 0 ? Math.round((used / window) * 100) : 0;
+  return [
+    "Claude session:",
+    `Session UUID: ${descriptor.providerSessionId ?? "(unknown)"}`,
+    `Workspace: ${descriptor.workspace}`,
+    `Model: ${String(descriptor.metadata?.model ?? "(default)")}`,
+    `Permission mode: ${String(descriptor.metadata?.permissionMode ?? "(default)")}`,
+    `Status: ${descriptor.status}`,
+    window > 0 ? `Context: ${used} of ${window} tokens (${percent}%).` : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
@@ -4220,6 +6474,14 @@ function sameWorkspace(left: string, right: string): boolean {
   return normalizedLeft === normalizedRight;
 }
 
+function persistSafe(store: JsonAgentSessionStore, manager: AgentSessionManager): void {
+  try {
+    store.save(manager.serialize());
+  } catch (error) {
+    console.warn("Failed to persist agent session state", error);
+  }
+}
+
 function resolveSessionSelectionArgument(raw: string, pendingThreadIds?: string[]): string {
   const value = raw.trim();
   if (!value) {
@@ -4307,6 +6569,396 @@ function resolveVerbosityArgument(raw: string): ProgressDelivery | null {
   }
 }
 
+function renderClaudeArgumentCommandHint(commandName: string): string {
+  switch (commandName) {
+    case "model":
+      return [
+        "Claude /model opens a terminal menu when used bare.",
+        "Use /model sonnet or /model opus over Telegram.",
+      ].join("\n");
+    case "effort":
+      return [
+        "Claude /effort opens a terminal menu when used bare.",
+        "Use /effort low, /effort medium, or /effort high over Telegram.",
+      ].join("\n");
+    case "permissions":
+      return [
+        "Claude /permissions opens a terminal menu when used bare.",
+        "Use an argument form over Telegram, or change CLAUDE_PERMISSION_MODE before starting a fresh session.",
+      ].join("\n");
+    default:
+      return [
+        `Claude /${commandName} needs an argument over Telegram.`,
+        `Use /${commandName} <value>.`,
+      ].join("\n");
+  }
+}
+
+function formatBufferedOutputEvent(event: BufferedOutputEvent): string {
+  const label = event.kind === "final"
+    ? "Final"
+    : event.kind === "error"
+      ? "Error"
+      : event.kind === "permission"
+        ? "Permission"
+        : event.kind === "question"
+          ? "Question"
+          : event.kind === "artifact"
+            ? "Artifact"
+            : event.kind;
+  const value = event.text ?? event.artifactPath ?? "";
+  return value ? `${label}: ${value}` : label;
+}
+
+function truncateBackgroundPreview(text: string, maxLength: number): string {
+  const singleLine = text.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= maxLength) {
+    return singleLine;
+  }
+  return `${singleLine.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function formatAgentJobLine(index: number, job: AgentJobRecord, session?: AgentSessionRecord): string {
+  const provider = session?.provider ?? job.provider;
+  const label = session?.displayName ?? provider;
+  const shortSessionId = session?.providerSessionId?.slice(0, 8) ?? job.sessionId.slice(0, 8);
+  const age = formatDuration(Date.now() - job.startedAt);
+  const detail = job.error ? ` - ${job.error}` : "";
+  return `${index}. ${label} ${job.status} - ${provider} session ${shortSessionId} - ${age}${detail}`;
+}
+
+function parseProviderSessionListLimit(rawArg: string): number {
+  const normalized = rawArg.trim().toLowerCase();
+  if (!normalized) {
+    return DEFAULT_PROVIDER_SESSION_LIST_LIMIT;
+  }
+  if (normalized === "all" || normalized === "more" || normalized === "old") {
+    return MAX_PROVIDER_SESSION_LIST_LIMIT;
+  }
+
+  const numeric = Number.parseInt(normalized, 10);
+  if (/^\d+$/.test(normalized) && Number.isFinite(numeric)) {
+    return Math.min(Math.max(1, numeric), MAX_PROVIDER_SESSION_LIST_LIMIT);
+  }
+
+  return DEFAULT_PROVIDER_SESSION_LIST_LIMIT;
+}
+
+function commandNameFromText(text: string): string {
+  return text.match(/^\/([a-z0-9_]+)/i)?.[1]?.toLowerCase() ?? "";
+}
+
+function providerSessionPickFromAgentSession(session: AgentSessionRecord): ProviderSessionPick {
+  return {
+    kind: "agent",
+    session,
+    provider: session.provider,
+    title: cleanProviderSessionTitle(session.displayName || session.providerSessionId || session.provider),
+    workspace: session.workspace,
+    updatedAt: session.updatedAt,
+    status: session.status,
+    providerSessionId: session.providerSessionId,
+  };
+}
+
+function providerSessionPickFromCodexThread(thread: CodexThreadRecord): ProviderSessionPick {
+  return {
+    kind: "codex-thread",
+    thread,
+    provider: "codex",
+    title: cleanProviderSessionTitle(thread.title || thread.firstUserMessage || "Codex thread"),
+    workspace: thread.cwd,
+    updatedAt: thread.updatedAt.getTime(),
+    status: "old",
+    providerSessionId: thread.id,
+  };
+}
+
+function providerSessionPickFromClaudeTranscript(
+  transcript: ClaudeTranscriptSessionSummary,
+  metadata: Record<string, unknown>,
+): ProviderSessionPick {
+  return {
+    kind: "claude-transcript",
+    provider: "claude",
+    title: cleanProviderSessionTitle(transcript.title || "Claude Code session"),
+    workspace: transcript.workspace,
+    updatedAt: transcript.updatedAt,
+    status: "old",
+    providerSessionId: transcript.sessionId,
+    metadata,
+  };
+}
+
+function providerSessionPickKey(pick: ProviderSessionPick): string {
+  return `${pick.provider}:${pick.providerSessionId || providerSessionPickAgentId(pick) || pick.title}`;
+}
+
+function providerSessionPickAgentId(pick: ProviderSessionPick): string | undefined {
+  return pick.kind === "agent" ? pick.session.id : undefined;
+}
+
+function resolveProviderSessionPick(rawSelection: string, picks: ProviderSessionPick[]): ProviderSessionPick | undefined {
+  const value = rawSelection.trim();
+  if (!value) {
+    return undefined;
+  }
+
+  if (value.toLowerCase() === "latest") {
+    return picks[0];
+  }
+
+  const numeric = Number.parseInt(value, 10);
+  if (/^\d+$/.test(value) && numeric >= 1 && numeric <= picks.length) {
+    return picks[numeric - 1];
+  }
+
+  const matches = findProviderSessionPickMatches(value, picks);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function findProviderSessionPickMatches(rawSelection: string, picks: ProviderSessionPick[]): ProviderSessionPick[] {
+  const query = rawSelection.trim().toLowerCase();
+  if (!query) {
+    return [];
+  }
+
+  return picks.filter((pick) => {
+    const agentId = providerSessionPickAgentId(pick) ?? "";
+    return (
+      agentId.toLowerCase().startsWith(query) ||
+      (pick.providerSessionId ?? "").toLowerCase().startsWith(query) ||
+      pick.title.toLowerCase().includes(query) ||
+      getWorkspaceShortName(pick.workspace).toLowerCase().includes(query)
+    );
+  });
+}
+
+function formatSelectedProviderSessionLabel(picks: ProviderSessionPick[], selectedSessionId?: string): string {
+  if (!selectedSessionId) {
+    return "(none)";
+  }
+  const selected = picks.find((pick) => providerSessionPickAgentId(pick) === selectedSessionId);
+  if (!selected) {
+    return "current session";
+  }
+  return `${formatProviderDisplayName(selected.provider)}, ${trimLine(selected.title, 70)}`;
+}
+
+function formatUnifiedSessionLine(index: number, session: AgentSessionRecord, selectedSessionId?: string): string {
+  const selected = session.id === selectedSessionId ? " selected" : "";
+  const running = session.currentJobId ? ` job ${session.currentJobId.slice(0, 8)}` : "";
+  const providerSession = session.providerSessionId ? ` provider ${session.providerSessionId.slice(0, 8)}` : "";
+  const label = session.displayName ?? session.provider;
+  return `${index}. ${session.provider} ${session.status}${selected}${running} - ${label}${providerSession} - ${getWorkspaceShortName(session.workspace)}`;
+}
+
+function formatProviderSessionPickLine(index: number, pick: ProviderSessionPick, selectedSessionId?: string): string {
+  const selected = providerSessionPickAgentId(pick) === selectedSessionId ? ", selected" : "";
+  const running = pick.status === "running" ? ", running" : "";
+  const old = pick.kind === "agent" ? "" : ", old";
+  const title = trimLine(pick.title || "(untitled)", 115);
+  const workspace = getWorkspaceShortName(pick.workspace);
+  return `${index}. ${formatProviderDisplayName(pick.provider)}${selected}${running}${old}, ${formatRelativeTime(new Date(pick.updatedAt))}, ${workspace}: ${title}`;
+}
+
+function formatProviderSessionSelectionMessage(session: AgentSessionRecord, listNumber?: number): string {
+  const providerName = formatProviderDisplayName(session.provider);
+  const lines = [
+    `Selected ${listNumber ? `#${listNumber}: ` : ""}${providerName}.`,
+    `Name: ${cleanProviderSessionTitle(session.displayName || providerName)}`,
+    `Workspace: ${session.workspace}`,
+    `Status: ${session.status}`,
+    "Use /session for technical details.",
+  ];
+
+  return lines.join("\n");
+}
+
+function shortSessionLabel(sessionId: string): string {
+  return sessionId.slice(0, 8);
+}
+
+function formatProviderDisplayName(provider: AgentProviderKind): string {
+  switch (provider) {
+    case "codex":
+      return "Codex";
+    case "claude":
+      return "Claude";
+    default:
+      return provider;
+  }
+}
+
+type ClaudeTranscriptSessionSummary = {
+  sessionId: string;
+  workspace: string;
+  title: string;
+  updatedAt: number;
+};
+
+function listClaudeTranscriptSessions(limit: number): ClaudeTranscriptSessionSummary[] {
+  const projectsDir = path.join(homedir(), ".claude", "projects");
+  if (!existsSync(projectsDir)) {
+    return [];
+  }
+
+  const files: Array<{ path: string; sessionId: string; updatedAt: number }> = [];
+  const visit = (dir: string): void => {
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true }) as Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name.toLowerCase() !== "subagents") {
+          visit(fullPath);
+        }
+        continue;
+      }
+
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) {
+        continue;
+      }
+
+      try {
+        const stat = statSync(fullPath);
+        files.push({
+          path: fullPath,
+          sessionId: path.basename(entry.name, ".jsonl"),
+          updatedAt: stat.mtimeMs,
+        });
+      } catch {
+        // Ignore unreadable transcript candidates.
+      }
+    }
+  };
+
+  visit(projectsDir);
+  return files
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, limit)
+    .map(readClaudeTranscriptSummary)
+    .filter((summary): summary is ClaudeTranscriptSessionSummary => Boolean(summary));
+}
+
+function readClaudeTranscriptSummary(file: { path: string; sessionId: string; updatedAt: number }): ClaudeTranscriptSessionSummary | undefined {
+  let text: string;
+  try {
+    text = readFileSync(file.path, "utf8");
+  } catch {
+    return undefined;
+  }
+
+  let workspace = "";
+  let title = "";
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    if (!workspace && typeof entry.cwd === "string") {
+      workspace = entry.cwd;
+    }
+
+    if (!title && entry.type === "user") {
+      const candidate = cleanProviderSessionTitle(extractClaudeUserText(entry));
+      if (candidate && !isClaudeTranscriptCaveat(candidate)) {
+        title = candidate;
+      }
+    }
+
+    if (workspace && title) {
+      break;
+    }
+  }
+
+  return {
+    sessionId: file.sessionId,
+    workspace: workspace || path.dirname(file.path),
+    title: title || `Claude session ${file.sessionId.slice(0, 8)}`,
+    updatedAt: file.updatedAt,
+  };
+}
+
+function extractClaudeUserText(entry: Record<string, unknown>): string {
+  const message = entry.message && typeof entry.message === "object"
+    ? entry.message as Record<string, unknown>
+    : undefined;
+  const content = message?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  return content
+    .map((block) => {
+      if (typeof block === "string") {
+        return block;
+      }
+      if (block && typeof block === "object" && typeof (block as Record<string, unknown>).text === "string") {
+        return (block as Record<string, unknown>).text as string;
+      }
+      return "";
+    })
+    .join(" ");
+}
+
+function isClaudeTranscriptCaveat(text: string): boolean {
+  const lower = text.toLowerCase();
+  return lower.includes("local-command-caveat") || lower.includes("do not respond to these messages");
+}
+
+function cleanProviderSessionTitle(title: string): string {
+  const withoutTags = title.replace(/<[^>]+>/g, " ");
+  return cleanSessionTitle(withoutTags).replace(/\s+/g, " ").trim() || "(untitled)";
+}
+
+function parseProviderPrefix(raw: string): { provider: "codex" | "claude"; rest: string } | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const [first = "", ...restParts] = trimmed.split(/\s+/);
+  const provider = parseProviderName(first);
+  if (provider !== "codex" && provider !== "claude") {
+    return undefined;
+  }
+
+  return {
+    provider,
+    rest: restParts.join(" ").trim(),
+  };
+}
+
+function parseProviderName(raw: string): "codex" | "claude" | undefined {
+  switch (raw.trim().toLowerCase()) {
+    case "codex":
+    case "code":
+    case "openai":
+      return "codex";
+    case "claude":
+    case "claude-code":
+    case "claudecode":
+      return "claude";
+    default:
+      return undefined;
+  }
+}
+
 function normalizeSmokeReply(reply: string): string {
   return reply.trim().replace(/[.!]+$/g, "").toUpperCase();
 }
@@ -4340,6 +6992,27 @@ function formatRelativeTime(date: Date): string {
 
   const deltaWeeks = Math.floor(deltaDays / 7);
   return `${deltaWeeks}w ago`;
+}
+
+function formatDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  const parts: string[] = [];
+  if (days > 0) {
+    parts.push(`${days}d`);
+  }
+  if (hours > 0 || parts.length > 0) {
+    parts.push(`${hours}h`);
+  }
+  if (minutes > 0 || parts.length > 0) {
+    parts.push(`${minutes}m`);
+  }
+  parts.push(`${seconds}s`);
+  return parts.join(" ");
 }
 
 function isMessageNotModifiedError(error: unknown): boolean {
