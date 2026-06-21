@@ -53,4 +53,26 @@ describe("ensureClaudeConfigDir", () => {
     expect(existsSync(target)).toBe(true);
     expect(existsSync(path.join(target, ".credentials.json"))).toBe(false);
   });
+
+  it("seeds hasCompletedOnboarding so the first-run wizard is skipped", () => {
+    ensureClaudeConfigDir(target, source);
+    const claudeJson = JSON.parse(readFileSync(path.join(target, ".claude.json"), "utf8"));
+    expect(claudeJson.hasCompletedOnboarding).toBe(true);
+    expect(claudeJson.theme).toBe("dark-ansi");
+  });
+
+  it("merges the onboarding flag into an existing .claude.json without clobbering it", () => {
+    mkdirSync(target, { recursive: true });
+    writeFileSync(
+      path.join(target, ".claude.json"),
+      JSON.stringify({ machineID: "abc123", theme: "light", userID: "u1" }),
+    );
+    ensureClaudeConfigDir(target, source);
+    const claudeJson = JSON.parse(readFileSync(path.join(target, ".claude.json"), "utf8"));
+    expect(claudeJson.hasCompletedOnboarding).toBe(true);
+    expect(claudeJson.machineID).toBe("abc123");
+    expect(claudeJson.userID).toBe("u1");
+    // An existing theme choice is preserved, not overwritten.
+    expect(claudeJson.theme).toBe("light");
+  });
 });

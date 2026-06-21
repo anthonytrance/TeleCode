@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -18,6 +18,40 @@ export function ensureClaudeConfigDir(
 ): void {
   mkdirSync(configDir, { recursive: true });
   syncCredentials(configDir, sourceConfigDir);
+  ensureOnboardingComplete(configDir);
+}
+
+/**
+ * A fresh CLAUDE_CONFIG_DIR makes claude.exe run its first-run wizard (theme picker,
+ * etc.), which never reaches the interactive prompt the PTY waits for. The relocated
+ * global state file lives at <configDir>/.claude.json; seeding hasCompletedOnboarding
+ * there skips the wizard. We merge into any existing file so we never clobber the
+ * machine/user IDs claude writes on boot. We deliberately do NOT copy the real
+ * settings.json, because it carries enabledPlugins/channelsEnabled for the telegram
+ * plugin — the exact thing this isolation exists to keep out of the child.
+ */
+function ensureOnboardingComplete(configDir: string): void {
+  const file = path.join(configDir, ".claude.json");
+  let data: Record<string, unknown> = {};
+  if (existsSync(file)) {
+    try {
+      data = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    } catch {
+      data = {};
+    }
+  }
+  let changed = false;
+  if (data.hasCompletedOnboarding !== true) {
+    data.hasCompletedOnboarding = true;
+    changed = true;
+  }
+  if (data.theme === undefined || data.theme === null) {
+    data.theme = "dark-ansi";
+    changed = true;
+  }
+  if (changed) {
+    writeFileSync(file, JSON.stringify(data, null, 2));
+  }
 }
 
 function syncCredentials(configDir: string, sourceConfigDir: string): void {
