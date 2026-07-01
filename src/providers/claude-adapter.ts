@@ -16,6 +16,7 @@ import { getClaudeCommandSpec, parseClaudeSlashCommand } from "./claude-commands
 import {
   CLAUDE_FULLSCREEN_PROMPT_MARKERS,
   CLAUDE_READY_MARKERS,
+  CLAUDE_RESUME_WARNING_MARKERS,
   CLAUDE_TRUST_MARKERS,
   ClaudePty,
 } from "./claude-pty.js";
@@ -401,6 +402,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     const firstMarker = await ptySession.waitForMarker([
       ...CLAUDE_TRUST_MARKERS,
       ...CLAUDE_FULLSCREEN_PROMPT_MARKERS,
+      ...CLAUDE_RESUME_WARNING_MARKERS,
       ...CLAUDE_READY_MARKERS,
     ], readyTimeoutMs);
     if (!firstMarker) {
@@ -425,6 +427,17 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         await ptySession.dispose(false);
         this.removeRegisteredProcessSession(runtime.descriptor.id);
         throw new Error("Claude fullscreen prompt was dismissed, but the prompt did not become ready");
+      }
+    }
+    if (CLAUDE_RESUME_WARNING_MARKERS.some((marker) => marker.source === firstMarker)) {
+      // Large resumed sessions can show a safety menu. Use Claude's recommended option,
+      // resume from summary, rather than burning usage on a full 300k+ token resume.
+      ptySession.pressEnter();
+      const ready = await ptySession.waitForMarker(CLAUDE_READY_MARKERS, 90000);
+      if (!ready) {
+        await ptySession.dispose(false);
+        this.removeRegisteredProcessSession(runtime.descriptor.id);
+        throw new Error(`Claude resume warning was accepted, but the prompt did not become ready. Screen tail: ${screenTail(ptySession)}`);
       }
     }
 
