@@ -223,6 +223,8 @@ Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no er
 
 2026-07-01 correction: the marker-order check was still too weak because Claude can redraw a normal footer under the active `Compacting conversation` screen, making the footer newer than the busy text in the raw PTY stream. `waitForReadyPrompt` now tracks newly received PTY output: every new compaction/interruption chunk resets readiness, and a ready marker only counts after a later clean ready chunk plus a quiet period. Added `test/claude-pty.test.ts` to cover this exact failure mode.
 
+2026-07-01 Fable follow-up: Claude Code docs list `fable` and `best` as model aliases, and Fable 5 was redeployed globally on July 1 with subscription access included only up to 50% of weekly limits through July 7, then requiring usage credits. TeleCodex help text now includes Fable aliases, and model startup or `/model` command failures are surfaced from the Claude CLI screen instead of reporting a successful model change blindly.
+
 ## Deferred Work
 
 - Full interactive menu navigation for Claude TUI commands.

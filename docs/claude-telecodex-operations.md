@@ -32,7 +32,7 @@ Default integrated Claude model:
 claude-sonnet-5
 ```
 
-`/new claude <model>` starts a fresh Claude session with that model. `/model <model>` sends Claude Code's own model command into the active Claude session, so it does not replace the session. Common values are `claude-sonnet-5`, `sonnet`, `opus`, and `haiku`.
+`/new claude <model>` starts a fresh Claude session with that model. `/model <model>` sends Claude Code's model selection through the active Claude integration. Common values are `fable`, `best`, `claude-fable-5`, `claude-sonnet-5`, `sonnet`, `opus`, `haiku`, and `default`. If Claude Code rejects a model because it is unavailable, blocked by the account or organization, or requires usage credits, TeleCodex reports the CLI error instead of saying the model changed.
 
 If `CLAUDE_DEFAULT_MODEL=default` is explicitly set, TeleCodex omits `--model` and lets Claude Code choose its local default. On 2026-07-01, a live smoke showed that this machine's local Claude default resolved to `claude-opus-4-8`, so the built-in TeleCodex default is explicitly `claude-sonnet-5`.
 

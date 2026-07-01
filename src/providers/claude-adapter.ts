@@ -170,8 +170,8 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       }
       const modelCommand = parseClaudeModelCommand(promptText);
       if (modelCommand) {
-        await this.applyModelCommand(runtime, promptText, modelCommand);
-        const text = `Claude model command sent: ${modelCommand}. Use /status to confirm the active model.`;
+        const resultText = await this.applyModelCommand(runtime, promptText, modelCommand);
+        const text = resultText || `Claude model command sent: ${modelCommand}. Use /status to confirm the active model.`;
         yield {
           type: "assistant_text_delta",
           sessionId: runtime.descriptor.id,
@@ -522,6 +522,15 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       );
     }
 
+    const startupModelFailure = shouldPassClaudeModel(runtime.model)
+      ? extractModelCommandFailure(ptySession.strippedText())
+      : undefined;
+    if (startupModelFailure) {
+      await ptySession.dispose(false);
+      this.removeRegisteredProcessSession(runtime.descriptor.id);
+      throw new Error(`Claude model startup failed: ${startupModelFailure}`);
+    }
+
     ptySession.on("exit", () => {
       if (runtime.ptyPid) {
         this.removeRegisteredProcessPid(runtime.ptyPid);
@@ -534,7 +543,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime.pty = ptySession;
   }
 
-  private async applyModelCommand(runtime: RuntimeSession, commandText: string, model: string): Promise<void> {
+  private async applyModelCommand(runtime: RuntimeSession, commandText: string, model: string): Promise<string | undefined> {
     const ptySession = runtime.pty;
     if (!ptySession) {
       throw new Error("Claude PTY is not running");
@@ -542,14 +551,25 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
     ptySession.clearBuffer();
     await ptySession.sendCommand(commandText);
-    const confirmation = await ptySession.waitForMarker(
-      [/switchmodel/, /yes,switchto/, /switchto/, /confirmmodel/],
+    let confirmation = await ptySession.waitForMarker(
+      [...CLAUDE_MODEL_CONFIRMATION_MARKERS, ...CLAUDE_MODEL_FAILURE_MARKERS],
       5000,
     );
+    let failure = extractModelCommandFailure(ptySession.strippedText());
+    if (failure) {
+      throw new Error(`Claude model switch failed: ${failure}`);
+    }
     if (confirmation) {
       ptySession.typeText("1");
       ptySession.pressEnter();
-      await sleep(1000);
+      ptySession.clearBuffer();
+    }
+
+    await sleep(1500);
+    await ptySession.waitForReadyPrompt(10000);
+    failure = extractModelCommandFailure(ptySession.strippedText());
+    if (failure) {
+      throw new Error(`Claude model switch failed: ${failure}`);
     }
 
     runtime.model = model;
@@ -558,6 +578,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       model,
     };
     runtime.descriptor.updatedAt = Date.now();
+    return `Claude model command accepted: ${model}. Use /status to confirm the active model.`;
   }
 
   private registerProcess(record: {
@@ -794,6 +815,43 @@ function promptToText(input: AgentSendPromptOptions["input"]): string {
 function parseClaudeModelCommand(text: string): string | undefined {
   const match = text.trim().match(/^\/model(?:@\w+)?\s+([a-zA-Z0-9_.:-]+)$/u);
   return match?.[1];
+}
+
+const CLAUDE_MODEL_CONFIRMATION_MARKERS = [
+  /switchmodel/,
+  /yes,switchto/,
+  /switchto/,
+  /confirmmodel/,
+];
+
+const CLAUDE_MODEL_FAILURE_MARKERS = [
+  /model(?:is)?notavailable/,
+  /modelunavailable/,
+  /notinyourorganizationsallowedmodels/,
+  /notinyourorganization'sallowedmodels/,
+  /requiresusagecredits/,
+  /usagecredits/,
+  /enableusagecredits/,
+  /unknownmodel/,
+  /invalidmodel/,
+  /notenabled/,
+];
+
+function extractModelCommandFailure(screen: string): string | undefined {
+  const lines = screen
+    .replace(/[\u2500-\u257f\u25cf\u25b0\u25b1\u2722\u273b\u273d\u2736]/g, " ")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const failureLines = lines.filter((line) => {
+    const compact = line.replace(/\s+/g, "").toLowerCase();
+    return CLAUDE_MODEL_FAILURE_MARKERS.some((marker) => marker.test(compact));
+  });
+  const candidate = failureLines.at(-1);
+  if (!candidate) {
+    return undefined;
+  }
+  return cleanScreenFallbackCandidate(candidate) ?? candidate;
 }
 
 /**

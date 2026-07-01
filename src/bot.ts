@@ -3422,15 +3422,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
       const requestedModel = parseClaudeModelArgument(remainingArg);
       if (remainingArg && !requestedModel) {
-        const message = "Usage: /new claude, /new claude sonnet, /new claude opus, or /new claude haiku.";
+        const message = "Usage: /new claude, /new claude fable, /new claude sonnet, /new claude opus, /new claude haiku, or /new claude default.";
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
         return;
       }
       registry.setActiveProvider(rawContextKey, "claude");
-      const descriptor = await createFreshClaudeSession(rawContextKey, { model: requestedModel });
-      const model = String(descriptor.metadata?.model ?? config.claudeDefaultModel);
-      const message = `New Claude session selected with model ${model}. The next normal message will use it.`;
-      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      try {
+        const descriptor = await createFreshClaudeSession(rawContextKey, { model: requestedModel });
+        const model = String(descriptor.metadata?.model ?? config.claudeDefaultModel);
+        const message = `New Claude session selected with model ${model}. The next normal message will use it.`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      } catch (error) {
+        const message = `Claude model change failed: ${friendlyErrorText(error)}`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      }
       return;
     }
 
@@ -5086,13 +5091,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       if (!modelArg) {
         const message = [
           `Claude model: ${currentModel}`,
-          "Use /model sonnet, /model opus, or /model haiku to change the active Claude session.",
+          "Use /model fable, /model sonnet, /model opus, /model haiku, /model best, or /model default to change the active Claude session.",
         ].join("\n");
         await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
         return;
       }
       if (!requestedModel) {
-        const message = "Usage: /model sonnet, /model opus, or /model haiku.";
+        const message = "Usage: /model fable, /model sonnet, /model opus, /model haiku, /model best, or /model default.";
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
         return;
       }
@@ -5102,12 +5107,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
       registry.setActiveProvider(rawContextKey, "claude");
-      const descriptor = await createFreshClaudeSession(rawContextKey, { model: requestedModel });
-      const message = [
-        `Claude model set to ${String(descriptor.metadata?.model ?? requestedModel)}.`,
-        "Started a fresh Claude session because Claude model changes apply when the process is spawned.",
-      ].join("\n");
-      await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
+      try {
+        const descriptor = await createFreshClaudeSession(rawContextKey, { model: requestedModel });
+        const message = [
+          `Claude model set to ${String(descriptor.metadata?.model ?? requestedModel)}.`,
+          "Started a fresh Claude session because Claude model changes apply when the process is spawned.",
+        ].join("\n");
+        await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
+      } catch (error) {
+        const message = `Claude model change failed: ${friendlyErrorText(error)}`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      }
       return;
     }
 
