@@ -37,6 +37,7 @@ describe("loadConfig", () => {
     delete process.env.CLAUDE_DEFAULT_MODEL;
     delete process.env.CLAUDE_WORKSPACE;
     delete process.env.CLAUDE_PERMISSION_MODE;
+    delete process.env.CLAUDE_LARGE_SESSION_RESUME;
     delete process.env.CLAUDE_TURN_IDLE_TIMEOUT;
     delete process.env.CLAUDE_CONTEXT_WINDOW;
     delete process.env.container;
@@ -124,6 +125,7 @@ describe("loadConfig", () => {
       claudeDefaultModel: "claude-sonnet-5",
       claudeWorkspace: process.cwd(),
       claudePermissionMode: "acceptEdits",
+      claudeLargeSessionResume: "summary",
       claudeTurnIdleTimeoutSeconds: 180,
       claudeContextWindow: 200000,
     });
@@ -176,6 +178,7 @@ describe("loadConfig", () => {
     expect(config.claudeDefaultModel).toBe("claude-sonnet-5");
     expect(config.claudeWorkspace).toBe(process.cwd());
     expect(config.claudePermissionMode).toBe("acceptEdits");
+    expect(config.claudeLargeSessionResume).toBe("summary");
     expect(config.claudeTurnIdleTimeoutSeconds).toBe(180);
     expect(config.claudeContextWindow).toBe(200000);
     expect(config.workspace).toBe(process.cwd());
@@ -359,6 +362,7 @@ describe("loadConfig", () => {
     process.env.CLAUDE_DEFAULT_MODEL = "opus";
     process.env.CLAUDE_WORKSPACE = path.join(tempDir, "claude-workspace");
     process.env.CLAUDE_PERMISSION_MODE = "plan";
+    process.env.CLAUDE_LARGE_SESSION_RESUME = "full";
     process.env.CLAUDE_STRICT_MCP_CONFIG = "false";
     process.env.CLAUDE_TURN_IDLE_TIMEOUT = "60";
     process.env.CLAUDE_CONTEXT_WINDOW = "123456";
@@ -372,6 +376,7 @@ describe("loadConfig", () => {
     expect(config.claudeDefaultModel).toBe("opus");
     expect(config.claudeWorkspace).toBe(path.join(tempDir, "claude-workspace"));
     expect(config.claudePermissionMode).toBe("plan");
+    expect(config.claudeLargeSessionResume).toBe("full");
     expect(config.claudeTurnIdleTimeoutSeconds).toBe(60);
     expect(config.claudeContextWindow).toBe(123456);
   });

@@ -18,6 +18,7 @@ export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
 export type ProgressDelivery = "none" | "messages" | "edit";
 export type CodexBackend = "sdk" | "app-server";
 export type ClaudePermissionMode = "default" | "acceptEdits" | "plan" | "bypassPermissions";
+export type ClaudeLargeSessionResumePolicy = "summary" | "full" | "manual";
 
 export interface TeleCodexConfig {
   telegramBotToken: string;
@@ -47,6 +48,7 @@ export interface TeleCodexConfig {
   claudeDefaultModel: string;
   claudeWorkspace: string;
   claudePermissionMode: ClaudePermissionMode;
+  claudeLargeSessionResume: ClaudeLargeSessionResumePolicy;
   claudeTurnIdleTimeoutSeconds: number;
   claudeContextWindow: number;
 }
@@ -108,6 +110,9 @@ export function loadConfig(): TeleCodexConfig {
   if (claudePermissionMode === "bypassPermissions" && !enableUnsafeLaunchProfiles) {
     throw new Error("CLAUDE_PERMISSION_MODE=bypassPermissions requires ENABLE_UNSAFE_LAUNCH_PROFILES=true");
   }
+  const claudeLargeSessionResume = parseClaudeLargeSessionResumePolicy(
+    optionalString(process.env.CLAUDE_LARGE_SESSION_RESUME),
+  );
   const claudeTurnIdleTimeoutSeconds = parsePositiveIntegerEnv(
     optionalString(process.env.CLAUDE_TURN_IDLE_TIMEOUT),
     180,
@@ -147,6 +152,7 @@ export function loadConfig(): TeleCodexConfig {
     claudeDefaultModel,
     claudeWorkspace,
     claudePermissionMode,
+    claudeLargeSessionResume,
     claudeTurnIdleTimeoutSeconds,
     claudeContextWindow,
   };
@@ -392,6 +398,32 @@ function parseClaudePermissionMode(raw: string | undefined): ClaudePermissionMod
         `Invalid CLAUDE_PERMISSION_MODE value: "${raw}". Expected one of: default, acceptEdits, plan, bypassPermissions. Falling back to "acceptEdits".`,
       );
       return "acceptEdits";
+  }
+}
+
+function parseClaudeLargeSessionResumePolicy(raw: string | undefined): ClaudeLargeSessionResumePolicy {
+  if (!raw) {
+    return "summary";
+  }
+
+  switch (raw.toLowerCase()) {
+    case "summary":
+    case "summarize":
+    case "recommended":
+      return "summary";
+    case "full":
+    case "asis":
+    case "as-is":
+      return "full";
+    case "manual":
+    case "ask":
+    case "stop":
+      return "manual";
+    default:
+      console.warn(
+        `Invalid CLAUDE_LARGE_SESSION_RESUME value: "${raw}". Expected one of: summary, full, manual. Falling back to "summary".`,
+      );
+      return "summary";
   }
 }
 

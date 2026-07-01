@@ -217,7 +217,7 @@ Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no er
 
 2026-07-01 follow-up after first F9 restart: Anthony hit `Claude did not reach a ready prompt` on resume. This was a startup readiness problem before any prompt/transcript tailing began. The failure message was too opaque, so startup now includes the PTY screen tail in that error. Resume startup also waits 90s instead of 30s, because the active session is now large, and ready detection accepts footer variants such as `bypass permissions on`, `accept edits on`, `esc to interrupt`, and `← for agents`, not only `shift+tab` / `? for shortcuts`.
 
-2026-07-01 follow-up after seeing the new screen tail: Claude showed its large-session warning menu: "This session is 4h 8m old and 340.3k tokens. Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary." TeleCodex now detects that menu and presses Enter to accept Claude's recommended "Resume from summary" option, then waits for the ready prompt.
+2026-07-01 follow-up after seeing the new screen tail: Claude showed its large-session warning menu: "This session is 4h 8m old and 340.3k tokens. Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary." TeleCodex now detects that menu and handles it according to `CLAUDE_LARGE_SESSION_RESUME`: `summary` (default, Claude's recommendation, fast/lower usage), `full` (types 2 and resumes the full session), or `manual` (stops with an explicit config message instead of choosing).
 
 ## Deferred Work
 

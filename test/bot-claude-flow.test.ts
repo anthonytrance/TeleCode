@@ -455,6 +455,7 @@ function createConfig(workspace: string): TeleCodexConfig {
     claudeDefaultModel: "sonnet",
     claudeWorkspace: workspace,
     claudePermissionMode: "acceptEdits",
+    claudeLargeSessionResume: "summary",
     claudeTurnIdleTimeoutSeconds: 180,
     claudeContextWindow: 200000,
   };
