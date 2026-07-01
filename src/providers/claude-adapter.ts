@@ -70,6 +70,8 @@ type LocatedTurnOutput =
   | { transcriptPath: string; startOffset: number }
   | { fallbackText: string };
 
+type StartupStatusCallback = (text: string) => void | Promise<void>;
+
 export class ClaudeProviderAdapter implements AgentProviderAdapter {
   readonly id = "claude";
   readonly displayName = "Claude Code";
@@ -82,7 +84,10 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     this.processRegistry = new ClaudeProcessRegistry(claudeProcessRegistryPath(config.workspace));
   }
 
-  async createSession(options: CreateAgentSessionOptions): Promise<AgentSessionDescriptor> {
+  async createSession(
+    options: CreateAgentSessionOptions,
+    onStartupStatus?: StartupStatusCallback,
+  ): Promise<AgentSessionDescriptor> {
     this.validateEnabled();
     const providerSessionId = randomUUID();
     const descriptor = this.buildDescriptor({
@@ -96,15 +101,18 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     });
     const runtime = this.runtimeFromDescriptor(descriptor);
     this.sessions.set(descriptor.id, runtime);
-    await this.ensurePty(runtime, "new");
+    await this.ensurePty(runtime, "new", onStartupStatus);
     return { ...descriptor };
   }
 
-  async resumeSession(session: AgentSessionDescriptor): Promise<AgentSessionDescriptor> {
+  async resumeSession(
+    session: AgentSessionDescriptor,
+    onStartupStatus?: StartupStatusCallback,
+  ): Promise<AgentSessionDescriptor> {
     this.validateEnabled();
     const runtime = this.runtimeFromDescriptor(session);
     this.sessions.set(session.id, runtime);
-    await this.ensurePty(runtime, "resume");
+    await this.ensurePty(runtime, "resume", onStartupStatus);
     return { ...runtime.descriptor };
   }
 
@@ -129,7 +137,37 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     yield { type: "session_status_changed", sessionId: runtime.descriptor.id, status: "running" };
 
     try {
-      await this.ensurePty(runtime, "resume");
+      const startupEvents: AgentProviderEvent[] = [];
+      let startupError: unknown;
+      let startupDone = false;
+      const startup = this.ensurePty(runtime, "resume", (text) => {
+        startupEvents.push({
+          type: "status_message",
+          sessionId: runtime.descriptor.id,
+          jobId: options.jobId,
+          text,
+        });
+      });
+      startup.then(
+        () => {
+          startupDone = true;
+        },
+        (error: unknown) => {
+          startupError = error;
+          startupDone = true;
+        },
+      );
+      while (!startupDone || startupEvents.length > 0) {
+        while (startupEvents.length > 0) {
+          yield startupEvents.shift()!;
+        }
+        if (!startupDone) {
+          await sleep(250);
+        }
+      }
+      if (startupError) {
+        throw startupError;
+      }
       const modelCommand = parseClaudeModelCommand(promptText);
       if (modelCommand) {
         await this.applyModelCommand(runtime, promptText, modelCommand);
@@ -310,7 +348,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     // typed at the prompt and not into a stuck panel.
     ptySession.pressEscape();
     ptySession.clearBuffer();
-    const ready = await ptySession.waitForMarker(CLAUDE_READY_MARKERS, 4000);
+    const ready = await ptySession.waitForReadyPrompt(4000);
     if (!ready) {
       ptySession.pressEscape();
       await sleep(400);
@@ -337,7 +375,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     this.sessions.clear();
   }
 
-  private async ensurePty(runtime: RuntimeSession, mode: "new" | "resume"): Promise<void> {
+  private async ensurePty(
+    runtime: RuntimeSession,
+    mode: "new" | "resume",
+    onStartupStatus?: StartupStatusCallback,
+  ): Promise<void> {
     if (runtime.pty?.isAlive) {
       return;
     }
@@ -414,7 +456,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     if (firstMarker === CLAUDE_TRUST_MARKERS[0]!.source) {
       ptySession.pressEnter();
       ptySession.clearBuffer();
-      const ready = await ptySession.waitForMarker(CLAUDE_READY_MARKERS, 30000);
+      const ready = await ptySession.waitForReadyPrompt(30000);
       if (!ready) {
         await ptySession.dispose(false);
         this.removeRegisteredProcessSession(runtime.descriptor.id);
@@ -425,7 +467,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       ptySession.typeText("2");
       ptySession.pressEnter();
       ptySession.clearBuffer();
-      const ready = await ptySession.waitForMarker(CLAUDE_READY_MARKERS, 30000);
+      const ready = await ptySession.waitForReadyPrompt(30000);
       if (!ready) {
         await ptySession.dispose(false);
         this.removeRegisteredProcessSession(runtime.descriptor.id);
@@ -440,17 +482,44 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           "Claude is asking how to resume a very large session. Set CLAUDE_LARGE_SESSION_RESUME=summary or full, then restart TeleCodex.",
         );
       }
+      const resumeStartedAt = Date.now();
+      const resumeStrategy = this.config.claudeLargeSessionResume;
+      runtime.descriptor.metadata = {
+        ...runtime.descriptor.metadata,
+        startupResumeStrategy: resumeStrategy,
+        startupResumeStartedAt: resumeStartedAt,
+        startupResumeFinishedAt: undefined,
+      };
+      runtime.descriptor.updatedAt = resumeStartedAt;
+      await onStartupStatus?.(
+        resumeStrategy === "full"
+          ? "Claude is resuming a very large session in full. This can take a while; I will wait before sending your prompt."
+          : "Claude is compacting a very large session into a summary. I will wait before sending your prompt.",
+      );
       if (this.config.claudeLargeSessionResume === "full") {
         ptySession.typeText("2");
       }
       ptySession.pressEnter();
       ptySession.clearBuffer();
-      const ready = await ptySession.waitForMarker(CLAUDE_READY_MARKERS, 600000);
+      const ready = await ptySession.waitForReadyPrompt(600000);
       if (!ready) {
         await ptySession.dispose(false);
         this.removeRegisteredProcessSession(runtime.descriptor.id);
         throw new Error(`Claude resume warning was accepted, but the prompt did not become ready. Screen tail: ${screenTail(ptySession)}`);
       }
+      const resumeFinishedAt = Date.now();
+      runtime.descriptor.metadata = {
+        ...runtime.descriptor.metadata,
+        startupResumeStrategy: resumeStrategy,
+        startupResumeStartedAt: resumeStartedAt,
+        startupResumeFinishedAt: resumeFinishedAt,
+      };
+      runtime.descriptor.updatedAt = resumeFinishedAt;
+      await onStartupStatus?.(
+        resumeStrategy === "full"
+          ? "Claude full-session resume finished. Sending your prompt now."
+          : "Claude summary compaction finished. Sending your prompt now.",
+      );
     }
 
     ptySession.on("exit", () => {

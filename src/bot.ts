@@ -524,6 +524,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
   const ensureClaudeSession = async (
     contextKey: TelegramContextKey,
+    onStartupStatus?: (text: string) => void | Promise<void>,
   ): Promise<AgentSessionDescriptor> => {
     if (!claudeAdapter) {
       throw new Error("Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.");
@@ -556,7 +557,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
     }
     const descriptor = resumablePersisted && persistedTranscript
-      ? await claudeAdapter.resumeSession(buildClaudeDescriptor(resumablePersisted))
+      ? await claudeAdapter.resumeSession(buildClaudeDescriptor(resumablePersisted), onStartupStatus)
       : await claudeAdapter.createSession({
           workspace: config.claudeWorkspace,
           displayName: `TeleCodex ${contextKey}`,
@@ -564,7 +565,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             model: config.claudeDefaultModel,
             permissionMode: config.claudePermissionMode,
           },
-        });
+        }, onStartupStatus);
     claudeSessions.set(contextKey, descriptor);
     persistClaudeSession(contextKey, descriptor);
     return descriptor;
@@ -2084,8 +2085,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }, NARRATION_IDLE_FLUSH_MS);
     };
 
+    const deliverClaudeStatusMessage = async (message: string): Promise<void> => {
+      const trimmed = message.trim();
+      if (!trimmed) {
+        return;
+      }
+      if (isProviderForeground(contextKey, "claude")) {
+        await safeReply(ctx, escapeHTML(trimmed), { fallbackText: trimmed, messageThreadId });
+      } else {
+        bufferClaudeOutput("status", trimmed, false);
+      }
+    };
+
     try {
-      descriptor = await ensureClaudeSession(contextKey);
+      descriptor = await ensureClaudeSession(contextKey, deliverClaudeStatusMessage);
       const jobId = `claude-job-${randomUUID().slice(0, 12)}`;
       const agentSession = ensureAgentSessionRecord(contextKey, "claude", {
         workspace: descriptor.workspace,
@@ -2146,6 +2159,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
                 bufferClaudeOutput("tool", line, false);
               }
             }
+            break;
+          case "status_message":
+            await flushPendingClaudeAssistantProgress();
+            await deliverClaudeStatusMessage(event.text);
             break;
           case "tool_failed":
           case "error": {

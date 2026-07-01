@@ -219,6 +219,8 @@ Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no er
 
 2026-07-01 follow-up after seeing the new screen tail: Claude showed its large-session warning menu: "This session is 4h 8m old and 340.3k tokens. Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary." TeleCodex now detects that menu and handles it according to `CLAUDE_LARGE_SESSION_RESUME`: `summary` (default, Claude's recommendation, fast/lower usage), `full` (types 2 and resumes the full session), or `manual` (stops with an explicit config message instead of choosing).
 
+2026-07-01 follow-up after repeated `Claude did not record the prompt` with screen tail `Compacting conversation`: ready detection still accepted footer text while Claude was actively compacting. `esc to interrupt` is now a BUSY marker, not a ready marker, and post-menu waits use `waitForReadyPrompt`, which requires the newest ready marker to appear after the newest busy marker before TeleCodex may send a prompt. Large-session resume also emits Telegram status messages when Claude starts summary/full resume and when it reaches a ready prompt again, so the user is not left with silence during compaction.
+
 ## Deferred Work
 
 - Full interactive menu navigation for Claude TUI commands.

@@ -89,6 +89,20 @@ export class ClaudePty extends EventEmitter {
     return null;
   }
 
+  async waitForReadyPrompt(timeoutMs: number): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() <= deadline) {
+      const compact = this.strippedText().slice(-4000).replace(/\s+/g, "").toLowerCase();
+      const ready = lastMatchingMarker(CLAUDE_READY_MARKERS, compact);
+      const busy = lastMatchingMarker(CLAUDE_BUSY_MARKERS, compact);
+      if (ready && (!busy || ready.index > busy.index)) {
+        return ready.source;
+      }
+      await sleep(250);
+    }
+    return null;
+  }
+
   typeText(text: string): void {
     this.requireProc().write(text);
   }
@@ -186,8 +200,31 @@ export const CLAUDE_READY_MARKERS = [
   /accepteditson/,
   /←foragents/,
   /foragents/,
-  /esc(?:to)?interrupt/,
 ];
+export const CLAUDE_BUSY_MARKERS = [/compactingconversation/, /esc(?:to)?interrupt/];
+
+function lastMatchingMarker(patterns: RegExp[], text: string): { source: string; index: number } | null {
+  let latest: { source: string; index: number } | null = null;
+  for (const pattern of patterns) {
+    const index = lastPatternIndex(pattern, text);
+    if (index >= 0 && (!latest || index > latest.index)) {
+      latest = { source: pattern.source, index };
+    }
+  }
+  return latest;
+}
+
+function lastPatternIndex(pattern: RegExp, text: string): number {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  const globalPattern = new RegExp(pattern.source, flags);
+  let latest = -1;
+  for (const match of text.matchAll(globalPattern)) {
+    if (typeof match.index === "number") {
+      latest = match.index;
+    }
+  }
+  return latest;
+}
 
 function taskkill(pid: number): Promise<void> {
   return new Promise((resolve) => {

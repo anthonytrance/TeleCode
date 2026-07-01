@@ -110,6 +110,12 @@ export type AgentProviderEvent =
       status: AgentSessionStatus;
     }
   | {
+      type: "status_message";
+      sessionId: string;
+      jobId?: string;
+      text: string;
+    }
+  | {
       type: "session_title_changed";
       sessionId: string;
       title: string;
