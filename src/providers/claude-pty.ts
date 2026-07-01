@@ -178,7 +178,14 @@ export class ClaudePty extends EventEmitter {
 
 export const CLAUDE_TRUST_MARKERS = [/trustthisfolder/];
 export const CLAUDE_FULLSCREEN_PROMPT_MARKERS = [/trythenewfullscreenrenderer/];
-export const CLAUDE_READY_MARKERS = [/shift\+tab/, /\?forshortcuts/];
+export const CLAUDE_READY_MARKERS = [
+  /shift\+tab/,
+  /\?forshortcuts/,
+  /bypasspermissionson/,
+  /accepteditson/,
+  /←foragents/,
+  /esc(?:to)?interrupt/,
+];
 
 function taskkill(pid: number): Promise<void> {
   return new Promise((resolve) => {

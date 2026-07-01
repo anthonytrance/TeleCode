@@ -278,6 +278,45 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     };
   }
 
+  /**
+   * Scrape Claude Code's own `/usage` panel, which is the only place the live subscription
+   * rate-limit picture (5-hour block, weekly, resets) is shown — it is not in the transcript
+   * or any local file. We drive the interactive panel in the PTY, capture the rendered text,
+   * then dismiss it and confirm the prompt returned so the session stays usable.
+   */
+  async getUsageReport(sessionId: string): Promise<string | null> {
+    const runtime = this.requireRuntime(sessionId);
+    if (runtime.busy) {
+      throw new Error("Cannot read Claude usage while a turn is running");
+    }
+    await this.ensurePty(runtime, "resume");
+    const ptySession = runtime.pty;
+    if (!ptySession) {
+      return null;
+    }
+
+    ptySession.clearBuffer();
+    await ptySession.sendCommand("/usage");
+    // Wait for the panel to paint; on no match, fall through and scrape whatever rendered.
+    await ptySession.waitForMarker(
+      [/current/, /resets?/, /limit/, /%/, /week/, /session/, /usage/],
+      8000,
+    );
+    await sleep(900);
+    const screen = ptySession.strippedText();
+
+    // Dismiss the panel and confirm the interactive prompt came back, so the next turn is
+    // typed at the prompt and not into a stuck panel.
+    ptySession.pressEscape();
+    const ready = await ptySession.waitForMarker(CLAUDE_READY_MARKERS, 4000);
+    if (!ready) {
+      ptySession.pressEscape();
+      await sleep(400);
+    }
+
+    return cleanUsagePanel(screen);
+  }
+
   async dispose(sessionId?: string): Promise<void> {
     if (sessionId) {
       const runtime = this.sessions.get(sessionId);
@@ -358,15 +397,16 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       });
     }
 
+    const readyTimeoutMs = mode === "resume" ? 90000 : 30000;
     const firstMarker = await ptySession.waitForMarker([
       ...CLAUDE_TRUST_MARKERS,
       ...CLAUDE_FULLSCREEN_PROMPT_MARKERS,
       ...CLAUDE_READY_MARKERS,
-    ], 30000);
+    ], readyTimeoutMs);
     if (!firstMarker) {
       await ptySession.dispose(false);
       this.removeRegisteredProcessSession(runtime.descriptor.id);
-      throw new Error("Claude did not reach a ready prompt");
+      throw new Error(`Claude did not reach a ready prompt. Screen tail: ${screenTail(ptySession)}`);
     }
     if (firstMarker === CLAUDE_TRUST_MARKERS[0]!.source) {
       ptySession.pressEnter();
@@ -706,6 +746,46 @@ function safeFileSize(filePath: string): number {
 function screenTail(ptySession: ClaudePty | undefined): string {
   const text = ptySession?.strippedText().replace(/\s+/g, " ").trim() ?? "";
   return text.slice(-1000) || "(empty)";
+}
+
+/**
+ * Turn a raw `/usage` panel screen capture into a clean, screen-reader-friendly block:
+ * drop box-drawing chrome, the input prompt/footer, and the TeleCodex system-prompt echo,
+ * then collapse blank runs. Returns null when nothing usable is left.
+ */
+function cleanUsagePanel(screen: string): string | null {
+  const lines = screen
+    .replace(/[─-╿⬢⬡●▌▐█]/g, " ")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => {
+      if (!line) {
+        return false;
+      }
+      const lower = line.toLowerCase();
+      return !(
+        lower.includes("shift+tab") ||
+        lower.includes("? for shortcuts") ||
+        lower.includes("esc to") ||
+        lower.includes("to go back") ||
+        lower.includes("telecodex") ||
+        lower.startsWith(">") ||
+        lower === "usage" ||
+        /^[\s>│|]+$/.test(line)
+      );
+    });
+
+  const seen = new Set<string>();
+  const deduped = lines.filter((line) => {
+    if (seen.has(line)) {
+      return false;
+    }
+    seen.add(line);
+    return true;
+  });
+
+  const text = deduped.join("\n").trim();
+  return text.length > 0 ? text : null;
 }
 
 function extractScreenFallbackText(before: string, after: string): string | undefined {

@@ -189,6 +189,34 @@ Verification: `npm run build` clean; `npm test` clean with 32 files and 320 test
 ### Not bugs (checked, OK in the live config)
 - Permission-prompt hang is NOT a live risk because `.env` uses `bypassPermissions` + `--dangerously-skip-permissions`. It WOULD hang if permission mode were ever set to `default`/`acceptEdits` in strict-mcp mode, since there is no Telegram permission-answer path (`capabilities.permissions=false`). Worth a guard/warning if that env ever changes.
 
+## F9 — Deep pass 2026-07-01 (post-F8 restart): usage limits, narration latency, worklist
+
+Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no errors). State integrity: progress=`edit` survived in `codetest/.telecodex/contexts.json` (live); `home/.telecodex/contexts.json` is stale (May 17). NOTE: `logs/telecodex.out.log` / `.err.log` are frozen at 2026-05-16 — current runs are NOT being captured to any log. The "Workspace: C:\Users\Anthony" banner people see is from that stale log, not the live process (the live process correctly uses codetest). Fixing live stdout/stderr logging is a real ops gap.
+
+### Done this pass (built + unit-tested, deployed via restart)
+- `/usage` (and `/cost`) now report the LIVE subscription limits. The rolling 5-hour/weekly/reset picture is not in the transcript or any local file — only Claude Code's own `/usage` panel has it. New `ClaudeProviderAdapter.getUsageReport()` dispatches `/usage` into the PTY, scrapes the rendered panel (`cleanUsagePanel`), then presses Esc and waits for the ready marker to confirm the panel dismissed so the session can't get stuck. The bot's `/usage` appends the session context-token line. `/context` and `/stats` keep the token snapshot. VERIFY LIVE: exact panel wording/format on Claude 2.1.197 — `cleanUsagePanel` is generic (strips chrome, dedupes) and may need tuning once the real panel text is seen.
+- Narration idle-flush: a held narration line now flushes after `NARRATION_IDLE_FLUSH_MS` (1500ms) instead of waiting for Claude's next block, so the first "let me..." line appears promptly. Timer is cleared on turn end / tool / finally so the final-answer block is never idle-flushed as a progress line. `flushPendingClaudeAssistantProgress` now clears pending synchronously before the async send so the idle timer and next-delta flush can't double-deliver.
+- Removed dead write-only `deliveredAssistantProgressText`.
+
+### Deliberately NOT done (Anthony undecided)
+- Codex replaces its rolling progress message with a "completed" state when the turn ends; Claude leaves the "Progress:" block parked above the final answer. Anthony is aware and unsure he wants the replacement, so it's left as-is. Trivial to add later either way.
+
+### Remaining worklist (roughly prioritized)
+1. Commands still to integrate:
+   - Emulate stubs returning "not supported over Telegram yet": `/fork`, `/branch`, `/rewind`, `/background`(`/bg`). Decide real behavior (fork/branch = new session from current; rewind = transcript truncation; background = move to background lane) or mark NA.
+   - Interactive TUI menu commands (`/agents`, `/mcp`, `/permissions`, `/config`, bare `/model`, bare `/resume`) only return current value / hint. No inline-button navigation (the Phase 2 fast-follow).
+   - `/resume <target>` explicit is stubbed.
+   - Command table is a static June-17 snapshot; anything Claude 2.1.197 added falls through to "not classified yet" (safe, not handled). Refresh against the live list.
+2. Smoothness/quality:
+   - Edit-mode leftover progress message (see above, pending Anthony's call).
+   - Edit-mode edge: if the final answer block is immediately followed by a tool, the answer can end up only as the last rolling-window bullet and not a clean final message. Rare; consider delivering the final answer even when `finalAssistantBlock` was consumed.
+   - F3 `/model`: verify the switch from the transcript model field rather than a screen marker.
+   - 180s idle timeout could kill a long, silent tool run; consider a longer cap.
+   - Live stdout/stderr logging (see ops gap above).
+3. Live verification backlog: F8 rolling window (edit), F1 dispatch-command matrix, F3 model switch, F5 mid-turn abort, F9 `/usage` panel format.
+
+2026-07-01 follow-up after first F9 restart: Anthony hit `Claude did not reach a ready prompt` on resume. This was a startup readiness problem before any prompt/transcript tailing began. The failure message was too opaque, so startup now includes the PTY screen tail in that error. Resume startup also waits 90s instead of 30s, because the active session is now large, and ready detection accepts footer variants such as `bypass permissions on`, `accept edits on`, `esc to interrupt`, and `← for agents`, not only `shift+tab` / `? for shortcuts`.
+
 ## Deferred Work
 
 - Full interactive menu navigation for Claude TUI commands.

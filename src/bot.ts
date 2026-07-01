@@ -82,6 +82,9 @@ const FIRST_INTERMEDIATE_UPDATE_MS = 2500;
 const INTERMEDIATE_UPDATE_MIN_MS = 30000;
 const SUMMARY_PROGRESS_UPDATE_MIN_MS = 30000;
 const SUMMARY_PROGRESS_RECENT_LIMIT = 5;
+// A held Claude narration line is flushed after this idle gap so the first line does not
+// wait for Claude's next block. Long enough that a normal turn ends (clearing it) first.
+const NARRATION_IDLE_FLUSH_MS = 1500;
 const BACKGROUND_NOTICE_PREVIEW_LIMIT = 700;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
@@ -1976,7 +1979,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     // answer not yet delivered, so it becomes the final delivery instead of re-posting the
     // whole answer on top of the narration.
     let finalAssistantBlock = "";
-    let deliveredAssistantProgressText = "";
     let progressMessageId: number | undefined;
     // Rolling window of recent Claude narration lines, mirroring the Codex progress buffer.
     const recentClaudeProgress: string[] = [];
@@ -2049,15 +2051,37 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         }
       }
       sentAssistantProgress = true;
-      deliveredAssistantProgressText += trimmed;
+    };
+
+    let narrationIdleTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearNarrationIdleTimer = (): void => {
+      if (narrationIdleTimer) {
+        clearTimeout(narrationIdleTimer);
+        narrationIdleTimer = undefined;
+      }
     };
 
     const flushPendingClaudeAssistantProgress = async (): Promise<void> => {
-      if (!pendingAssistantProgressText.trim()) {
+      const pending = pendingAssistantProgressText;
+      if (!pending.trim()) {
         return;
       }
-      await deliverClaudeAssistantProgress(pendingAssistantProgressText);
+      // Clear synchronously before the async send so the idle timer and the next-delta flush
+      // can never deliver the same block twice.
       pendingAssistantProgressText = "";
+      clearNarrationIdleTimer();
+      await deliverClaudeAssistantProgress(pending);
+    };
+
+    // A held narration line would otherwise wait for Claude's next block before appearing.
+    // Flush it after a short idle so the first "let me..." line reaches Telegram promptly.
+    // The timer is cleared at turn end, so the final answer block is never flushed this way.
+    const scheduleNarrationIdleFlush = (): void => {
+      clearNarrationIdleTimer();
+      narrationIdleTimer = setTimeout(() => {
+        narrationIdleTimer = undefined;
+        void flushPendingClaudeAssistantProgress().catch(() => {});
+      }, NARRATION_IDLE_FLUSH_MS);
     };
 
     try {
@@ -2096,9 +2120,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             }
             pendingAssistantProgressText = event.text;
             streamedText += event.text;
+            scheduleNarrationIdleFlush();
             break;
           }
           case "assistant_message_complete":
+            clearNarrationIdleTimer();
             finalText = event.text.trim() || streamedText.trim() || pendingAssistantProgressText.trim();
             finalAssistantBlock = pendingAssistantProgressText;
             pendingAssistantProgressText = "";
@@ -2213,6 +2239,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       await clearReaction(ctx);
     } finally {
       clearInterval(typingInterval);
+      clearNarrationIdleTimer();
       if (agentJobId) {
         finishAgentJob(agentJobId, completedSuccessfully ? "completed" : "failed");
       }
@@ -2428,7 +2455,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     commandName: string,
     messageThreadId?: number,
   ): Promise<void> => {
-    if (["usage", "context", "cost", "stats"].includes(commandName)) {
+    if (commandName === "usage" || commandName === "cost") {
+      await sendClaudeUsageReport(ctx, contextKey, messageThreadId);
+      return;
+    }
+
+    if (["context", "stats"].includes(commandName)) {
       await sendClaudeUsage(ctx, contextKey, messageThreadId);
       return;
     }
@@ -2645,6 +2677,49 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             `Permission mode: ${config.claudePermissionMode}`,
           ].join("\n");
     await safeReply(ctx, formatTelegramHTML(lines), { fallbackText: lines, messageThreadId });
+  };
+
+  const sendClaudeUsageReport = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    if (!claudeAdapter) {
+      const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+    if (isBusy(contextKey)) {
+      const message = "Cannot read Claude usage while a prompt is running. Try again once it finishes.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    await safeReply(ctx, escapeHTML("Reading Claude usage limits..."), {
+      fallbackText: "Reading Claude usage limits...",
+      messageThreadId,
+    });
+
+    try {
+      const descriptor = await ensureClaudeSession(contextKey);
+      const report = await claudeAdapter.getUsageReport(descriptor.id);
+      const context = await claudeAdapter.getContext(descriptor.id);
+      const used = Number(context.usedTokens ?? 0);
+      const window = Number(context.contextWindow ?? config.claudeContextWindow);
+      const percent = window > 0 ? Math.round((used / window) * 100) : 0;
+      const sections = [
+        report ?? "Could not read the Claude usage panel this time. Try again in a moment.",
+        `Session context: ${used} of ${window} tokens (${percent}%).`,
+      ];
+      const plain = sections.join("\n\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+    } catch (error) {
+      const message = `Failed to read Claude usage: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: message,
+        messageThreadId,
+      });
+    }
   };
 
   const sendClaudeUsage = async (
