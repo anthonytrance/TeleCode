@@ -309,6 +309,17 @@ export function projectClaudeTranscriptEntry(
   const entryType = asString(entry.type);
   if (entryType === "assistant") {
     const message = asObject(entry.message);
+    if (entry.isApiErrorMessage === true || entry.error) {
+      const errorText = extractAssistantText(message) || asString(entry.error) || "Claude API error";
+      events.push({
+        type: "error",
+        sessionId: options.sessionId,
+        jobId: options.jobId,
+        message: errorText,
+        cause: entry.error,
+      });
+      return { events, assistantText, turnEnded, compactBoundary, usage };
+    }
     const content = asArray(message?.content);
     for (const block of content) {
       const blockObject = asObject(block);
@@ -617,6 +628,20 @@ function extractUserText(entry: JsonObject): string {
     }
   }
   return parts.join("\n").trim();
+}
+
+function extractAssistantText(message: JsonObject | undefined): string {
+  const parts: string[] = [];
+  for (const block of asArray(message?.content)) {
+    const blockObject = asObject(block);
+    if (asString(blockObject?.type) === "text") {
+      const text = asString(blockObject?.text);
+      if (text) {
+        parts.push(text);
+      }
+    }
+  }
+  return parts.join("");
 }
 
 async function transcriptPromptRecoveryCandidates(options: {

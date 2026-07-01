@@ -45,6 +45,30 @@ describe("Claude transcript projection", () => {
     ]);
   });
 
+  it("maps Claude API error assistant entries to error events", () => {
+    const projection = projectClaudeTranscriptEntry({
+      type: "assistant",
+      isApiErrorMessage: true,
+      error: "rate_limit",
+      message: {
+        content: [
+          { type: "text", text: "Claude Fable 5 is currently unavailable." },
+        ],
+      },
+    }, { sessionId: "s1", jobId: "j1" });
+
+    expect(projection.assistantText).toBe("");
+    expect(projection.events).toMatchObject([
+      {
+        type: "error",
+        sessionId: "s1",
+        jobId: "j1",
+        message: "Claude Fable 5 is currently unavailable.",
+        cause: "rate_limit",
+      },
+    ]);
+  });
+
   it("ignores meta command echoes", () => {
     const projection = projectClaudeTranscriptEntry({
       type: "user",
