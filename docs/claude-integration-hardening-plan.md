@@ -221,6 +221,8 @@ Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no er
 
 2026-07-01 follow-up after repeated `Claude did not record the prompt` with screen tail `Compacting conversation`: ready detection still accepted footer text while Claude was actively compacting. `esc to interrupt` is now a BUSY marker, not a ready marker, and post-menu waits use `waitForReadyPrompt`, which requires the newest ready marker to appear after the newest busy marker before TeleCodex may send a prompt. Large-session resume also emits Telegram status messages when Claude starts summary/full resume and when it reaches a ready prompt again, so the user is not left with silence during compaction.
 
+2026-07-01 correction: the marker-order check was still too weak because Claude can redraw a normal footer under the active `Compacting conversation` screen, making the footer newer than the busy text in the raw PTY stream. `waitForReadyPrompt` now tracks newly received PTY output: every new compaction/interruption chunk resets readiness, and a ready marker only counts after a later clean ready chunk plus a quiet period. Added `test/claude-pty.test.ts` to cover this exact failure mode.
+
 ## Deferred Work
 
 - Full interactive menu navigation for Claude TUI commands.

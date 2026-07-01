@@ -68,7 +68,7 @@ export class ClaudePty extends EventEmitter {
   }
 
   strippedText(): string {
-    return this.rawBuffer.replace(ANSI_PATTERN, "");
+    return stripAnsi(this.rawBuffer);
   }
 
   clearBuffer(): void {
@@ -91,12 +91,37 @@ export class ClaudePty extends EventEmitter {
 
   async waitForReadyPrompt(timeoutMs: number): Promise<string | null> {
     const deadline = Date.now() + timeoutMs;
+    const busyQuietMs = 2500;
+    let previousRawLength = this.rawBuffer.length;
+    let lastBusyAt = 0;
+    let readyAfterBusy: { source: string; at: number } | null = null;
+
     while (Date.now() <= deadline) {
-      const compact = this.strippedText().slice(-4000).replace(/\s+/g, "").toLowerCase();
-      const ready = lastMatchingMarker(CLAUDE_READY_MARKERS, compact);
-      const busy = lastMatchingMarker(CLAUDE_BUSY_MARKERS, compact);
-      if (ready && (!busy || ready.index > busy.index)) {
-        return ready.source;
+      const now = Date.now();
+      const raw = this.rawBuffer;
+      const rawDelta = raw.length >= previousRawLength
+        ? raw.slice(previousRawLength)
+        : raw;
+      previousRawLength = raw.length;
+
+      const compactDelta = stripAnsi(rawDelta).replace(/\s+/g, "").toLowerCase();
+      const newBusy = lastMatchingMarker(CLAUDE_BUSY_MARKERS, compactDelta);
+      const newReady = lastMatchingMarker(CLAUDE_READY_MARKERS, compactDelta);
+      if (newBusy) {
+        lastBusyAt = now;
+        readyAfterBusy = null;
+      } else if (newReady) {
+        readyAfterBusy = { source: newReady.source, at: now };
+      }
+
+      const compactTail = this.strippedText().slice(-4000).replace(/\s+/g, "").toLowerCase();
+      const tailBusy = lastMatchingMarker(CLAUDE_BUSY_MARKERS, compactTail);
+      const tailReady = lastMatchingMarker(CLAUDE_READY_MARKERS, compactTail);
+      if (!lastBusyAt && tailReady && !tailBusy) {
+        return tailReady.source;
+      }
+      if (readyAfterBusy && now - lastBusyAt >= busyQuietMs) {
+        return readyAfterBusy.source;
       }
       await sleep(250);
     }
@@ -202,6 +227,10 @@ export const CLAUDE_READY_MARKERS = [
   /foragents/,
 ];
 export const CLAUDE_BUSY_MARKERS = [/compactingconversation/, /esc(?:to)?interrupt/];
+
+function stripAnsi(text: string): string {
+  return text.replace(ANSI_PATTERN, "");
+}
 
 function lastMatchingMarker(patterns: RegExp[], text: string): { source: string; index: number } | null {
   let latest: { source: string; index: number } | null = null;
