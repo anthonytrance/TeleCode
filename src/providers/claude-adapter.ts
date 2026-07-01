@@ -101,7 +101,13 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     });
     const runtime = this.runtimeFromDescriptor(descriptor);
     this.sessions.set(descriptor.id, runtime);
-    await this.ensurePty(runtime, "new", onStartupStatus);
+    try {
+      await this.ensurePty(runtime, "new", onStartupStatus);
+    } catch (error) {
+      this.sessions.delete(descriptor.id);
+      await this.stopRuntimePty(runtime, { graceful: false }).catch(() => {});
+      throw error;
+    }
     return { ...descriptor };
   }
 
@@ -112,7 +118,13 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     this.validateEnabled();
     const runtime = this.runtimeFromDescriptor(session);
     this.sessions.set(session.id, runtime);
-    await this.ensurePty(runtime, "resume", onStartupStatus);
+    try {
+      await this.ensurePty(runtime, "resume", onStartupStatus);
+    } catch (error) {
+      this.sessions.delete(session.id);
+      await this.stopRuntimePty(runtime, { graceful: false }).catch(() => {});
+      throw error;
+    }
     return { ...runtime.descriptor };
   }
 
@@ -520,15 +532,6 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           ? "Claude full-session resume finished. Sending your prompt now."
           : "Claude summary compaction finished. Sending your prompt now.",
       );
-    }
-
-    const startupModelFailure = shouldPassClaudeModel(runtime.model)
-      ? extractModelCommandFailure(ptySession.strippedText())
-      : undefined;
-    if (startupModelFailure) {
-      await ptySession.dispose(false);
-      this.removeRegisteredProcessSession(runtime.descriptor.id);
-      throw new Error(`Claude model startup failed: ${startupModelFailure}`);
     }
 
     ptySession.on("exit", () => {

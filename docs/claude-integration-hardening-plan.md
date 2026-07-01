@@ -227,6 +227,8 @@ Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no er
 
 2026-07-01 transcript follow-up: Claude can write unavailable-model failures as synthetic assistant entries with `isApiErrorMessage: true` and `error: "rate_limit"` rather than ordinary CLI stderr. `projectClaudeTranscriptEntry` now maps those entries to provider `error` events so TeleCodex reports the failure path instead of treating it like a normal assistant answer.
 
+2026-07-01 regression fix: the first model-failure hardening scanned the whole startup screen for unavailable-model text. That is unsafe on resumed Claude sessions because the screen can contain historical transcript text from an earlier failed `/model fable` command, so later Sonnet/default resumes were incorrectly killed. Removed the startup-screen failure scan, cleaned failed adapter runtimes on create/resume failure, and restored Telegram `/model <alias>` to Claude Code's in-session `/model` command path.
+
 ## Deferred Work
 
 - Full interactive menu navigation for Claude TUI commands.

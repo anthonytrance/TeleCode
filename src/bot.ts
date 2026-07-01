@@ -5107,17 +5107,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
       registry.setActiveProvider(rawContextKey, "claude");
-      try {
-        const descriptor = await createFreshClaudeSession(rawContextKey, { model: requestedModel });
-        const message = [
-          `Claude model set to ${String(descriptor.metadata?.model ?? requestedModel)}.`,
-          "Started a fresh Claude session because Claude model changes apply when the process is spawned.",
-        ].join("\n");
-        await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
-      } catch (error) {
-        const message = `Claude model change failed: ${friendlyErrorText(error)}`;
-        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
-      }
+      startClaudePrompt(ctx, rawContextKey, chatId, `/model ${requestedModel}`);
       return;
     }
 
