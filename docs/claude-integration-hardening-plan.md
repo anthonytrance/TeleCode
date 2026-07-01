@@ -149,6 +149,7 @@ Fix:
 - Propagate it through the Claude descriptor metadata.
 - Restore it into the adapter runtime on resume, so the next turn starts with the exact known transcript file instead of relying only on rediscovery.
 - Added a regression test for the related `\r/exit` input shape, confirming embedded Claude commands separated by carriage returns are rejected before paste just like newline-separated commands.
+- Follow-up diagnosis: Anthony did not intentionally embed `/exit`. The likely injector was TeleCodex cleanup itself: `stopRuntimePty` used graceful dispose, and graceful dispose writes `/exit` then Enter. If Claude still has the prompt sitting in the input box after transcript-location failure, that cleanup can append `/exit` to Anthony's prompt and submit it. Fix: transcript-location failure paths now hard-dispose the PTY with `graceful: false`; explicit user `/exit` can still use graceful disposal.
 
 Verification: `npm run build` clean; `npm test` clean with 32 files and 320 tests. Remaining live check: after restart, send a normal multi-step Claude prompt and verify it resumes the known transcript, rejects embedded `/exit` lines, and shows F8's rolling edit-mode narration.
 

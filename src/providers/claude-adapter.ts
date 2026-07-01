@@ -455,7 +455,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
   }
 
-  private async stopRuntimePty(runtime: RuntimeSession): Promise<void> {
+  private async stopRuntimePty(runtime: RuntimeSession, options: { graceful?: boolean } = {}): Promise<void> {
     const ptySession = runtime.pty;
     if (!ptySession) {
       return;
@@ -463,7 +463,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     const pid = runtime.ptyPid;
     runtime.pty = undefined;
     runtime.ptyPid = undefined;
-    await ptySession.dispose(true);
+    await ptySession.dispose(options.graceful ?? true);
     if (pid) {
       this.removeRegisteredProcessPid(pid);
     } else {
@@ -541,7 +541,10 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         }
 
         const tail = screenTail(runtime.pty);
-        await this.stopRuntimePty(runtime);
+        // Do not type /exit here. On prompt-location failure Claude may still have the
+        // user's prompt sitting in the input box; graceful /exit would append to it and
+        // can submit a corrupted prompt.
+        await this.stopRuntimePty(runtime, { graceful: false });
         throw new Error(`Claude did not record the prompt in its transcript. Screen tail: ${tail}`);
       }
 
@@ -555,7 +558,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         return { fallbackText: "Claude handled the command. It did not produce a transcript response to read back." };
       }
       const tail = screenTail(runtime.pty);
-      await this.stopRuntimePty(runtime);
+      // Same as above: if no transcript turn was found, avoid writing /exit into a
+      // potentially live input buffer.
+      await this.stopRuntimePty(runtime, { graceful: false });
       throw new Error(`Claude transcript was not created. Screen tail: ${tail}`);
     }
 
