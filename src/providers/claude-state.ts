@@ -8,6 +8,7 @@ import { parseJsonFileText } from "../json.js";
 export interface ClaudeSessionStateRecord {
   telegramContextKey: TelegramContextKey;
   sessionId: string;
+  transcriptPath?: string;
   workspace: string;
   displayName?: string;
   model: string;

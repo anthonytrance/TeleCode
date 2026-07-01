@@ -488,6 +488,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     metadata: {
       model: record.model,
       permissionMode: record.permissionMode,
+      transcriptPath: record.transcriptPath,
     },
   });
 
@@ -510,6 +511,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       displayName: descriptor.displayName,
       model: String(descriptor.metadata?.model ?? config.claudeDefaultModel),
       permissionMode: asClaudePermissionMode(descriptor.metadata?.permissionMode) ?? config.claudePermissionMode,
+      transcriptPath: typeof descriptor.metadata?.transcriptPath === "string"
+        ? descriptor.metadata.transcriptPath
+        : undefined,
       createdAt: descriptor.createdAt,
       lastUsedAt: Date.now(),
     });
@@ -1974,7 +1978,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     let finalAssistantBlock = "";
     let deliveredAssistantProgressText = "";
     let progressMessageId: number | undefined;
-    let lastProgressEdit = 0;
+    // Rolling window of recent Claude narration lines, mirroring the Codex progress buffer.
+    const recentClaudeProgress: string[] = [];
     let descriptor: AgentSessionDescriptor | undefined;
     let agentJobId: string | undefined;
     let completedSuccessfully = false;
@@ -1995,9 +2000,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       });
     };
 
-    const deliverClaudeAssistantProgress = async (progressText: string, options: { force?: boolean } = {}): Promise<void> => {
+    // Deliver one Claude narration line, matching the Codex progress pipeline so both
+    // providers behave identically. In `edit` mode a single message is kept and edited in
+    // place, showing the rolling last-N narration lines (oldest rolls off). In `messages`
+    // mode each line is its own message. `none` suppresses narration entirely.
+    const deliverClaudeAssistantProgress = async (progressText: string): Promise<void> => {
       const trimmed = progressText.trim();
-      if (!trimmed || (!options.force && registry.getProgressDelivery(contextKey) !== "messages")) {
+      if (!trimmed) {
+        return;
+      }
+      const mode = registry.getProgressDelivery(contextKey);
+      if (mode === "none") {
         return;
       }
 
@@ -2006,55 +2019,45 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
 
-      for (const chunk of splitMarkdownForTelegram(trimmed)) {
-        await sendTextMessage(ctx.api, chatId, chunk.text, {
-          parseMode: chunk.parseMode,
-          fallbackText: chunk.fallbackText,
-          messageThreadId,
-        });
+      recentClaudeProgress.push(trimmed);
+      if (recentClaudeProgress.length > SUMMARY_PROGRESS_RECENT_LIMIT) {
+        recentClaudeProgress.splice(0, recentClaudeProgress.length - SUMMARY_PROGRESS_RECENT_LIMIT);
+      }
+
+      if (mode === "edit") {
+        const rendered = renderAssistantProgressMessage(recentClaudeProgress);
+        if (!progressMessageId) {
+          const message = await sendTextMessage(ctx.api, chatId, rendered.text, {
+            parseMode: rendered.parseMode,
+            fallbackText: rendered.fallbackText,
+            messageThreadId,
+          });
+          progressMessageId = message.message_id;
+        } else {
+          await safeEditMessage(bot, chatId, progressMessageId, rendered.text, {
+            parseMode: rendered.parseMode,
+            fallbackText: rendered.fallbackText,
+          }).catch(() => {});
+        }
+      } else {
+        for (const chunk of splitMarkdownForTelegram(trimmed)) {
+          await sendTextMessage(ctx.api, chatId, chunk.text, {
+            parseMode: chunk.parseMode,
+            fallbackText: chunk.fallbackText,
+            messageThreadId,
+          });
+        }
       }
       sentAssistantProgress = true;
       deliveredAssistantProgressText += trimmed;
     };
 
-    const flushPendingClaudeAssistantProgress = async (options: { force?: boolean } = {}): Promise<void> => {
+    const flushPendingClaudeAssistantProgress = async (): Promise<void> => {
       if (!pendingAssistantProgressText.trim()) {
         return;
       }
-      await deliverClaudeAssistantProgress(pendingAssistantProgressText, options);
+      await deliverClaudeAssistantProgress(pendingAssistantProgressText);
       pendingAssistantProgressText = "";
-    };
-
-    const maybeUpdateStreamingProgress = async (): Promise<void> => {
-      if (!config.streamAssistantText || registry.getProgressDelivery(contextKey) !== "edit") {
-        return;
-      }
-      const now = Date.now();
-      if (now - lastProgressEdit < EDIT_DEBOUNCE_MS) {
-        return;
-      }
-      if (!isProviderForeground(contextKey, "claude")) {
-        return;
-      }
-      lastProgressEdit = now;
-      const preview = streamedText.trim().slice(-STREAMING_PREVIEW_LIMIT);
-      if (!preview) {
-        return;
-      }
-      const rendered = formatMarkdownMessage(preview);
-      if (!progressMessageId) {
-        const message = await sendTextMessage(ctx.api, chatId, rendered.text, {
-          parseMode: rendered.parseMode,
-          fallbackText: rendered.fallbackText,
-          messageThreadId,
-        });
-        progressMessageId = message.message_id;
-        return;
-      }
-      await safeEditMessage(bot, chatId, progressMessageId, rendered.text, {
-        parseMode: rendered.parseMode,
-        fallbackText: rendered.fallbackText,
-      }).catch(() => {});
     };
 
     try {
@@ -2083,14 +2086,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         input: { text },
       })) {
         switch (event.type) {
-          case "assistant_text_delta":
-            if (registry.getProgressDelivery(contextKey) === "messages" && pendingAssistantProgressText.trim()) {
+          case "assistant_text_delta": {
+            // Each delta is a complete narration block. Flush the previously held block as
+            // progress (edit or messages) and hold this one; the last held block becomes the
+            // final answer rather than a progress line, so the answer is never posted twice.
+            const progressMode = registry.getProgressDelivery(contextKey);
+            if ((progressMode === "messages" || progressMode === "edit") && pendingAssistantProgressText.trim()) {
               await flushPendingClaudeAssistantProgress();
             }
             pendingAssistantProgressText = event.text;
             streamedText += event.text;
-            await maybeUpdateStreamingProgress();
             break;
+          }
           case "assistant_message_complete":
             finalText = event.text.trim() || streamedText.trim() || pendingAssistantProgressText.trim();
             finalAssistantBlock = pendingAssistantProgressText;
@@ -2104,7 +2111,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             persistClaudeSession(contextKey, descriptor);
             break;
           case "tool_started":
-            await flushPendingClaudeAssistantProgress({ force: true });
+            await flushPendingClaudeAssistantProgress();
             if (registry.getProgressDelivery(contextKey) !== "none" && config.toolVerbosity === "all") {
               const line = event.text ? `Claude started ${event.toolName}: ${event.text}` : `Claude started ${event.toolName}`;
               if (isProviderForeground(contextKey, "claude")) {

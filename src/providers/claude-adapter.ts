@@ -177,7 +177,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         return;
       }
 
-      const tailer = new TranscriptTailer(output.transcriptPath, { startOffset: output.startOffset });
+      const tailer = new TranscriptTailer(output.transcriptPath, {
+        startOffset: output.startOffset,
+        // Poll faster than the 750ms default so narration lines reach Telegram promptly.
+        pollIntervalMs: 300,
+      });
       let partialAssistantText = "";
       for await (const event of tailer.eventsUntilTurnEnd({
         sessionId: runtime.descriptor.id,
@@ -563,6 +567,10 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     active: { path: string; startOffset: number },
   ): { transcriptPath: string; startOffset: number } {
     runtime.transcriptPath = active.path;
+    runtime.descriptor.metadata = {
+      ...runtime.descriptor.metadata,
+      transcriptPath: active.path,
+    };
     const realSessionId = sessionIdFromTranscriptPath(active.path);
     if (realSessionId && realSessionId !== runtime.providerSessionId) {
       runtime.providerSessionId = realSessionId;
@@ -611,6 +619,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       model: asString(descriptor.metadata?.model) || this.config.claudeDefaultModel,
       permissionMode: asPermissionMode(descriptor.metadata?.permissionMode) || this.config.claudePermissionMode,
       busy: false,
+      transcriptPath: asString(descriptor.metadata?.transcriptPath) || undefined,
     };
   }
 

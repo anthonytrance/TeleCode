@@ -272,6 +272,17 @@ describe("Claude bot flow", () => {
     );
   });
 
+  it("rejects embedded slash commands separated by carriage returns", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "please answer this\r/exit"));
+
+    await waitFor(() => sent.some((entry) => entry.text?.includes("contains /exit on its own line")));
+
+    expect(mockClaude.prompts).toEqual([]);
+  });
+
   it("does not resume a persisted Claude session with stale permission mode", async () => {
     const staleSessionId = "11111111-1111-4111-8111-111111111111";
     const providerStateDir = path.join(tempDir, ".telecodex", "provider-state");

@@ -128,6 +128,30 @@ Fixes for F1–F7 were written the same day. `npm run build` clean; `npm test` g
 
 REMAINING VERIFY (do live before trusting): F1 needs a per-command matrix (which DISPATCH commands actually stream a readable turn vs. return the benign no-transcript message); F3 needs a real model switch on the installed Claude build; F5 needs a real mid-turn `/abort`.
 
+### F8 — Claude narration now matches Codex in both edit and messages modes (2026-07-01, built + unit-tested, NOT yet live)
+
+Diagnosis (corrected after two wrong guesses): the progress-delivery setting IS unified per Telegram context and Anthony's is `edit` (confirmed live from `codetest/.telecodex/contexts.json`, mtime today, `activeProvider=claude`; the `home/.telecodex/contexts.json` is a stale May-17 file, not in use — there is NO workspace regression). The real defect: Claude never used Codex's narration pipeline. Codex renders the rolling last-5 narration lines into ONE edited message in `edit` mode via `renderAssistantProgressMessage` + a `recentProgress` buffer. Claude had its own path that only delivered in `messages` mode, gated its `edit` path behind `STREAM_ASSISTANT_TEXT` (off), and otherwise only leaked narration as accidental separate messages when a following tool call force-flushed the held block — which also made the first line arrive late.
+
+Fix (`src/bot.ts` `handleClaudePrompt`, `src/providers/claude-adapter.ts`):
+- Claude narration now flows through the same shared renderer. `edit` mode keeps ONE message and edits it in place with the rolling last-`SUMMARY_PROGRESS_RECENT_LIMIT` (5) lines; `messages` mode sends each line as its own message. `none` suppresses. The held last block is still delivered as the final answer (not as a progress line), so no duplication.
+- Interim blocks now flush on the next block in BOTH edit and messages modes (previously edit-mode blocks were overwritten and lost).
+- Removed the dead `maybeUpdateStreamingProgress`/`STREAM_ASSISTANT_TEXT` Claude preview path.
+- Dropped the transcript tailer poll interval to 300ms (from 750ms) so lines reach Telegram faster.
+
+Not covered by a unit test yet: the edit-mode rolling-window rendering. Adding it means making the shared Claude test mock yield a configurable multi-block event sequence; deferred to avoid destabilizing the 11 existing bot-flow tests. Verify live: with progress=`edit`, a multi-step Claude turn should show ONE message that accumulates the last 5 narration lines and rolls the oldest off, then a separate final answer; with progress=`messages`, each narration line is its own message.
+
+### F9 — Restart resume now persists Claude's exact transcript path (2026-07-01, built + unit-tested, NOT yet live)
+
+Observed after the F8 restart: TeleCodex restarted cleanly and resumed the saved Claude session id, but the next Claude turn failed with `Claude did not record the prompt in its transcript`. The latest transcript did in fact contain Anthony's prompt as the final user entry, and the live log showed the bridge killed the Claude PTY after failing to locate that echo. The saved Claude state only stored `sessionId`; after a restart the adapter had to rediscover the transcript path by scanning, which is an avoidable fragile step in the exact failure path.
+
+Fix:
+- Persist `transcriptPath` in `.telecodex/provider-state/claude.json`.
+- Propagate it through the Claude descriptor metadata.
+- Restore it into the adapter runtime on resume, so the next turn starts with the exact known transcript file instead of relying only on rediscovery.
+- Added a regression test for the related `\r/exit` input shape, confirming embedded Claude commands separated by carriage returns are rejected before paste just like newline-separated commands.
+
+Verification: `npm run build` clean; `npm test` clean with 32 files and 320 tests. Remaining live check: after restart, send a normal multi-step Claude prompt and verify it resumes the known transcript, rejects embedded `/exit` lines, and shows F8's rolling edit-mode narration.
+
 ### F1 (HIGH, VERIFY) — DISPATCH slash commands can time out and KILL the Claude PTY
 - Where: `src/providers/claude-adapter.ts` `sendPrompt` sends every non-`/model` prompt through `locateTurnTranscript(..., { requirePromptEcho: true })` (lines ~146-151). On failure it throws AND calls `stopRuntimePty` (lines ~520-522), disposing the Claude process.
 - Problem: DISPATCH commands (`/diff`, `/memory`, `/init`, `/recap`, `/pr-comments`, `/review`, `/security-review`, etc.) are typed into the PTY as if they were prompts, then TeleCodex waits for the exact command text to reappear as a `user` transcript entry. But Claude Code records slash-command invocations as user entries that begin with `<command-name>` / `<command-message>` — the projector itself explicitly skips those (`src/providers/claude-transcript.ts` lines ~330-332). So `findLastPromptOffset` normalizes `/diff` and never matches `<command-name>/diff...`. After the 30s locate timeout plus recovery failure, the adapter throws and kills the PTY.
