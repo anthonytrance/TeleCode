@@ -122,6 +122,36 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
+  it("stops promptly when shouldStop returns true, emitting collected text without an idle wait", async () => {
+    const transcript = path.join(tempDir, "session.jsonl");
+    // No turn_duration line: the turn never ends on its own, so only shouldStop can end it.
+    writeFileSync(transcript, [
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "PARTIAL" }] } }),
+      "",
+    ].join("\n"), "utf8");
+
+    const tailer = new TranscriptTailer(transcript, { pollIntervalMs: 10 });
+    const events = [];
+    let stop = false;
+    for await (const event of tailer.eventsUntilTurnEnd({
+      sessionId: "s1",
+      jobId: "j1",
+      idleTimeoutMs: 60000,
+      shouldStop: () => stop,
+    })) {
+      events.push(event);
+      if (event.type === "assistant_text_delta") {
+        stop = true;
+      }
+    }
+
+    expect(events).toMatchObject([
+      { type: "assistant_text_delta", text: "PARTIAL" },
+      { type: "assistant_message_complete", text: "PARTIAL" },
+    ]);
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  });
+
   it("reads complete lines, tolerates a partial last line, and emits final text", async () => {
     const transcript = path.join(tempDir, "session.jsonl");
     writeFileSync(transcript, [

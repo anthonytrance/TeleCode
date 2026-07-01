@@ -1967,6 +1967,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     let streamedText = "";
     let pendingAssistantProgressText = "";
     let sentAssistantProgress = false;
+    // The last interim assistant block, still held (not yet streamed) when the turn ends.
+    // When narration was streamed as its own messages, this is the only piece of the final
+    // answer not yet delivered, so it becomes the final delivery instead of re-posting the
+    // whole answer on top of the narration.
+    let finalAssistantBlock = "";
     let deliveredAssistantProgressText = "";
     let progressMessageId: number | undefined;
     let lastProgressEdit = 0;
@@ -2088,6 +2093,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             break;
           case "assistant_message_complete":
             finalText = event.text.trim() || streamedText.trim() || pendingAssistantProgressText.trim();
+            finalAssistantBlock = pendingAssistantProgressText;
             pendingAssistantProgressText = "";
             break;
           case "session_title_changed":
@@ -2147,18 +2153,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
 
       finalText = finalText.trim() || (sentAssistantProgress ? "" : streamedText.trim());
-      const deliveredProgressTrimmed = deliveredAssistantProgressText.trim();
-      const finalTextAlreadyDelivered = Boolean(finalText.trim() && deliveredProgressTrimmed === finalText.trim());
-      let finalTextToDeliver = finalText;
-      if (!finalTextAlreadyDelivered && deliveredProgressTrimmed && finalText.trim().startsWith(deliveredProgressTrimmed)) {
-        finalTextToDeliver = finalText.trim().slice(deliveredProgressTrimmed.length).trim();
-      }
-      if (!finalText && !sentAssistantProgress) {
-        finalText = "Claude finished without text.";
-        finalTextToDeliver = finalText;
-      }
       if (finalText) {
         lastAssistantReply.set(contextKey, finalText);
+      }
+      // Decide what still needs delivering. When interim narration was streamed as its own
+      // messages, every block but the last was already sent; only the held final block
+      // remains, so deliver just that and never re-post the whole answer. Otherwise (edit
+      // or none delivery, or a single-block turn) deliver the full answer.
+      let finalTextToDeliver = sentAssistantProgress ? finalAssistantBlock.trim() : finalText;
+      if (!finalTextToDeliver && !sentAssistantProgress) {
+        finalText = "Claude finished without text.";
+        finalTextToDeliver = finalText;
       }
       const deliverClaudeFinal = async (outputText: string, header?: string): Promise<void> => {
         const textToSend = header ? `${header}\n\n${outputText}` : outputText;
@@ -2171,12 +2176,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         }
       };
 
-      if (isProviderForeground(contextKey, "claude")) {
-        if (finalTextToDeliver && !finalTextAlreadyDelivered) {
+      if (finalTextToDeliver) {
+        if (isProviderForeground(contextKey, "claude")) {
           await deliverClaudeFinal(finalTextToDeliver);
-        }
-      } else {
-        if (finalTextToDeliver && !finalTextAlreadyDelivered) {
+        } else {
           const label = descriptor?.displayName || descriptor?.providerSessionId?.slice(0, 8);
           const header = label
             ? `Claude Code finished in background: ${label}`
@@ -2527,7 +2530,57 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
-    const message = `/${commandName} is recognized for Claude, but the TeleCodex implementation is not complete yet. No action was taken.`;
+    if (commandName === "rename") {
+      const name = argument.trim();
+      if (!name) {
+        const message = "Usage: /rename <new title>";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+        return;
+      }
+      const descriptor = claudeSessions.get(contextKey);
+      if (!descriptor) {
+        const message = "No Claude session here yet. Send a message to Claude first, then rename it.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+        return;
+      }
+      const renamed = { ...descriptor, displayName: name };
+      claudeSessions.set(contextKey, renamed);
+      const selected = agentSessions.getSelectedSession(contextKey);
+      if (selected && selected.provider === "claude") {
+        agentSessions.updateDisplayName(selected.id, name);
+        persistAgentSessionState();
+      }
+      persistClaudeSession(contextKey, renamed);
+      const message = `Renamed this Claude session to: ${name}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    if (commandName === "export") {
+      const descriptor = claudeSessions.get(contextKey);
+      const persisted = claudeState?.get(contextKey);
+      const sessionId = descriptor?.providerSessionId ?? persisted?.sessionId;
+      if (!sessionId) {
+        const message = "No Claude session to export yet.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+        return;
+      }
+      const transcriptRoot = config.claudeStrictMcpConfig
+        ? path.join(homedir(), ".claude", "projects")
+        : path.join(config.claudeConfigDir, "projects");
+      const lines = [
+        "Claude session export:",
+        `Session UUID: ${sessionId}`,
+        `Workspace: ${descriptor?.workspace ?? persisted?.workspace ?? config.claudeWorkspace}`,
+        `Transcript directory: ${transcriptRoot}`,
+        "The full transcript JSONL lives under that directory, named <session-uuid>.jsonl.",
+      ];
+      const plain = lines.join("\n");
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+      return;
+    }
+
+    const message = `/${commandName} is recognized for Claude, but it is not supported over Telegram yet. No action was taken.`;
     await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
   };
 

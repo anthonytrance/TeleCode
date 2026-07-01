@@ -118,6 +118,12 @@ export async function locateActiveTranscript(options: {
   timeoutMs: number;
   configDir?: string;
   pollIntervalMs?: number;
+  /**
+   * When set, only transcripts inside this project directory are considered as fresh/grown
+   * candidates. Prevents grabbing another concurrent Claude process's transcript (e.g. a
+   * standalone terminal session) as this turn's output. The knownPath is always honoured.
+   */
+  projectDir?: string;
 }): Promise<ActiveTranscript | null> {
   const deadline = Date.now() + options.timeoutMs;
   const pollIntervalMs = options.pollIntervalMs ?? 400;
@@ -127,6 +133,9 @@ export async function locateActiveTranscript(options: {
     const fresh: string[] = [];
     const grown: Array<{ path: string; startOffset: number }> = [];
     for (const [candidate, size] of now) {
+      if (!isInProjectDir(candidate, options.projectDir)) {
+        continue;
+      }
       const priorSize = before.get(candidate);
       if (priorSize === undefined) {
         fresh.push(candidate);
@@ -174,6 +183,8 @@ export async function locateActiveTranscriptTurnByPrompt(options: {
   timeoutMs: number;
   configDir?: string;
   pollIntervalMs?: number;
+  /** See locateActiveTranscript: restrict fresh/grown candidates to this project dir. */
+  projectDir?: string;
 }): Promise<ActiveTranscript | null> {
   const deadline = Date.now() + options.timeoutMs;
   const pollIntervalMs = options.pollIntervalMs ?? 400;
@@ -191,6 +202,9 @@ export async function locateActiveTranscriptTurnByPrompt(options: {
     }
 
     for (const [candidate, size] of now) {
+      if (!isInProjectDir(candidate, options.projectDir)) {
+        continue;
+      }
       const priorSize = before.get(candidate);
       if (priorSize === undefined) {
         candidates.push({
@@ -251,6 +265,18 @@ export async function locateTranscriptTurnByPrompt(options: {
 
 export function sessionIdFromTranscriptPath(transcriptPath: string): string {
   return path.basename(transcriptPath, ".jsonl");
+}
+
+/**
+ * True when a candidate transcript lives in the given project directory. When no
+ * projectDir is supplied (e.g. the very first turn, before we know Claude's real
+ * transcript path), every candidate is allowed so discovery still works.
+ */
+function isInProjectDir(candidatePath: string, projectDir?: string): boolean {
+  if (!projectDir) {
+    return true;
+  }
+  return path.resolve(path.dirname(candidatePath)) === path.resolve(projectDir);
 }
 
 async function newestPath(paths: string[]): Promise<string> {
@@ -403,12 +429,29 @@ export class TranscriptTailer {
     sessionId: string;
     jobId: string;
     idleTimeoutMs: number;
+    /**
+     * Optional cancellation check. Polled each loop; when it returns true the tailer
+     * stops promptly (within one poll interval) instead of waiting out the idle timeout.
+     * Used by /abort so an interrupted turn does not stall the session for minutes.
+     */
+    shouldStop?: () => boolean;
   }): AsyncIterable<AgentProviderEvent> {
     let collectedText = "";
     let lastBytesAt = Date.now();
     let lastUsage: ClaudeUsageSnapshot | undefined;
 
     while (true) {
+      if (options.shouldStop?.()) {
+        if (collectedText.trim()) {
+          yield {
+            type: "assistant_message_complete",
+            sessionId: options.sessionId,
+            jobId: options.jobId,
+            text: collectedText,
+          };
+        }
+        return;
+      }
       const projections = await this.readNewProjections(options.sessionId, options.jobId);
       if (projections.length > 0) {
         lastBytesAt = Date.now();

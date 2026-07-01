@@ -43,7 +43,7 @@ Where it comes from: the transcript has multiple `assistant` entries per turn (o
 
 ### Verbosity model (shared `PROGRESS_DELIVERY` / `TOOL_VERBOSITY`, settable via command)
 
-Define ordered levels, per context, changeable live with a command (`/verbosity <level>` plus the existing `/quiet` style aliases):
+NOTE (2026-07-01): as built, delivery is driven by `PROGRESS_DELIVERY` (`none` / `messages` / `edit`) plus `TOOL_VERBOSITY`, not by the named levels below. A `/verbosity <level>` command mapping onto the levels below is NOT yet implemented; either implement it or treat the ordered levels as the target design. Define ordered levels, per context, changeable live with a command (`/verbosity <level>` plus the existing `/quiet` style aliases):
 
 - `silent` — final assistant message only (today's plugin behaviour). The floor, never the default.
 - `summary` — final message + a short collapsed digest of interim narration (e.g. one combined block per turn). For people who want signal without spam.
@@ -96,7 +96,7 @@ NA (recognised, clear "not applicable over Telegram" reply):
 BLOCK (safety — refuse with reason):
 `/login /logout /upgrade /usage-credits /feedback(sends data externally — confirm-gate, not silent) /autofix-pr(spawns cloud session — confirm-gate) /install-github-app /install-slack-app /privacy-settings`
 
-(Where a command appears in two lists above, the stricter handler wins; the implementation table is the single source of truth — this prose is the rationale. The exact 98-row table gets generated into `src/providers/claude-commands.ts` and a test asserts every live command name has a handler class, failing CI when Claude Code adds a command we haven't classified — this is how we keep "full coverage" honest as Claude Code moves.)
+(Where a command appears in two lists above, the stricter handler wins; the implementation table is the single source of truth — this prose is the rationale. The table lives as a STATIC list in `src/providers/claude-commands.ts`, and `test/claude-commands.test.ts` asserts every entry has a handler class. NOTE (2026-07-01): this is a static table, not a live fetch — nothing automatically diffs it against the current code.claude.com command set, so "keeps full coverage honest as Claude Code moves" is aspirational. To make that real, add a check that fetches the live command list and fails when an unclassified command appears.)
 
 ### The hard subset: interactive menu commands
 

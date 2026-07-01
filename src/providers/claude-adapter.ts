@@ -1,4 +1,5 @@
 import { existsSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import type { ClaudePermissionMode, TeleCodexConfig } from "../config.js";
@@ -11,6 +12,7 @@ import type {
   CreateAgentSessionOptions,
 } from "./types.js";
 import { ensureClaudeConfigDir } from "./claude-config-dir.js";
+import { getClaudeCommandSpec, parseClaudeSlashCommand } from "./claude-commands.js";
 import {
   CLAUDE_FULLSCREEN_PROMPT_MARKERS,
   CLAUDE_READY_MARKERS,
@@ -55,6 +57,8 @@ interface RuntimeSession {
   permissionMode: ClaudePermissionMode;
   pty?: ClaudePty;
   busy: boolean;
+  /** Set by abort(); the running turn's tailer stops promptly instead of idling out. */
+  abortRequested?: boolean;
   lastUsage?: ClaudeUsageSnapshot;
   /** Path to the transcript Claude actually writes; discovered on the first turn. */
   transcriptPath?: string;
@@ -118,6 +122,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
 
     runtime.busy = true;
+    runtime.abortRequested = false;
     runtime.descriptor.status = "running";
     runtime.descriptor.updatedAt = Date.now();
     yield { type: "session_status_changed", sessionId: runtime.descriptor.id, status: "running" };
@@ -127,7 +132,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       const modelCommand = parseClaudeModelCommand(promptText);
       if (modelCommand) {
         await this.applyModelCommand(runtime, promptText, modelCommand);
-        const text = `Claude model command applied: ${modelCommand}`;
+        const text = `Claude model command sent: ${modelCommand}. Use /status to confirm the active model.`;
         yield {
           type: "assistant_text_delta",
           sessionId: runtime.descriptor.id,
@@ -143,11 +148,17 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         return;
       }
 
+      // Real Claude slash commands (DISPATCH / DISPATCH+ARG, e.g. /diff, /memory, /review)
+      // are typed into the PTY, but Claude records them as <command-name> entries rather
+      // than a plain user prompt, so requiring a prompt echo would time out and then kill
+      // the PTY. Detect those and locate the turn by transcript growth instead, and never
+      // dispose the session if the command produced no readable turn.
+      const isSlashCommand = isDispatchSlashCommand(promptText);
       const output = await this.locateTurnTranscript(
         runtime,
         promptText,
         () => runtime.pty!.sendPrompt(promptText),
-        { requirePromptEcho: true },
+        { requirePromptEcho: !isSlashCommand, disposeOnFailure: !isSlashCommand },
       );
 
       if ("fallbackText" in output) {
@@ -172,6 +183,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         sessionId: runtime.descriptor.id,
         jobId: options.jobId,
         idleTimeoutMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
+        shouldStop: () => runtime.abortRequested === true,
       })) {
         if (event.type === "error") {
           await this.stopRuntimePty(runtime);
@@ -212,6 +224,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
   async abort(sessionId: string): Promise<void> {
     const runtime = this.requireRuntime(sessionId);
+    runtime.abortRequested = true;
     runtime.pty?.pressEscape();
   }
 
@@ -392,7 +405,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     ptySession.clearBuffer();
     await ptySession.sendCommand(commandText);
     const confirmation = await ptySession.waitForMarker(
-      [/switchmodel/, /yes,switchto/],
+      [/switchmodel/, /yes,switchto/, /switchto/, /confirmmodel/],
       5000,
     );
     if (confirmation) {
@@ -472,7 +485,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime: RuntimeSession,
     promptText: string,
     send: () => Promise<void>,
-    options: { requirePromptEcho?: boolean } = {},
+    options: { requirePromptEcho?: boolean; disposeOnFailure?: boolean } = {},
   ): Promise<LocatedTurnOutput> {
     const configDir = this.transcriptConfigDir;
     let knownPath = runtime.transcriptPath;
@@ -480,12 +493,16 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       knownPath = (await findTranscript(runtime.providerSessionId, 1000, configDir)) ?? undefined;
     }
     const knownOffset = knownPath && existsSync(knownPath) ? safeFileSize(knownPath) : 0;
+    // Once we know Claude's real transcript path, only look inside that project directory
+    // so a concurrent standalone Claude cannot have its transcript mistaken for this turn.
+    const projectDir = knownPath ? dirname(knownPath) : undefined;
 
     const before = await snapshotTranscriptSizes(configDir);
     const screenBefore = runtime.pty?.strippedText() ?? "";
     await send();
 
     const requirePromptEcho = options.requirePromptEcho ?? true;
+    const disposeOnFailure = options.disposeOnFailure ?? true;
     const active = requirePromptEcho
       ? await locateActiveTranscriptTurnByPrompt({
           before,
@@ -495,6 +512,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           knownOffset,
           timeoutMs: 30000,
           configDir,
+          projectDir,
         })
       : await locateActiveTranscript({
           before,
@@ -503,6 +521,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           knownOffset,
           timeoutMs: 30000,
           configDir,
+          projectDir,
         });
     if (!active) {
       if (requirePromptEcho) {
@@ -525,6 +544,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       const fallbackText = extractScreenFallbackText(screenBefore, runtime.pty?.strippedText() ?? "");
       if (fallbackText) {
         return { fallbackText };
+      }
+      if (!disposeOnFailure) {
+        // Slash command that wrote no readable turn (e.g. a config-only command). Keep the
+        // session alive and report a benign result instead of killing the PTY.
+        return { fallbackText: "Claude handled the command. It did not produce a transcript response to read back." };
       }
       const tail = screenTail(runtime.pty);
       await this.stopRuntimePty(runtime);
@@ -622,6 +646,21 @@ function promptToText(input: AgentSendPromptOptions["input"]): string {
 function parseClaudeModelCommand(text: string): string | undefined {
   const match = text.trim().match(/^\/model(?:@\w+)?\s+([a-zA-Z0-9_.:-]+)$/u);
   return match?.[1];
+}
+
+/**
+ * True when the prompt is a real Claude Code slash command that TeleCodex forwards to the
+ * PTY (DISPATCH / DISPATCH+ARG). These are recorded by Claude as <command-name> transcript
+ * entries, not plain user prompts, so their turns must be located by transcript growth
+ * rather than by prompt echo. /model is handled separately, so it is excluded here.
+ */
+function isDispatchSlashCommand(text: string): boolean {
+  const parsed = parseClaudeSlashCommand(text);
+  if (!parsed || parsed.name === "model") {
+    return false;
+  }
+  const spec = getClaudeCommandSpec(parsed.name);
+  return spec?.class === "dispatch" || spec?.class === "dispatch_arg";
 }
 
 function shouldPassClaudeModel(model: string): boolean {
