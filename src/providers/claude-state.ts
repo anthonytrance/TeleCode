@@ -3,6 +3,7 @@ import path from "node:path";
 
 import type { ClaudePermissionMode } from "../config.js";
 import type { TelegramContextKey } from "../context-key.js";
+import { parseJsonFileText } from "../json.js";
 
 export interface ClaudeSessionStateRecord {
   telegramContextKey: TelegramContextKey;
@@ -32,7 +33,7 @@ export class ClaudeStateStore {
       return { version: 1, sessions: [] };
     }
 
-    const parsed = JSON.parse(readFileSync(this.filePath, "utf8")) as ClaudeProviderState;
+    const parsed = parseJsonFileText<ClaudeProviderState>(readFileSync(this.filePath, "utf8"));
     if (parsed.version !== 1) {
       throw new Error(`Unsupported Claude provider state version: ${parsed.version}`);
     }

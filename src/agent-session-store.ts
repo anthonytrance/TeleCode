@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import path from "node:path";
 
 import type { PersistedAgentSessionState } from "./agent-session-manager.js";
+import { parseJsonFileText } from "./json.js";
 
 export function createEmptyAgentSessionState(): PersistedAgentSessionState {
   return {
@@ -25,7 +26,7 @@ export class JsonAgentSessionStore {
     }
 
     const raw = readFileSync(this.filePath, "utf8");
-    const parsed = JSON.parse(raw) as PersistedAgentSessionState;
+    const parsed = parseJsonFileText<PersistedAgentSessionState>(raw);
     if (parsed.version !== 1) {
       throw new Error(`Unsupported agent session state version: ${parsed.version}`);
     }

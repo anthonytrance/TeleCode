@@ -5,6 +5,7 @@ import { createCodexSession, type CodexSessionRuntime } from "./codex-backend.js
 import { findLaunchProfile } from "./codex-launch.js";
 import type { CodexBackend, ProgressDelivery, TeleCodexConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
+import { parseJsonFileText } from "./json.js";
 import type { AgentProviderKind } from "./providers/types.js";
 
 export interface ContextMetadata {
@@ -208,7 +209,7 @@ export class SessionRegistry {
         return;
       }
       const raw = readFileSync(this.persistPath, "utf8");
-      const data = JSON.parse(raw) as ContextMetadata[];
+      const data = parseJsonFileText<ContextMetadata[]>(raw);
       for (const entry of data) {
         if (entry.contextKey) {
           this.metadata.set(entry.contextKey, entry);

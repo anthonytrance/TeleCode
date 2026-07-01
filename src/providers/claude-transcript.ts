@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -16,6 +16,7 @@ export interface ClaudeTranscriptProjection {
   events: AgentProviderEvent[];
   assistantText: string;
   turnEnded: boolean;
+  title?: string;
   compactBoundary?: { preTokens?: number; postTokens?: number };
   usage?: ClaudeUsageSnapshot;
 }
@@ -66,9 +67,14 @@ export async function findTranscript(
  * filename and must spot the one that appears (or grows) instead.
  */
 export async function snapshotTranscripts(configDir?: string): Promise<Set<string>> {
+  const snapshot = await snapshotTranscriptSizes(configDir);
+  return new Set(snapshot.keys());
+}
+
+export async function snapshotTranscriptSizes(configDir?: string): Promise<Map<string, number>> {
   const baseConfigDir = configDir ?? path.join(homedir(), ".claude");
   const projectsDir = path.join(baseConfigDir, "projects");
-  const result = new Set<string>();
+  const result = new Map<string, number>();
   let projectDirs: string[];
   try {
     projectDirs = await readdir(projectsDir);
@@ -84,7 +90,8 @@ export async function snapshotTranscripts(configDir?: string): Promise<Set<strin
     }
     for (const file of files) {
       if (file.endsWith(".jsonl")) {
-        result.add(path.join(projectsDir, projectDir, file));
+        const filePath = path.join(projectsDir, projectDir, file);
+        result.set(filePath, statSyncSize(filePath));
       }
     }
   }
@@ -98,14 +105,14 @@ export interface ActiveTranscript {
 }
 
 /**
- * Find the transcript that is actively receiving this turn's content. Prefers a
- * brand-new file (covers the first turn, where Claude ignores --session-id, and the
- * case where --resume forks a new session id). Falls back to a known transcript that
- * has grown past the offset captured before the prompt was sent (the in-process resume
- * where Claude appends to the same file).
+ * Find the transcript that is actively receiving this turn's content. Prefers the
+ * known transcript when it grows, then a fresh file matching the expected session id,
+ * then the newest fresh file as a fallback for older Claude builds that ignore the
+ * requested session id or fork a new one.
  */
 export async function locateActiveTranscript(options: {
-  before: Set<string>;
+  before: Set<string> | Map<string, number>;
+  expectedSessionId?: string;
   knownPath?: string;
   knownOffset: number;
   timeoutMs: number;
@@ -114,16 +121,18 @@ export async function locateActiveTranscript(options: {
 }): Promise<ActiveTranscript | null> {
   const deadline = Date.now() + options.timeoutMs;
   const pollIntervalMs = options.pollIntervalMs ?? 400;
+  const before = normalizeTranscriptSnapshot(options.before);
   while (Date.now() <= deadline) {
-    const now = await snapshotTranscripts(options.configDir);
+    const now = await snapshotTranscriptSizes(options.configDir);
     const fresh: string[] = [];
-    for (const candidate of now) {
-      if (!options.before.has(candidate)) {
+    const grown: Array<{ path: string; startOffset: number }> = [];
+    for (const [candidate, size] of now) {
+      const priorSize = before.get(candidate);
+      if (priorSize === undefined) {
         fresh.push(candidate);
+      } else if (size > priorSize) {
+        grown.push({ path: candidate, startOffset: priorSize });
       }
-    }
-    if (fresh.length > 0) {
-      return { path: await newestPath(fresh), startOffset: 0 };
     }
     if (options.knownPath && existsSync(options.knownPath)) {
       const size = statSyncSize(options.knownPath);
@@ -131,7 +140,46 @@ export async function locateActiveTranscript(options: {
         return { path: options.knownPath, startOffset: options.knownOffset };
       }
     }
+    const expectedFresh = options.expectedSessionId
+      ? fresh.find((candidate) => sessionIdFromTranscriptPath(candidate) === options.expectedSessionId)
+      : undefined;
+    if (expectedFresh) {
+      return { path: expectedFresh, startOffset: 0 };
+    }
+    if (fresh.length > 0) {
+      return { path: await newestPath(fresh), startOffset: 0 };
+    }
+    if (grown.length > 0) {
+      const path = await newestPath(grown.map((candidate) => candidate.path));
+      return grown.find((candidate) => candidate.path === path) ?? null;
+    }
     await sleep(pollIntervalMs);
+  }
+  return null;
+}
+
+/**
+ * Last-resort recovery for cases where Claude wrote the turn, but file-growth
+ * detection missed it. Finds the latest user prompt entry matching the exact
+ * prompt text and returns its byte offset so the tailer can replay that turn.
+ */
+export async function locateTranscriptTurnByPrompt(options: {
+  promptText: string;
+  expectedSessionId?: string;
+  knownPath?: string;
+  configDir?: string;
+}): Promise<ActiveTranscript | null> {
+  const candidates = await transcriptPromptRecoveryCandidates(options);
+  const normalizedPrompt = normalizePromptText(options.promptText);
+  if (!normalizedPrompt) {
+    return null;
+  }
+
+  for (const candidate of candidates) {
+    const startOffset = findLastPromptOffset(candidate, normalizedPrompt);
+    if (startOffset !== undefined) {
+      return { path: candidate, startOffset };
+    }
   }
   return null;
 }
@@ -253,6 +301,16 @@ export function projectClaudeTranscriptEntry(
         sessionId: options.sessionId,
         status: "running",
       });
+    }
+  } else if (entryType === "ai-title") {
+    const title = asString(entry.aiTitle).trim();
+    if (title) {
+      events.push({
+        type: "session_title_changed",
+        sessionId: options.sessionId,
+        title,
+      });
+      return { events, assistantText, turnEnded, title };
     }
   }
 
@@ -438,7 +496,11 @@ function readUsage(usage: JsonObject): ClaudeUsageSnapshot {
 }
 
 function extractUserText(entry: JsonObject): string {
-  const content = asArray(asObject(entry.message)?.content);
+  const rawContent = asObject(entry.message)?.content;
+  if (typeof rawContent === "string") {
+    return rawContent.trim();
+  }
+  const content = asArray(rawContent);
   const parts: string[] = [];
   for (const block of content) {
     const blockObject = asObject(block);
@@ -447,6 +509,91 @@ function extractUserText(entry: JsonObject): string {
     }
   }
   return parts.join("\n").trim();
+}
+
+async function transcriptPromptRecoveryCandidates(options: {
+  expectedSessionId?: string;
+  knownPath?: string;
+  configDir?: string;
+}): Promise<string[]> {
+  const candidates: string[] = [];
+  if (options.knownPath && existsSync(options.knownPath)) {
+    candidates.push(options.knownPath);
+  }
+
+  if (options.expectedSessionId) {
+    const expected = await findTranscriptOnce(options.expectedSessionId, options.configDir);
+    if (expected) {
+      candidates.push(expected);
+    }
+  }
+
+  const snapshot = await snapshotTranscriptSizes(options.configDir);
+  const byMtime = await Promise.all(
+    [...snapshot.keys()].map(async (filePath) => {
+      let mtime = 0;
+      try {
+        mtime = (await stat(filePath)).mtimeMs;
+      } catch {
+        // Ignore files that disappear while building the recovery list.
+      }
+      return { filePath, mtime };
+    }),
+  );
+  byMtime
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(0, 25)
+    .forEach((entry) => candidates.push(entry.filePath));
+
+  return [...new Set(candidates)];
+}
+
+function findLastPromptOffset(filePath: string, normalizedPrompt: string): number | undefined {
+  let buffer: Buffer;
+  try {
+    buffer = readFileSync(filePath);
+  } catch {
+    return undefined;
+  }
+
+  let lineStart = 0;
+  let lastMatch: number | undefined;
+  for (let index = 0; index <= buffer.length; index += 1) {
+    if (index < buffer.length && buffer[index] !== 0x0a) {
+      continue;
+    }
+    const lineEnd = index > lineStart && buffer[index - 1] === 0x0d ? index - 1 : index;
+    if (lineEnd > lineStart) {
+      const line = buffer.subarray(lineStart, lineEnd).toString("utf8").trim();
+      const userPrompt = userPromptFromJsonLine(line);
+      if (userPrompt && normalizePromptText(userPrompt) === normalizedPrompt) {
+        lastMatch = lineStart;
+      }
+    }
+    lineStart = index + 1;
+  }
+
+  return lastMatch;
+}
+
+function userPromptFromJsonLine(line: string): string | undefined {
+  let entry: JsonObject;
+  try {
+    entry = JSON.parse(line) as JsonObject;
+  } catch {
+    return undefined;
+  }
+  if (asString(entry.type) !== "user") {
+    return undefined;
+  }
+  if (entry.isMeta === true || entry.isCompactSummary === true) {
+    return undefined;
+  }
+  return extractUserText(entry);
+}
+
+function normalizePromptText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function summarizeToolInput(input: unknown): string | undefined {
@@ -517,6 +664,17 @@ function statSyncSize(filePath: string): number {
   } catch {
     return 0;
   }
+}
+
+function normalizeTranscriptSnapshot(snapshot: Set<string> | Map<string, number>): Map<string, number> {
+  if (snapshot instanceof Map) {
+    return new Map(snapshot);
+  }
+  const result = new Map<string, number>();
+  for (const filePath of snapshot) {
+    result.set(filePath, statSyncSize(filePath));
+  }
+  return result;
 }
 
 function sleep(ms: number): Promise<void> {

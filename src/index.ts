@@ -2,14 +2,21 @@ import { createBot, registerCommands } from "./bot.js";
 import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
 import { loadConfig } from "./config.js";
+import { cleanupRegisteredClaudeProcesses } from "./providers/claude-process-registry.js";
 import { SessionRegistry } from "./session-registry.js";
-import { assertTelegramPollingSafety } from "./startup-safety.js";
+import { assertTelegramPollingSafety, findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
 
 try {
   const config = loadConfig();
+  if (config.enableClaudeProvider) {
+    const cleanedClaudeProcesses = await cleanupRegisteredClaudeProcesses(config.workspace);
+    if (cleanedClaudeProcesses > 0) {
+      console.warn(`Cleaned up ${cleanedClaudeProcesses} stale TeleCodex Claude process(es).`);
+    }
+  }
   const pollingSafety = assertTelegramPollingSafety({ token: config.telegramBotToken });
   registry = new SessionRegistry(config);
   bot = createBot(config, registry);
@@ -39,9 +46,20 @@ try {
     }
   }
   console.log("Session mode: per Telegram context");
+  const competingClaudeProcesses = await findRunningClaudeTelegramPluginProcesses();
+  if (competingClaudeProcesses.length > 0) {
+    console.warn(
+      `Notice: found ${competingClaudeProcesses.length} Claude Telegram plugin process(es). ` +
+        "This is fine if they use a different bot token than TeleCodex; sharing a token would cause polling conflicts.",
+    );
+    console.warn("Use /doctor for Claude plugin process details.");
+  }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Failed to start TeleCodex: ${message}`);
+  await bot?.disposeProviders().catch((disposeError) => {
+    console.warn("Failed to dispose provider sessions during startup failure", disposeError);
+  });
   registry?.disposeAll();
   process.exit(1);
 }
@@ -57,9 +75,16 @@ const shutdown = (signal: NodeJS.Signals) => {
   if (bot) bot.stop();
 
   setTimeout(() => {
-    registry?.disposeAll();
-    console.log("TeleCodex stopped.");
-    process.exit(0);
+    void (async () => {
+      try {
+        await bot?.disposeProviders();
+      } catch (error) {
+        console.warn("Failed to dispose provider sessions during shutdown", error);
+      }
+      registry?.disposeAll();
+      console.log("TeleCodex stopped.");
+      process.exit(0);
+    })();
   }, 500);
 };
 
@@ -95,6 +120,9 @@ async function startPolling(): Promise<void> {
     }
 
     console.error(`Fatal polling error: ${message}`);
+    await bot?.disposeProviders().catch((disposeError) => {
+      console.warn("Failed to dispose provider sessions after fatal polling error", disposeError);
+    });
     registry?.disposeAll();
     process.exit(1);
   }

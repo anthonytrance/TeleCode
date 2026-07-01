@@ -4,8 +4,10 @@ import path from "node:path";
 
 import {
   locateActiveTranscript,
+  locateTranscriptTurnByPrompt,
   projectClaudeTranscriptEntry,
   sessionIdFromTranscriptPath,
+  snapshotTranscriptSizes,
   snapshotTranscripts,
   TranscriptTailer,
 } from "../src/providers/claude-transcript.js";
@@ -69,6 +71,18 @@ describe("Claude transcript projection", () => {
       type: "compact_boundary",
       summary: "Compacted: 26,056 -> 3,146 tokens",
     });
+  });
+
+  it("maps Claude ai-title entries to title-change events", () => {
+    const projection = projectClaudeTranscriptEntry({
+      type: "ai-title",
+      aiTitle: "Daily Codex integration",
+    }, { sessionId: "s1", jobId: "j1" });
+
+    expect(projection.title).toBe("Daily Codex integration");
+    expect(projection.events).toEqual([
+      { type: "session_title_changed", sessionId: "s1", title: "Daily Codex integration" },
+    ]);
   });
 });
 
@@ -161,11 +175,32 @@ describe("transcript discovery", () => {
     expect([...snapshot]).toEqual([path.join(projectDir, "a.jsonl")]);
   });
 
-  it("prefers a brand-new transcript over a known one (ignored --session-id / resume fork)", async () => {
+  it("prefers a known transcript that grew over an unrelated fresh transcript", async () => {
+    const knownPath = path.join(projectDir, "known.jsonl");
+    writeFileSync(knownPath, "old\n", "utf8");
+    const knownOffset = statSync(knownPath).size;
     const before = await snapshotTranscripts(configDir);
+    writeFileSync(path.join(projectDir, "other-session.jsonl"), "other\n", "utf8");
+    appendFileSync(knownPath, "new\n", "utf8");
+
+    const active = await locateActiveTranscript({ before, knownPath, knownOffset, timeoutMs: 2000, configDir });
+
+    expect(active).toEqual({ path: knownPath, startOffset: knownOffset });
+  });
+
+  it("prefers a fresh transcript matching the expected session id over other fresh transcripts", async () => {
+    const before = await snapshotTranscripts(configDir);
+    const otherPath = path.join(projectDir, "other-id.jsonl");
     const realPath = path.join(projectDir, "real-id.jsonl");
+    writeFileSync(otherPath, "line\n", "utf8");
     writeFileSync(realPath, "line\n", "utf8");
-    const active = await locateActiveTranscript({ before, knownOffset: 0, timeoutMs: 2000, configDir });
+    const active = await locateActiveTranscript({
+      before,
+      expectedSessionId: "real-id",
+      knownOffset: 0,
+      timeoutMs: 2000,
+      configDir,
+    });
     expect(active).toEqual({ path: realPath, startOffset: 0 });
   });
 
@@ -177,6 +212,41 @@ describe("transcript discovery", () => {
     appendFileSync(knownPath, "new\n", "utf8");
     const active = await locateActiveTranscript({ before, knownPath, knownOffset, timeoutMs: 2000, configDir });
     expect(active).toEqual({ path: knownPath, startOffset: knownOffset });
+  });
+
+  it("detects an already-existing unknown transcript that grows after the prompt", async () => {
+    const realPath = path.join(projectDir, "real-id.jsonl");
+    writeFileSync(realPath, "old\n", "utf8");
+    const oldSize = statSync(realPath).size;
+    const before = await snapshotTranscriptSizes(configDir);
+    appendFileSync(realPath, "new\n", "utf8");
+
+    const active = await locateActiveTranscript({ before, knownOffset: 0, timeoutMs: 2000, configDir });
+
+    expect(active).toEqual({ path: realPath, startOffset: oldSize });
+  });
+
+  it("recovers a turn boundary by matching a string-content user prompt", async () => {
+    const realPath = path.join(projectDir, "real-id.jsonl");
+    const oldLine = `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "old" }] } })}\n`;
+    writeFileSync(realPath, oldLine, "utf8");
+    const expectedOffset = statSync(realPath).size;
+    appendFileSync(realPath, [
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: "do you still remember about the press release" },
+      }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Yes" }] } }),
+      "",
+    ].join("\n"), "utf8");
+
+    const active = await locateTranscriptTurnByPrompt({
+      promptText: "do you still remember about the press release",
+      expectedSessionId: "real-id",
+      configDir,
+    });
+
+    expect(active).toEqual({ path: realPath, startOffset: expectedOffset });
   });
 
   it("returns null when nothing appears or grows before the timeout", async () => {

@@ -12,15 +12,21 @@ import type {
 } from "./types.js";
 import { ensureClaudeConfigDir } from "./claude-config-dir.js";
 import {
+  CLAUDE_FULLSCREEN_PROMPT_MARKERS,
   CLAUDE_READY_MARKERS,
   CLAUDE_TRUST_MARKERS,
   ClaudePty,
 } from "./claude-pty.js";
 import {
+  ClaudeProcessRegistry,
+  claudeProcessRegistryPath,
+} from "./claude-process-registry.js";
+import {
   findTranscript,
   locateActiveTranscript,
+  locateTranscriptTurnByPrompt,
   sessionIdFromTranscriptPath,
-  snapshotTranscripts,
+  snapshotTranscriptSizes,
   TranscriptTailer,
   type ClaudeUsageSnapshot,
 } from "./claude-transcript.js";
@@ -51,7 +57,12 @@ interface RuntimeSession {
   lastUsage?: ClaudeUsageSnapshot;
   /** Path to the transcript Claude actually writes; discovered on the first turn. */
   transcriptPath?: string;
+  ptyPid?: number;
 }
+
+type LocatedTurnOutput =
+  | { transcriptPath: string; startOffset: number }
+  | { fallbackText: string };
 
 export class ClaudeProviderAdapter implements AgentProviderAdapter {
   readonly id = "claude";
@@ -59,8 +70,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   readonly capabilities = CLAUDE_CAPABILITIES;
 
   private readonly sessions = new Map<string, RuntimeSession>();
+  private readonly processRegistry: ClaudeProcessRegistry;
 
-  constructor(private readonly config: TeleCodexConfig) {}
+  constructor(private readonly config: TeleCodexConfig) {
+    this.processRegistry = new ClaudeProcessRegistry(claudeProcessRegistryPath(config.workspace));
+  }
 
   async createSession(options: CreateAgentSessionOptions): Promise<AgentSessionDescriptor> {
     this.validateEnabled();
@@ -109,17 +123,70 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
     try {
       await this.ensurePty(runtime, "resume");
-      const { transcriptPath, startOffset } = await this.locateTurnTranscript(
+      const modelCommand = parseClaudeModelCommand(promptText);
+      if (modelCommand) {
+        await this.applyModelCommand(runtime, promptText, modelCommand);
+        const text = `Claude model command applied: ${modelCommand}`;
+        yield {
+          type: "assistant_text_delta",
+          sessionId: runtime.descriptor.id,
+          jobId: options.jobId,
+          text,
+        };
+        yield {
+          type: "assistant_message_complete",
+          sessionId: runtime.descriptor.id,
+          jobId: options.jobId,
+          text,
+        };
+        return;
+      }
+
+      const output = await this.locateTurnTranscript(
         runtime,
+        promptText,
         () => runtime.pty!.sendPrompt(promptText),
       );
 
-      const tailer = new TranscriptTailer(transcriptPath, { startOffset });
+      if ("fallbackText" in output) {
+        yield {
+          type: "assistant_text_delta",
+          sessionId: runtime.descriptor.id,
+          jobId: options.jobId,
+          text: output.fallbackText,
+        };
+        yield {
+          type: "assistant_message_complete",
+          sessionId: runtime.descriptor.id,
+          jobId: options.jobId,
+          text: output.fallbackText,
+        };
+        return;
+      }
+
+      const tailer = new TranscriptTailer(output.transcriptPath, { startOffset: output.startOffset });
+      let partialAssistantText = "";
       for await (const event of tailer.eventsUntilTurnEnd({
         sessionId: runtime.descriptor.id,
         jobId: options.jobId,
         idleTimeoutMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
       })) {
+        if (event.type === "error") {
+          await this.stopRuntimePty(runtime);
+          if (partialAssistantText.trim()) {
+            yield {
+              type: "assistant_message_complete",
+              sessionId: runtime.descriptor.id,
+              jobId: options.jobId,
+              text: `${partialAssistantText.trim()}\n\nClaude stopped before finishing the turn: ${event.message}`,
+            };
+            return;
+          }
+          throw new Error(event.message);
+        }
+        if (event.type === "assistant_text_delta") {
+          partialAssistantText += event.text;
+        }
         if (event.type === "usage_updated") {
           runtime.lastUsage = {
             inputTokens: event.inputTokens ?? 0,
@@ -127,6 +194,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
             outputTokens: event.outputTokens ?? 0,
             contextTokens: (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
           };
+        } else if (event.type === "session_title_changed") {
+          runtime.descriptor.displayName = event.title;
+          runtime.descriptor.updatedAt = Date.now();
         }
         yield event;
       }
@@ -151,11 +221,15 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime.busy = true;
     try {
       await this.ensurePty(runtime, "resume");
-      const { transcriptPath, startOffset } = await this.locateTurnTranscript(
+      const output = await this.locateTurnTranscript(
         runtime,
+        "/compact",
         () => runtime.pty!.sendCommand("/compact"),
       );
-      const tailer = new TranscriptTailer(transcriptPath, { startOffset });
+      if ("fallbackText" in output) {
+        throw new Error("Claude compaction completed on screen, but no compact transcript boundary was written");
+      }
+      const tailer = new TranscriptTailer(output.transcriptPath, { startOffset: output.startOffset });
       const summary = await tailer.waitForCompact({
         sessionId,
         jobId: `compact-${Date.now()}`,
@@ -190,12 +264,14 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       if (runtime?.pty) {
         await runtime.pty.dispose(true);
       }
+      this.removeRegisteredProcessSession(sessionId);
       this.sessions.delete(sessionId);
       return;
     }
 
     for (const runtime of this.sessions.values()) {
       await runtime.pty?.dispose(true);
+      this.removeRegisteredProcessSession(runtime.descriptor.id);
     }
     this.sessions.clear();
   }
@@ -215,19 +291,26 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           runtime.providerSessionId,
           "-n",
           runtime.descriptor.displayName || "TeleCodex Claude",
-          "--model",
-          runtime.model,
           "--permission-mode",
           runtime.permissionMode,
         ]
       : [
           "--resume",
           runtime.providerSessionId,
-          "--model",
-          runtime.model,
           "--permission-mode",
           runtime.permissionMode,
         ];
+
+    if (shouldPassClaudeModel(runtime.model)) {
+      args.push("--model", runtime.model);
+    }
+
+    if (runtime.permissionMode === "bypassPermissions") {
+      args.unshift("--dangerously-skip-permissions");
+    }
+
+    args.push("--settings", JSON.stringify(TELECODEX_CLAUDE_SETTINGS));
+    args.push("--append-system-prompt", TELECODEX_CLAUDE_SYSTEM_PROMPT);
 
     const strictMcp = this.config.claudeStrictMcpConfig;
     if (strictMcp) {
@@ -245,13 +328,24 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       cwd: runtime.workspace,
       configDir: strictMcp ? undefined : this.config.claudeConfigDir,
     });
+    runtime.ptyPid = ptySession.pid;
+    if (runtime.ptyPid) {
+      this.registerProcess({
+        pid: runtime.ptyPid,
+        sessionId: runtime.descriptor.id,
+        providerSessionId: runtime.providerSessionId,
+        startedAt: Date.now(),
+      });
+    }
 
     const firstMarker = await ptySession.waitForMarker([
       ...CLAUDE_TRUST_MARKERS,
+      ...CLAUDE_FULLSCREEN_PROMPT_MARKERS,
       ...CLAUDE_READY_MARKERS,
     ], 30000);
     if (!firstMarker) {
       await ptySession.dispose(false);
+      this.removeRegisteredProcessSession(runtime.descriptor.id);
       throw new Error("Claude did not reach a ready prompt");
     }
     if (firstMarker === CLAUDE_TRUST_MARKERS[0]!.source) {
@@ -259,16 +353,102 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       const ready = await ptySession.waitForMarker(CLAUDE_READY_MARKERS, 30000);
       if (!ready) {
         await ptySession.dispose(false);
+        this.removeRegisteredProcessSession(runtime.descriptor.id);
         throw new Error("Claude trust dialog was accepted, but the prompt did not become ready");
+      }
+    }
+    if (firstMarker === CLAUDE_FULLSCREEN_PROMPT_MARKERS[0]!.source) {
+      ptySession.typeText("2");
+      ptySession.pressEnter();
+      const ready = await ptySession.waitForMarker(CLAUDE_READY_MARKERS, 30000);
+      if (!ready) {
+        await ptySession.dispose(false);
+        this.removeRegisteredProcessSession(runtime.descriptor.id);
+        throw new Error("Claude fullscreen prompt was dismissed, but the prompt did not become ready");
       }
     }
 
     ptySession.on("exit", () => {
+      if (runtime.ptyPid) {
+        this.removeRegisteredProcessPid(runtime.ptyPid);
+      }
+      runtime.ptyPid = undefined;
       runtime.pty = undefined;
       runtime.descriptor.status = runtime.busy ? "failed" : "idle";
       runtime.descriptor.updatedAt = Date.now();
     });
     runtime.pty = ptySession;
+  }
+
+  private async applyModelCommand(runtime: RuntimeSession, commandText: string, model: string): Promise<void> {
+    const ptySession = runtime.pty;
+    if (!ptySession) {
+      throw new Error("Claude PTY is not running");
+    }
+
+    ptySession.clearBuffer();
+    await ptySession.sendCommand(commandText);
+    const confirmation = await ptySession.waitForMarker(
+      [/switchmodel/, /yes,switchto/],
+      5000,
+    );
+    if (confirmation) {
+      ptySession.typeText("1");
+      ptySession.pressEnter();
+      await sleep(1000);
+    }
+
+    runtime.model = model;
+    runtime.descriptor.metadata = {
+      ...runtime.descriptor.metadata,
+      model,
+    };
+    runtime.descriptor.updatedAt = Date.now();
+  }
+
+  private registerProcess(record: {
+    pid: number;
+    sessionId: string;
+    providerSessionId: string;
+    startedAt: number;
+  }): void {
+    try {
+      this.processRegistry.upsert(record);
+    } catch (error) {
+      console.warn("Failed to record TeleCodex Claude process", error);
+    }
+  }
+
+  private removeRegisteredProcessPid(pid: number): void {
+    try {
+      this.processRegistry.removePid(pid);
+    } catch (error) {
+      console.warn("Failed to remove TeleCodex Claude process record", error);
+    }
+  }
+
+  private removeRegisteredProcessSession(sessionId: string): void {
+    try {
+      this.processRegistry.removeSession(sessionId);
+    } catch (error) {
+      console.warn("Failed to remove TeleCodex Claude session process record", error);
+    }
+  }
+
+  private async stopRuntimePty(runtime: RuntimeSession): Promise<void> {
+    const ptySession = runtime.pty;
+    if (!ptySession) {
+      return;
+    }
+    const pid = runtime.ptyPid;
+    runtime.pty = undefined;
+    runtime.ptyPid = undefined;
+    await ptySession.dispose(true);
+    if (pid) {
+      this.removeRegisteredProcessPid(pid);
+    } else {
+      this.removeRegisteredProcessSession(runtime.descriptor.id);
+    }
   }
 
   /**
@@ -287,8 +467,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
   private async locateTurnTranscript(
     runtime: RuntimeSession,
+    promptText: string,
     send: () => Promise<void>,
-  ): Promise<{ transcriptPath: string; startOffset: number }> {
+  ): Promise<LocatedTurnOutput> {
     const configDir = this.transcriptConfigDir;
     let knownPath = runtime.transcriptPath;
     if (!knownPath) {
@@ -296,20 +477,45 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
     const knownOffset = knownPath && existsSync(knownPath) ? safeFileSize(knownPath) : 0;
 
-    const before = await snapshotTranscripts(configDir);
+    const before = await snapshotTranscriptSizes(configDir);
+    const screenBefore = runtime.pty?.strippedText() ?? "";
     await send();
 
     const active = await locateActiveTranscript({
       before,
+      expectedSessionId: runtime.providerSessionId,
       knownPath,
       knownOffset,
       timeoutMs: 30000,
       configDir,
     });
     if (!active) {
-      throw new Error("Claude transcript was not created");
+      const recovered = await locateTranscriptTurnByPrompt({
+        promptText,
+        expectedSessionId: runtime.providerSessionId,
+        knownPath,
+        configDir,
+      });
+      if (recovered) {
+        return this.reconcileLocatedTranscript(runtime, recovered);
+      }
+
+      const fallbackText = extractScreenFallbackText(screenBefore, runtime.pty?.strippedText() ?? "");
+      if (fallbackText) {
+        return { fallbackText };
+      }
+      const tail = screenTail(runtime.pty);
+      await this.stopRuntimePty(runtime);
+      throw new Error(`Claude transcript was not created. Screen tail: ${tail}`);
     }
 
+    return this.reconcileLocatedTranscript(runtime, active);
+  }
+
+  private reconcileLocatedTranscript(
+    runtime: RuntimeSession,
+    active: { path: string; startOffset: number },
+  ): { transcriptPath: string; startOffset: number } {
     runtime.transcriptPath = active.path;
     const realSessionId = sessionIdFromTranscriptPath(active.path);
     if (realSessionId && realSessionId !== runtime.providerSessionId) {
@@ -391,12 +597,83 @@ function promptToText(input: AgentSendPromptOptions["input"]): string {
   return parts.join("\n\n");
 }
 
+function parseClaudeModelCommand(text: string): string | undefined {
+  const match = text.trim().match(/^\/model(?:@\w+)?\s+([a-zA-Z0-9_.:-]+)$/u);
+  return match?.[1];
+}
+
+function shouldPassClaudeModel(model: string): boolean {
+  const normalized = model.trim().toLowerCase();
+  return Boolean(normalized && normalized !== "default");
+}
+
+const TELECODEX_CLAUDE_SETTINGS = {
+  channelsEnabled: false,
+  enabledPlugins: {
+    "telegram@claude-plugins-official": false,
+  },
+};
+
+const TELECODEX_CLAUDE_SYSTEM_PROMPT = [
+  "You are running inside TeleCodex, which relays this Claude Code session to Anthony through its own Telegram bot.",
+  "Do not send Telegram messages yourself. Do not use Telegram channel plugins, Telegram skills, Telegram bot tokens, curl requests to api.telegram.org, or scripts that contact Telegram.",
+  "Return every response through the current Claude Code conversation transcript only; TeleCodex will deliver it to Anthony.",
+].join("\n");
+
 function safeFileSize(filePath: string): number {
   try {
     return statSync(filePath).size;
   } catch {
     return 0;
   }
+}
+
+function screenTail(ptySession: ClaudePty | undefined): string {
+  const text = ptySession?.strippedText().replace(/\s+/g, " ").trim() ?? "";
+  return text.slice(-1000) || "(empty)";
+}
+
+function extractScreenFallbackText(before: string, after: string): string | undefined {
+  const delta = after.length > before.length ? after.slice(before.length) : after;
+  const normalized = delta.replace(/\s+/g, " ").trim();
+  const candidates: string[] = [];
+  for (const match of normalized.matchAll(/\u25cf\s*([^\u25cf]{1,2000})/giu)) {
+    const candidate = cleanScreenFallbackCandidate(match[1] ?? "");
+    if (candidate) {
+      candidates.push(candidate);
+    }
+  }
+
+  return candidates.at(-1);
+}
+
+function cleanScreenFallbackCandidate(raw: string): string | undefined {
+  const candidate = raw
+    .replace(/\s*[\u2722\u273b\u273d\u2736*]\s+\S+ing\b[\s\S]*$/iu, "")
+    .replace(/[\u2500-\u257f]/g, " ")
+    .replace(/[\u23f5\u25cf\u2722\u273b\u273d\u2736]/g, " ")
+    .replace(/\s+(?:[\u00b7*]?\s*)?(?:Booping|Bootstrapping|Cogitated|Crunched|Worked|Thinking|Precipitating)\b[\s\S]*$/iu, "")
+    .replace(/\s*\([^)]*\btokens?\)[\s\S]*$/iu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!candidate) {
+    return undefined;
+  }
+
+  const lower = candidate.toLowerCase();
+  if (
+    lower.includes("accept edits") ||
+    lower.includes("shift+tab") ||
+    lower.includes("/effort") ||
+    lower.includes("telecodex") ||
+    lower.includes("tokens)") ||
+    lower === "high" ||
+    lower === "medium" ||
+    lower === "low"
+  ) {
+    return undefined;
+  }
+  return candidate;
 }
 
 function asString(value: unknown): string {
@@ -407,4 +684,8 @@ function asPermissionMode(value: unknown): ClaudePermissionMode | undefined {
   return value === "default" || value === "acceptEdits" || value === "plan" || value === "bypassPermissions"
     ? value
     : undefined;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -27,8 +27,15 @@ export class ClaudePty extends EventEmitter {
     }
 
     const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+    for (const key of Object.keys(env)) {
+      if (key === "CLAUDECODE" || key.startsWith("CLAUDE_CODE_")) {
+        delete env[key];
+      }
+    }
     if (options.configDir) {
       env.CLAUDE_CONFIG_DIR = options.configDir;
+    } else {
+      delete env.CLAUDE_CONFIG_DIR;
     }
 
     this.proc = pty.spawn(options.bin, options.args, {
@@ -64,6 +71,10 @@ export class ClaudePty extends EventEmitter {
     return this.rawBuffer.replace(ANSI_PATTERN, "");
   }
 
+  clearBuffer(): void {
+    this.rawBuffer = "";
+  }
+
   async waitForMarker(patterns: RegExp[], timeoutMs: number): Promise<string | null> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() <= deadline) {
@@ -91,8 +102,13 @@ export class ClaudePty extends EventEmitter {
   }
 
   async sendPrompt(text: string): Promise<void> {
-    this.requireProc().write(`\x1b[200~${text}\x1b[201~`);
-    await sleep(400);
+    if (/\r|\n/.test(text)) {
+      this.requireProc().write(`\x1b[200~${text}\x1b[201~`);
+      await sleep(800);
+    } else {
+      this.requireProc().write(text);
+      await sleep(150);
+    }
     this.pressEnter();
   }
 
@@ -122,15 +138,16 @@ export class ClaudePty extends EventEmitter {
       }
     }
 
-    try {
-      proc.kill();
-    } catch {
-      // Fall through to taskkill.
-    }
-
-    if (proc.pid && process.platform === "win32" && !(await this.waitForExit(1500))) {
+    if (proc.pid && process.platform === "win32") {
       await taskkill(proc.pid);
+    } else {
+      try {
+        proc.kill();
+      } catch {
+        // Fall through to state cleanup.
+      }
     }
+    await this.waitForExit(1500);
     this.proc = null;
   }
 
@@ -160,7 +177,8 @@ export class ClaudePty extends EventEmitter {
 }
 
 export const CLAUDE_TRUST_MARKERS = [/trustthisfolder/];
-export const CLAUDE_READY_MARKERS = [/shift\+tab/, /bypasspermissions/, /\?forshortcuts/];
+export const CLAUDE_FULLSCREEN_PROMPT_MARKERS = [/trythenewfullscreenrenderer/];
+export const CLAUDE_READY_MARKERS = [/shift\+tab/, /\?forshortcuts/];
 
 function taskkill(pid: number): Promise<void> {
   return new Promise((resolve) => {

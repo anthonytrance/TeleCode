@@ -102,7 +102,7 @@ export function loadConfig(): TeleCodexConfig {
   // with only the telegram poller neutralized. When false, falls back to the isolated
   // CLAUDE_CONFIG_DIR approach (where interactive turns currently do not execute).
   const claudeStrictMcpConfig = parseBooleanEnv(optionalString(process.env.CLAUDE_STRICT_MCP_CONFIG), true);
-  const claudeDefaultModel = optionalString(process.env.CLAUDE_DEFAULT_MODEL) ?? "sonnet";
+  const claudeDefaultModel = optionalString(process.env.CLAUDE_DEFAULT_MODEL) ?? "claude-sonnet-5";
   const claudeWorkspace = path.resolve(optionalString(process.env.CLAUDE_WORKSPACE) ?? workspace);
   const claudePermissionMode = parseClaudePermissionMode(optionalString(process.env.CLAUDE_PERMISSION_MODE));
   if (claudePermissionMode === "bypassPermissions" && !enableUnsafeLaunchProfiles) {

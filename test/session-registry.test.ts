@@ -325,6 +325,34 @@ describe("SessionRegistry", () => {
     });
   });
 
+  it("loads persisted context metadata with a leading UTF-8 BOM", async () => {
+    const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");
+    mockFsState.files.set(
+      persistPath,
+      `\uFEFF${JSON.stringify([
+        {
+          contextKey: "123",
+          threadId: "thread-a",
+          workspace: "/workspace/a",
+          model: "o4-mini",
+          launchProfileId: "default",
+          updatedAt: 10,
+        },
+      ])}`,
+    );
+
+    const registry = new SessionRegistry(createConfig());
+    await registry.getOrCreate("123");
+
+    expect(mockSessionState.create).toHaveBeenCalledWith(createConfig(), {
+      workspace: "/workspace/a",
+      model: "o4-mini",
+      reasoningEffort: undefined,
+      launchProfileId: "default",
+      resumeThreadId: "thread-a",
+    });
+  });
+
   it("falls back to the default launch profile when persisted metadata references a missing profile", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");

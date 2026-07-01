@@ -66,6 +66,22 @@ describe("AgentSessionManager", () => {
     });
   });
 
+  it("updates a session display name without changing the selected session", () => {
+    const manager = createManager();
+    const session = manager.createSession("123", "claude", {
+      workspace: "/workspace",
+      displayName: "Claude",
+    });
+
+    const updated = manager.updateDisplayName(session.id, "Daily Codex integration");
+
+    expect(updated.displayName).toBe("Daily Codex integration");
+    expect(manager.getSelectedSession("123")).toMatchObject({
+      id: session.id,
+      displayName: "Daily Codex integration",
+    });
+  });
+
   it("imports legacy Codex context metadata into stable selected sessions", () => {
     const manager = createManager();
     const contexts: ContextMetadata[] = [

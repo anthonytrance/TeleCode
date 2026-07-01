@@ -19,6 +19,7 @@ export function ensureClaudeConfigDir(
   mkdirSync(configDir, { recursive: true });
   syncCredentials(configDir, sourceConfigDir);
   ensureOnboardingComplete(configDir);
+  ensureIsolatedSettings(configDir);
 }
 
 /**
@@ -52,6 +53,35 @@ function ensureOnboardingComplete(configDir: string): void {
   if (changed) {
     writeFileSync(file, JSON.stringify(data, null, 2));
   }
+}
+
+function ensureIsolatedSettings(configDir: string): void {
+  const file = path.join(configDir, "settings.json");
+  let data: Record<string, unknown> = {};
+  if (existsSync(file)) {
+    try {
+      data = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    } catch {
+      data = {};
+    }
+  }
+
+  const permissions = isObject(data.permissions) ? data.permissions : {};
+  data.theme = data.theme ?? "dark-ansi";
+  data.channelsEnabled = false;
+  data.enabledPlugins = {};
+  data.skipDangerousModePermissionPrompt = true;
+  data.skipAutoPermissionPrompt = true;
+  data.permissions = {
+    ...permissions,
+    defaultMode: "bypassPermissions",
+  };
+
+  writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
 function syncCredentials(configDir: string, sourceConfigDir: string): void {

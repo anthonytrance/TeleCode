@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 export type TelegramTokenRole = "unspecified" | "development" | "canary" | "production";
 
@@ -13,6 +15,8 @@ export interface PollingSafetyResult {
   allowProductionPolling: boolean;
   tokenFingerprint: string;
 }
+
+const execFileAsync = promisify(execFile);
 
 export function assertTelegramPollingSafety(options: PollingSafetyOptions): PollingSafetyResult {
   const env = options.env ?? process.env;
@@ -43,6 +47,43 @@ export function assertTelegramPollingSafety(options: PollingSafetyOptions): Poll
 
 export function fingerprintTelegramToken(token: string): string {
   return createHash("sha256").update(token).digest("hex").slice(0, 12);
+}
+
+export function findClaudeTelegramPluginCommandLines(commandLines: string[]): string[] {
+  return commandLines
+    .map((line) => line.trim())
+    .filter((line) => {
+      const lower = line.toLowerCase();
+      return (
+        lower.includes("plugin:telegram") &&
+        /^\d+\s+claude\.exe\s/u.test(lower)
+      );
+    });
+}
+
+export async function findRunningClaudeTelegramPluginProcesses(): Promise<string[]> {
+  if (process.platform !== "win32") {
+    return [];
+  }
+
+  try {
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        [
+          "Get-CimInstance Win32_Process",
+          "| Where-Object { $_.Name -eq 'claude.exe' -and $_.CommandLine -like '*plugin:telegram*' }",
+          "| ForEach-Object { \"$($_.ProcessId) $($_.Name) $($_.CommandLine)\" }",
+        ].join(" "),
+      ],
+      { windowsHide: true, timeout: 5000 },
+    );
+    return findClaudeTelegramPluginCommandLines(stdout.split(/\r?\n/));
+  } catch {
+    return [];
+  }
 }
 
 function parseTokenRole(raw: string | undefined): TelegramTokenRole {

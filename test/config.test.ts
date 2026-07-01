@@ -121,7 +121,7 @@ describe("loadConfig", () => {
       claudeBin: "C:\\Users\\Anthony\\.local\\bin\\claude.exe",
       claudeConfigDir: path.join(homedir(), ".telecodex", "claude-config"),
       claudeStrictMcpConfig: true,
-      claudeDefaultModel: "sonnet",
+      claudeDefaultModel: "claude-sonnet-5",
       claudeWorkspace: process.cwd(),
       claudePermissionMode: "acceptEdits",
       claudeTurnIdleTimeoutSeconds: 180,
@@ -173,7 +173,7 @@ describe("loadConfig", () => {
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.enableClaudeProvider).toBe(false);
-    expect(config.claudeDefaultModel).toBe("sonnet");
+    expect(config.claudeDefaultModel).toBe("claude-sonnet-5");
     expect(config.claudeWorkspace).toBe(process.cwd());
     expect(config.claudePermissionMode).toBe("acceptEdits");
     expect(config.claudeTurnIdleTimeoutSeconds).toBe(180);
