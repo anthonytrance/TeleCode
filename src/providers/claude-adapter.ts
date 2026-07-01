@@ -24,6 +24,7 @@ import {
 import {
   findTranscript,
   locateActiveTranscript,
+  locateActiveTranscriptTurnByPrompt,
   locateTranscriptTurnByPrompt,
   sessionIdFromTranscriptPath,
   snapshotTranscriptSizes,
@@ -146,6 +147,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         runtime,
         promptText,
         () => runtime.pty!.sendPrompt(promptText),
+        { requirePromptEcho: true },
       );
 
       if ("fallbackText" in output) {
@@ -225,6 +227,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         runtime,
         "/compact",
         () => runtime.pty!.sendCommand("/compact"),
+        { requirePromptEcho: false },
       );
       if ("fallbackText" in output) {
         throw new Error("Claude compaction completed on screen, but no compact transcript boundary was written");
@@ -469,6 +472,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime: RuntimeSession,
     promptText: string,
     send: () => Promise<void>,
+    options: { requirePromptEcho?: boolean } = {},
   ): Promise<LocatedTurnOutput> {
     const configDir = this.transcriptConfigDir;
     let knownPath = runtime.transcriptPath;
@@ -481,23 +485,41 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     const screenBefore = runtime.pty?.strippedText() ?? "";
     await send();
 
-    const active = await locateActiveTranscript({
-      before,
-      expectedSessionId: runtime.providerSessionId,
-      knownPath,
-      knownOffset,
-      timeoutMs: 30000,
-      configDir,
-    });
+    const requirePromptEcho = options.requirePromptEcho ?? true;
+    const active = requirePromptEcho
+      ? await locateActiveTranscriptTurnByPrompt({
+          before,
+          promptText,
+          expectedSessionId: runtime.providerSessionId,
+          knownPath,
+          knownOffset,
+          timeoutMs: 30000,
+          configDir,
+        })
+      : await locateActiveTranscript({
+          before,
+          expectedSessionId: runtime.providerSessionId,
+          knownPath,
+          knownOffset,
+          timeoutMs: 30000,
+          configDir,
+        });
     if (!active) {
-      const recovered = await locateTranscriptTurnByPrompt({
-        promptText,
-        expectedSessionId: runtime.providerSessionId,
-        knownPath,
-        configDir,
-      });
-      if (recovered) {
-        return this.reconcileLocatedTranscript(runtime, recovered);
+      if (requirePromptEcho) {
+        const recovered = await locateTranscriptTurnByPrompt({
+          promptText,
+          expectedSessionId: runtime.providerSessionId,
+          knownPath,
+          minOffset: knownOffset,
+          configDir,
+        });
+        if (recovered) {
+          return this.reconcileLocatedTranscript(runtime, recovered);
+        }
+
+        const tail = screenTail(runtime.pty);
+        await this.stopRuntimePty(runtime);
+        throw new Error(`Claude did not record the prompt in its transcript. Screen tail: ${tail}`);
       }
 
       const fallbackText = extractScreenFallbackText(screenBefore, runtime.pty?.strippedText() ?? "");

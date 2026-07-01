@@ -4,6 +4,7 @@ import path from "node:path";
 
 import {
   locateActiveTranscript,
+  locateActiveTranscriptTurnByPrompt,
   locateTranscriptTurnByPrompt,
   projectClaudeTranscriptEntry,
   sessionIdFromTranscriptPath,
@@ -247,6 +248,61 @@ describe("transcript discovery", () => {
     });
 
     expect(active).toEqual({ path: realPath, startOffset: expectedOffset });
+  });
+
+  it("finds an active turn only after the exact prompt appears past the captured offset", async () => {
+    const knownPath = path.join(projectDir, "known.jsonl");
+    writeFileSync(knownPath, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "old prompt" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "old answer" }] } }),
+      "",
+    ].join("\n"), "utf8");
+    const knownOffset = statSync(knownPath).size;
+    const before = await snapshotTranscriptSizes(configDir);
+    appendFileSync(knownPath, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "stale repaint" }] } })}\n`, "utf8");
+
+    const missing = await locateActiveTranscriptTurnByPrompt({
+      before,
+      promptText: "new prompt",
+      knownPath,
+      knownOffset,
+      timeoutMs: 700,
+      configDir,
+    });
+
+    expect(missing).toBeNull();
+
+    appendFileSync(knownPath, `${JSON.stringify({ type: "user", message: { role: "user", content: "new prompt" } })}\n`, "utf8");
+    const active = await locateActiveTranscriptTurnByPrompt({
+      before,
+      promptText: "new prompt",
+      knownPath,
+      knownOffset,
+      timeoutMs: 2000,
+      configDir,
+    });
+
+    expect(active).toEqual({ path: knownPath, startOffset: statSync(knownPath).size - `${JSON.stringify({ type: "user", message: { role: "user", content: "new prompt" } })}\n`.length });
+  });
+
+  it("does not recover an old matching prompt before the minimum offset", async () => {
+    const realPath = path.join(projectDir, "real-id.jsonl");
+    writeFileSync(realPath, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "repeat me" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "old answer" }] } }),
+      "",
+    ].join("\n"), "utf8");
+    const minOffset = statSync(realPath).size;
+
+    const active = await locateTranscriptTurnByPrompt({
+      promptText: "repeat me",
+      expectedSessionId: "real-id",
+      knownPath: realPath,
+      minOffset,
+      configDir,
+    });
+
+    expect(active).toBeNull();
   });
 
   it("returns null when nothing appears or grows before the timeout", async () => {

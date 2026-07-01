@@ -159,6 +159,69 @@ export async function locateActiveTranscript(options: {
 }
 
 /**
+ * Find the transcript turn for the exact prompt that was just sent. This is stricter
+ * than file-growth detection: interactive Claude can rewrite metadata or repaint old
+ * screen content without actually accepting a new prompt. For normal user prompts,
+ * TeleCodex must not tail an answer until the prompt itself appears after the
+ * captured pre-send offset.
+ */
+export async function locateActiveTranscriptTurnByPrompt(options: {
+  before: Set<string> | Map<string, number>;
+  promptText: string;
+  expectedSessionId?: string;
+  knownPath?: string;
+  knownOffset: number;
+  timeoutMs: number;
+  configDir?: string;
+  pollIntervalMs?: number;
+}): Promise<ActiveTranscript | null> {
+  const deadline = Date.now() + options.timeoutMs;
+  const pollIntervalMs = options.pollIntervalMs ?? 400;
+  const before = normalizeTranscriptSnapshot(options.before);
+  const normalizedPrompt = normalizePromptText(options.promptText);
+  if (!normalizedPrompt) {
+    return null;
+  }
+
+  while (Date.now() <= deadline) {
+    const now = await snapshotTranscriptSizes(options.configDir);
+    const candidates: Array<{ path: string; minOffset: number; priority: number }> = [];
+    if (options.knownPath && existsSync(options.knownPath)) {
+      candidates.push({ path: options.knownPath, minOffset: options.knownOffset, priority: 0 });
+    }
+
+    for (const [candidate, size] of now) {
+      const priorSize = before.get(candidate);
+      if (priorSize === undefined) {
+        candidates.push({
+          path: candidate,
+          minOffset: 0,
+          priority: options.expectedSessionId && sessionIdFromTranscriptPath(candidate) === options.expectedSessionId ? 1 : 3,
+        });
+      } else if (size > priorSize) {
+        candidates.push({
+          path: candidate,
+          minOffset: priorSize,
+          priority: options.expectedSessionId && sessionIdFromTranscriptPath(candidate) === options.expectedSessionId ? 1 : 2,
+        });
+      }
+    }
+
+    candidates.sort((a, b) => a.priority - b.priority || b.minOffset - a.minOffset);
+    for (const candidate of dedupeTranscriptCandidates(candidates)) {
+      const promptOffset = findLastPromptOffset(candidate.path, normalizedPrompt, candidate.minOffset);
+      if (promptOffset !== undefined) {
+        return { path: candidate.path, startOffset: promptOffset };
+      }
+    }
+
+    await sleep(pollIntervalMs);
+  }
+
+  return null;
+}
+
+/**
  * Last-resort recovery for cases where Claude wrote the turn, but file-growth
  * detection missed it. Finds the latest user prompt entry matching the exact
  * prompt text and returns its byte offset so the tailer can replay that turn.
@@ -167,6 +230,7 @@ export async function locateTranscriptTurnByPrompt(options: {
   promptText: string;
   expectedSessionId?: string;
   knownPath?: string;
+  minOffset?: number;
   configDir?: string;
 }): Promise<ActiveTranscript | null> {
   const candidates = await transcriptPromptRecoveryCandidates(options);
@@ -176,7 +240,8 @@ export async function locateTranscriptTurnByPrompt(options: {
   }
 
   for (const candidate of candidates) {
-    const startOffset = findLastPromptOffset(candidate, normalizedPrompt);
+    const minOffset = candidate === options.knownPath ? options.minOffset : undefined;
+    const startOffset = findLastPromptOffset(candidate, normalizedPrompt, minOffset);
     if (startOffset !== undefined) {
       return { path: candidate, startOffset };
     }
@@ -548,7 +613,7 @@ async function transcriptPromptRecoveryCandidates(options: {
   return [...new Set(candidates)];
 }
 
-function findLastPromptOffset(filePath: string, normalizedPrompt: string): number | undefined {
+function findLastPromptOffset(filePath: string, normalizedPrompt: string, minOffset = 0): number | undefined {
   let buffer: Buffer;
   try {
     buffer = readFileSync(filePath);
@@ -566,7 +631,7 @@ function findLastPromptOffset(filePath: string, normalizedPrompt: string): numbe
     if (lineEnd > lineStart) {
       const line = buffer.subarray(lineStart, lineEnd).toString("utf8").trim();
       const userPrompt = userPromptFromJsonLine(line);
-      if (userPrompt && normalizePromptText(userPrompt) === normalizedPrompt) {
+      if (lineStart >= minOffset && userPrompt && normalizePromptText(userPrompt) === normalizedPrompt) {
         lastMatch = lineStart;
       }
     }
@@ -574,6 +639,21 @@ function findLastPromptOffset(filePath: string, normalizedPrompt: string): numbe
   }
 
   return lastMatch;
+}
+
+function dedupeTranscriptCandidates(
+  candidates: Array<{ path: string; minOffset: number; priority: number }>,
+): Array<{ path: string; minOffset: number; priority: number }> {
+  const seen = new Set<string>();
+  const result: Array<{ path: string; minOffset: number; priority: number }> = [];
+  for (const candidate of candidates) {
+    if (seen.has(candidate.path)) {
+      continue;
+    }
+    seen.add(candidate.path);
+    result.push(candidate);
+  }
+  return result;
 }
 
 function userPromptFromJsonLine(line: string): string | undefined {
