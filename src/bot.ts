@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { spawn as spawnProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -7,6 +8,7 @@ import path from "node:path";
 import { autoRetry } from "@grammyjs/auto-retry";
 import type { ModelReasoningEffort } from "@openai/codex-sdk";
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
+import * as pty from "node-pty";
 
 import {
   probeCodexAppServer,
@@ -93,6 +95,8 @@ const STREAM_MESSAGE_TARGET = 1200;
 const FORMATTED_CHUNK_TARGET = 3600;
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const KEYBOARD_PAGE_SIZE = 6;
+const CLAUDE_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+const ANSI_PATTERN = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r/g;
 const DEFAULT_PROVIDER_SESSION_LIST_LIMIT = 20;
 const MAX_PROVIDER_SESSION_LIST_LIMIT = 50;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
@@ -119,6 +123,9 @@ const TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "stop",
   "steer",
   "claude",
+  "claude-login",
+  "claudelogin",
+  "claude_login",
   "codex",
   "provider",
   "new",
@@ -171,6 +178,17 @@ type QueuedPrompt = {
   chatId: TelegramChatId;
   session: CodexSessionRuntime;
   userInput: CodexPromptInput;
+};
+
+type PendingClaudeLogin = {
+  proc: pty.IPty;
+  chatId: TelegramChatId;
+  messageThreadId?: number;
+  buffer: string;
+  urlSent: boolean;
+  codeSubmitted: boolean;
+  submittedCode?: string;
+  timeout: ReturnType<typeof setTimeout>;
 };
 
 type QueuedClaudePrompt = {
@@ -274,11 +292,206 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const queuedPrompts = new Map<TelegramContextKey, QueuedPrompt>();
   const queuedClaudePrompts = new Map<TelegramContextKey, QueuedClaudePrompt>();
   const activeProgressRefreshers = new Map<TelegramContextKey, () => Promise<void>>();
+  const pendingClaudeLogins = new Map<TelegramContextKey, PendingClaudeLogin>();
   const claudeAdapter = config.enableClaudeProvider ? new ClaudeProviderAdapter(config) : undefined;
   const claudeState = config.enableClaudeProvider
     ? new ClaudeSessionStateIndex(new ClaudeStateStore(claudeProviderStatePath(config.workspace)))
     : undefined;
   const claudeSessions = new Map<TelegramContextKey, AgentSessionDescriptor>();
+
+  const cancelPendingClaudeLogin = (contextKey: TelegramContextKey): void => {
+    const pending = pendingClaudeLogins.get(contextKey);
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timeout);
+    pendingClaudeLogins.delete(contextKey);
+    try {
+      pending.proc.kill();
+    } catch {
+      // Best effort cleanup for a PTY that may already have exited.
+    }
+  };
+
+  const runClaudeAuthStatus = async (): Promise<string> => {
+    return await new Promise((resolve) => {
+      const child = spawnProcess(config.claudeBin, ["auth", "status"], {
+        cwd: config.workspace,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", (data: Buffer) => {
+        output += data.toString("utf8");
+      });
+      child.stderr.on("data", (data: Buffer) => {
+        output += data.toString("utf8");
+      });
+      child.on("error", (error) => {
+        resolve(`Failed to run Claude auth status: ${error.message}`);
+      });
+      child.on("close", () => {
+        resolve(output.trim() || "Claude auth status returned no output.");
+      });
+    });
+  };
+
+  const submitClaudeLoginCode = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    code: string,
+  ): Promise<boolean> => {
+    const pending = pendingClaudeLogins.get(contextKey);
+    if (!pending) {
+      return false;
+    }
+    const trimmed = code.trim();
+    if (!trimmed) {
+      return true;
+    }
+    if (pending.codeSubmitted) {
+      await safeReply(ctx, escapeHTML("Claude login code was already submitted. Waiting for Claude to finish."), {
+        fallbackText: "Claude login code was already submitted. Waiting for Claude to finish.",
+        messageThreadId: pending.messageThreadId,
+      });
+      return true;
+    }
+    pending.codeSubmitted = true;
+    pending.submittedCode = trimmed;
+    pending.proc.write(`${trimmed}\r`);
+    await safeReply(ctx, escapeHTML("Claude login code submitted. Checking auth status..."), {
+      fallbackText: "Claude login code submitted. Checking auth status...",
+      messageThreadId: pending.messageThreadId,
+    });
+    return true;
+  };
+
+  const startClaudeLoginFlow = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    email?: string,
+  ): Promise<void> => {
+    if (!config.enableClaudeProvider) {
+      const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+    if (!existsSync(config.claudeBin)) {
+      const message = `Claude binary not found: ${config.claudeBin}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    cancelPendingClaudeLogin(contextKey);
+
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+    const messageThreadId = ctx.message?.message_thread_id;
+    const args = ["auth", "login", "--claudeai"];
+    if (email) {
+      args.push("--email", email);
+    }
+
+    let proc: pty.IPty;
+    try {
+      proc = pty.spawn(config.claudeBin, args, {
+        cwd: config.workspace,
+        cols: 120,
+        rows: 40,
+        env: process.env as Record<string, string>,
+        name: process.platform === "win32" ? "xterm-256color" : "xterm-color",
+      });
+    } catch (error) {
+      const message = `Claude login failed to start: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+
+    const pending: PendingClaudeLogin = {
+      proc,
+      chatId,
+      messageThreadId,
+      buffer: "",
+      urlSent: false,
+      codeSubmitted: false,
+      timeout: setTimeout(() => {
+        cancelPendingClaudeLogin(contextKey);
+        void sendTextMessage(bot.api, chatId, "Claude login timed out. Run /claude-login to try again.", {
+          parseMode: undefined,
+          fallbackText: "Claude login timed out. Run /claude-login to try again.",
+          messageThreadId,
+        }).catch(() => {});
+      }, CLAUDE_LOGIN_TIMEOUT_MS),
+    };
+    pendingClaudeLogins.set(contextKey, pending);
+
+    proc.onData((data) => {
+      pending.buffer += data;
+      if (pending.buffer.length > 32000) {
+        pending.buffer = pending.buffer.slice(-32000);
+      }
+      if (!pending.urlSent) {
+        const url = extractClaudeLoginUrl(stripTerminalText(pending.buffer));
+        if (url) {
+          pending.urlSent = true;
+          const message = [
+            "Open this Claude login URL, finish the browser login, then send the returned code here as your next message.",
+            "",
+            url,
+          ].join("\n");
+          void sendTextMessage(bot.api, chatId, message, {
+            parseMode: undefined,
+            fallbackText: message,
+            messageThreadId,
+          }).catch(() => {});
+        }
+      }
+    });
+
+    proc.onExit(({ exitCode }) => {
+      const current = pendingClaudeLogins.get(contextKey);
+      if (current !== pending) {
+        return;
+      }
+      clearTimeout(pending.timeout);
+      pendingClaudeLogins.delete(contextKey);
+      void (async () => {
+        const status = await runClaudeAuthStatus();
+        const loggedIn = /"loggedIn"\s*:\s*true/.test(status);
+        if (exitCode === 0 && loggedIn) {
+          const message = `Claude login complete.\n\n${status}`;
+          await sendTextMessage(bot.api, chatId, message, {
+            parseMode: undefined,
+            fallbackText: message,
+            messageThreadId,
+          });
+          return;
+        }
+
+        const tail = redactClaudeLoginSecrets(stripTerminalText(pending.buffer), pending.submittedCode).slice(-1200).trim();
+        const message = [
+          "Claude login failed.",
+          `Exit code: ${exitCode ?? "unknown"}`,
+          "",
+          tail || status,
+        ].join("\n");
+        await sendTextMessage(bot.api, chatId, message, {
+          parseMode: undefined,
+          fallbackText: message,
+          messageThreadId,
+        });
+      })().catch((error) => {
+        console.warn("Failed to report Claude login result", error);
+      });
+    });
+
+    await safeReply(ctx, escapeHTML("Claude login started. Waiting for the browser login URL..."), {
+      fallbackText: "Claude login started. Waiting for the browser login URL...",
+      messageThreadId,
+    });
+  };
 
   const disposeClaudeDescriptor = async (descriptor: AgentSessionDescriptor | undefined): Promise<void> => {
     if (!descriptor || !claudeAdapter) {
@@ -313,6 +526,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     queuedPrompts.delete(key);
     queuedClaudePrompts.delete(key);
     activeProgressRefreshers.delete(key);
+    cancelPendingClaudeLogin(key);
     void disposeClaudeDescriptor(claudeSessions.get(key)).catch((error) => {
         console.warn("Failed to dispose Claude session after context removal", error);
       });
@@ -3200,6 +3414,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await safeReply(ctx, escapeHTML(message), { fallbackText: message });
   });
 
+  const handleClaudeLoginCommand = async (ctx: Context): Promise<void> => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+    await startClaudeLoginFlow(ctx, contextKey, getCommandArgument(ctx) || undefined);
+  };
+
+  bot.command(["claude_login", "claudelogin"], handleClaudeLoginCommand);
+  bot.hears(/^\/claude-login(?:@\w+)?(?:\s+.*)?$/i, handleClaudeLoginCommand);
+
   bot.command("codex", async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
@@ -5813,6 +6038,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     if (!rawContextKey) {
       return;
     }
+    if (pendingClaudeLogins.has(rawContextKey)) {
+      await submitClaudeLoginCode(ctx, rawContextKey, userText);
+      return;
+    }
     if (isClaudeActive(rawContextKey)) {
       lastPromptInput.set(rawContextKey, userText);
       await setReaction(ctx, "👀");
@@ -6151,6 +6380,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "effort", description: "Set reasoning effort" },
     { command: "auth", description: "Check auth status" },
     { command: "login", description: "Start authentication" },
+    { command: "claude_login", description: "Start Claude Code login" },
     { command: "logout", description: "Sign out" },
     { command: "voice", description: "Voice transcription status" },
     { command: "handback", description: "Hand thread to Codex CLI" },
@@ -6946,6 +7176,33 @@ function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName
 function getCommandArgument(ctx: Context): string {
   const text = ctx.message?.text ?? "";
   return text.replace(/^\/\S+\s*/u, "").trim();
+}
+
+function stripTerminalText(text: string): string {
+  return text.replace(ANSI_PATTERN, "");
+}
+
+function extractClaudeLoginUrl(screen: string): string | undefined {
+  const marker = "https://claude.com/cai/oauth/authorize?";
+  const start = screen.indexOf(marker);
+  if (start < 0) {
+    return undefined;
+  }
+
+  const after = screen.slice(start);
+  const pasteIndex = after.search(/Paste code here/i);
+  const segment = pasteIndex >= 0 ? after.slice(0, pasteIndex) : after;
+  const compact = segment.replace(/\s+/g, "");
+  const match = compact.match(/^https:\/\/claude\.com\/cai\/oauth\/authorize\?[^<>"']+/i);
+  return match?.[0];
+}
+
+function redactClaudeLoginSecrets(text: string, code?: string): string {
+  let result = text;
+  if (code) {
+    result = result.split(code).join("[redacted-code]");
+  }
+  return result.replace(/[A-Za-z0-9_-]{30,}#[A-Za-z0-9_-]{20,}/g, "[redacted-code]");
 }
 
 function resolveBackendArgument(raw: string): CodexBackend | null {

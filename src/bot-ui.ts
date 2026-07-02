@@ -76,6 +76,7 @@ export function renderHelpMessage(): DualText {
       commands: [
         ["/auth", "Check auth status"],
         ["/login", "Start authentication"],
+        ["/claude_login", "Start Claude Code login"],
         ["/logout", "Sign out"],
       ],
     },
