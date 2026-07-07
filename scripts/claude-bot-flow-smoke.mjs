@@ -64,7 +64,11 @@ try {
 
   const beforeModelCommandMessages = sent.length;
   await bot.handleUpdate(textUpdate(6, "/model opus", config));
-  await waitFor(() => sent.length > beforeModelCommandMessages, 240000);
+  await waitFor(() => Boolean(findModelCommandResult(sent, beforeModelCommandMessages)), 240000);
+  const modelCommandResult = findModelCommandResult(sent, beforeModelCommandMessages);
+  if (/Claude (?:failed|error):/i.test(modelCommandResult)) {
+    throw new Error(`Model command failed: ${modelCommandResult}`);
+  }
   await bot.handleUpdate(textUpdate(7, `Reply with exactly ${expectedModelSwitch} and nothing else.`, config));
   const modelSwitchText = await waitForCapturedText(sent, expectedModelSwitch, 240000);
   console.log("[claude-bot-smoke] model-switch reply:", modelSwitchText.trim());
@@ -202,6 +206,17 @@ async function waitForCapturedText(sent, expected, timeoutMs) {
   return sent
     .map((entry) => entry.text ?? "")
     .find((text) => text.toUpperCase().includes(expected.toUpperCase()));
+}
+
+function findModelCommandResult(sent, startIndex) {
+  return sent
+    .slice(startIndex)
+    .map((entry) => entry.text ?? "")
+    .find((text) =>
+      text.includes("Claude model command accepted: opus") ||
+      text.includes("Claude model command sent: opus") ||
+      text.includes("Claude failed:") ||
+      text.includes("Claude error:"));
 }
 
 function assertPidRegistryEmpty(workspace, label) {

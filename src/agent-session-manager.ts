@@ -163,6 +163,14 @@ export class AgentSessionManager {
     return cloneSession(session);
   }
 
+  updateMetadata(sessionId: string, metadata: Record<string, unknown> | undefined): AgentSessionRecord {
+    const session = this.requireSession(sessionId);
+    session.metadata = metadata ? { ...metadata } : undefined;
+    session.updatedAt = this.now();
+    this.touchLane(session.laneKey, session.updatedAt);
+    return cloneSession(session);
+  }
+
   selectSession(laneKey: TelegramContextKey, sessionId: string): AgentSessionRecord {
     const lane = this.requireLane(laneKey);
     const session = this.requireSession(sessionId);

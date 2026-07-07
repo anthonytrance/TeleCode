@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   locateActiveTranscript,
   locateActiveTranscriptTurnByPrompt,
+  locateSingleHumanPromptTurn,
   locateTranscriptTurnByPrompt,
   projectClaudeTranscriptEntry,
   sessionIdFromTranscriptPath,
@@ -18,6 +19,7 @@ describe("Claude transcript projection", () => {
     const projection = projectClaudeTranscriptEntry({
       type: "assistant",
       message: {
+        model: "claude-fable-5",
         content: [
           { type: "text", text: "Hello" },
           { type: "tool_use", name: "Read", input: { file: "a.txt" } },
@@ -39,13 +41,14 @@ describe("Claude transcript projection", () => {
       contextTokens: 117,
     });
     expect(projection.events).toMatchObject([
+      { type: "model_updated", model: "claude-fable-5" },
       { type: "assistant_text_delta", text: "Hello" },
       { type: "tool_started", toolName: "Read" },
       { type: "usage_updated", inputTokens: 10, cachedInputTokens: 107, outputTokens: 5 },
     ]);
   });
 
-  it("maps Claude API error assistant entries to error events", () => {
+  it("maps Claude API error assistant entries to readable final text", async () => {
     const projection = projectClaudeTranscriptEntry({
       type: "assistant",
       isApiErrorMessage: true,
@@ -57,14 +60,30 @@ describe("Claude transcript projection", () => {
       },
     }, { sessionId: "s1", jobId: "j1" });
 
-    expect(projection.assistantText).toBe("");
+    expect(projection.assistantText).toBe("Claude Fable 5 is currently unavailable.");
+    expect(projection.turnEnded).toBe(true);
     expect(projection.events).toMatchObject([
       {
-        type: "error",
+        type: "assistant_text_delta",
         sessionId: "s1",
         jobId: "j1",
-        message: "Claude Fable 5 is currently unavailable.",
-        cause: "rate_limit",
+        text: "Claude Fable 5 is currently unavailable.",
+      },
+    ]);
+  });
+
+  it("surfaces unknown Claude system notices with text", () => {
+    const projection = projectClaudeTranscriptEntry({
+      type: "system",
+      subtype: "model_fallback_notice",
+      message: { content: [{ type: "text", text: "Claude Fable handed this turn to Opus after a safety check." }] },
+    }, { sessionId: "s1", jobId: "j1" });
+
+    expect(projection.events).toMatchObject([
+      {
+        type: "status_message",
+        sessionId: "s1",
+        text: "Claude Fable handed this turn to Opus after a safety check.",
       },
     ]);
   });
@@ -201,6 +220,36 @@ describe("TranscriptTailer", () => {
       { type: "assistant_text_delta", text: " second" },
       { type: "session_status_changed", status: "idle" },
       { type: "assistant_message_complete", text: "First second" },
+    ]);
+  });
+
+  it("ends the turn when Claude writes a synthetic API notice", async () => {
+    const transcript = path.join(tempDir, "session.jsonl");
+    writeFileSync(transcript, [
+      JSON.stringify({
+        type: "assistant",
+        isApiErrorMessage: true,
+        error: "safety_fallback",
+        message: {
+          content: [{ type: "text", text: "Claude Fable handed this turn to Opus after a safety check." }],
+        },
+      }),
+      "",
+    ].join("\n"), "utf8");
+
+    const tailer = new TranscriptTailer(transcript, { pollIntervalMs: 10 });
+    const events = [];
+    for await (const event of tailer.eventsUntilTurnEnd({
+      sessionId: "s1",
+      jobId: "j1",
+      idleTimeoutMs: 1000,
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toMatchObject([
+      { type: "assistant_text_delta", text: "Claude Fable handed this turn to Opus after a safety check." },
+      { type: "assistant_message_complete", text: "Claude Fable handed this turn to Opus after a safety check." },
     ]);
   });
 });
@@ -357,6 +406,37 @@ describe("transcript discovery", () => {
     });
 
     expect(active).toBeNull();
+  });
+
+  it("recovers the single human prompt after the offset while ignoring tool results", async () => {
+    const realPath = path.join(projectDir, "real-id.jsonl");
+    writeFileSync(realPath, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "old prompt" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "old answer" }] } }),
+      "",
+    ].join("\n"), "utf8");
+    const expectedOffset = statSync(realPath).size;
+    appendFileSync(realPath, [
+      JSON.stringify({ type: "user", message: { role: "user", content: " recorded prompt" } }),
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "MEMORY.md" } }] },
+      }),
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: [{ type: "tool_result", content: "tool output" }] },
+      }),
+      "",
+    ].join("\n"), "utf8");
+
+    const active = await locateSingleHumanPromptTurn({
+      expectedSessionId: "real-id",
+      knownPath: realPath,
+      minOffset: expectedOffset,
+      configDir,
+    });
+
+    expect(active).toEqual({ path: realPath, startOffset: expectedOffset });
   });
 
   it("returns null when nothing appears or grows before the timeout", async () => {

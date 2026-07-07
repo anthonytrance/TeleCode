@@ -77,6 +77,7 @@ import { SessionRegistry } from "./session-registry.js";
 import { findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
 import { readLatestCodexUsage, renderUsagePlain } from "./usage.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
+import { normalizePersistedWorkspace } from "./workspace-normalization.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
@@ -265,7 +266,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
   const startedAt = Date.now();
   const agentSessionStore = new JsonAgentSessionStore(agentSessionStatePath(config.workspace));
-  const agentSessions = new AgentSessionManager({ state: agentSessionStore.load() });
+  const agentSessionState = agentSessionStore.load();
+  for (const session of agentSessionState.sessions) {
+    session.workspace = normalizePersistedWorkspace(session.workspace, config.workspace);
+  }
+  const agentSessions = new AgentSessionManager({ state: agentSessionState });
   const outputBuffer = new OutputBuffer();
   const busyProviders = new Map<TelegramContextKey, Set<AgentProviderKind>>();
   agentSessions.importLegacyContexts(registry.listContexts(), { defaultProvider: "codex", selectImported: true });
@@ -630,6 +635,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         shouldReplaceSessionDisplayName(existing.displayName, options.displayName, existing.providerSessionId, provider)
       ) {
         next = agentSessions.updateDisplayName(existing.id, options.displayName);
+      }
+      if (options.metadata) {
+        next = agentSessions.updateMetadata(existing.id, options.metadata);
       }
       if (options.select) {
         agentSessions.selectSession(contextKey, existing.id);
@@ -2400,18 +2408,33 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       // descriptor and propagate the real id into both state stores so --resume works.
       try {
         const refreshed = await claudeAdapter.getSessionInfo(descriptor.id);
-        if (
+        const providerSessionChanged = Boolean(
           refreshed.providerSessionId &&
-          refreshed.providerSessionId !== descriptor.providerSessionId
-        ) {
-          descriptor = refreshed;
-          claudeSessions.set(contextKey, refreshed);
+            refreshed.providerSessionId !== descriptor.providerSessionId,
+        );
+        const refreshedDisplayName = refreshed.displayName &&
+          shouldReplaceSessionDisplayName(
+            descriptor.displayName,
+            refreshed.displayName,
+            refreshed.providerSessionId,
+            "claude",
+          )
+          ? refreshed.displayName
+          : descriptor.displayName;
+        descriptor = {
+          ...refreshed,
+          displayName: refreshedDisplayName,
+        };
+        claudeSessions.set(contextKey, descriptor);
+        if (providerSessionChanged && refreshed.providerSessionId) {
           agentSessions.updateProviderSessionId(agentSession.id, refreshed.providerSessionId);
-          if (refreshed.displayName) {
-            agentSessions.updateDisplayName(agentSession.id, refreshed.displayName);
-          }
-          persistAgentSessionState();
         }
+        if (refreshedDisplayName) {
+          agentSessions.updateDisplayName(agentSession.id, refreshedDisplayName);
+        }
+        agentSessions.updateMetadata(agentSession.id, refreshed.metadata);
+        persistAgentSessionState();
+        persistClaudeSession(contextKey, descriptor);
       } catch {
         // Non-fatal: keep the existing descriptor if the adapter cannot be queried.
       }

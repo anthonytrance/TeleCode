@@ -82,6 +82,22 @@ describe("AgentSessionManager", () => {
     });
   });
 
+  it("updates session metadata without changing the selected session", () => {
+    const manager = createManager();
+    const session = manager.createSession("123", "claude", {
+      workspace: "/workspace",
+      metadata: { model: "sonnet" },
+    });
+
+    const updated = manager.updateMetadata(session.id, { model: "fable" });
+
+    expect(updated.metadata).toEqual({ model: "fable" });
+    expect(manager.getSelectedSession("123")).toMatchObject({
+      id: session.id,
+      metadata: { model: "fable" },
+    });
+  });
+
   it("imports legacy Codex context metadata into stable selected sessions", () => {
     const manager = createManager();
     const contexts: ContextMetadata[] = [

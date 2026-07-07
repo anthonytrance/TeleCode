@@ -28,10 +28,12 @@ import {
   findTranscript,
   locateActiveTranscript,
   locateActiveTranscriptTurnByPrompt,
+  locateSingleHumanPromptTurn,
   locateTranscriptTurnByPrompt,
   sessionIdFromTranscriptPath,
   snapshotTranscriptSizes,
   TranscriptTailer,
+  type ActiveTranscript,
   type ClaudeUsageSnapshot,
 } from "./claude-transcript.js";
 
@@ -263,6 +265,13 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
             outputTokens: event.outputTokens ?? 0,
             contextTokens: (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
           };
+        } else if (event.type === "model_updated") {
+          runtime.model = event.model;
+          runtime.descriptor.metadata = {
+            ...runtime.descriptor.metadata,
+            model: event.model,
+          };
+          runtime.descriptor.updatedAt = Date.now();
         } else if (event.type === "session_title_changed") {
           runtime.descriptor.displayName = event.title;
           runtime.descriptor.updatedAt = Date.now();
@@ -659,32 +668,53 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     // so a concurrent standalone Claude cannot have its transcript mistaken for this turn.
     const projectDir = knownPath ? dirname(knownPath) : undefined;
 
-    const before = await snapshotTranscriptSizes(configDir);
     const screenBefore = runtime.pty?.strippedText() ?? "";
-    await send();
-
     const requirePromptEcho = options.requirePromptEcho ?? true;
     const disposeOnFailure = options.disposeOnFailure ?? true;
-    const active = requirePromptEcho
-      ? await locateActiveTranscriptTurnByPrompt({
-          before,
-          promptText,
-          expectedSessionId: runtime.providerSessionId,
-          knownPath,
-          knownOffset,
-          timeoutMs: 30000,
-          configDir,
-          projectDir,
-        })
-      : await locateActiveTranscript({
-          before,
-          expectedSessionId: runtime.providerSessionId,
-          knownPath,
-          knownOffset,
-          timeoutMs: 30000,
-          configDir,
-          projectDir,
-        });
+    const locate = async (
+      before: Map<string, number>,
+      offset: number,
+      timeoutMs: number,
+    ): Promise<ActiveTranscript | null> => {
+      return requirePromptEcho
+        ? await locateActiveTranscriptTurnByPrompt({
+            before,
+            promptText,
+            expectedSessionId: runtime.providerSessionId,
+            knownPath,
+            knownOffset: offset,
+            timeoutMs,
+            configDir,
+            projectDir,
+          })
+        : await locateActiveTranscript({
+            before,
+            expectedSessionId: runtime.providerSessionId,
+            knownPath,
+            knownOffset: offset,
+            timeoutMs,
+            configDir,
+            projectDir,
+          });
+    };
+
+    const before = await snapshotTranscriptSizes(configDir);
+    await send();
+
+    let active = await locate(before, knownOffset, requirePromptEcho ? 8000 : 30000);
+    if (!active && requirePromptEcho && runtime.pty?.isAlive) {
+      const ready = await runtime.pty.waitForReadyPrompt(2500);
+      if (ready) {
+        runtime.pty.clearInput();
+        await sleep(100);
+        const retryKnownOffset = knownPath && existsSync(knownPath) ? safeFileSize(knownPath) : 0;
+        const retryBefore = await snapshotTranscriptSizes(configDir);
+        await send();
+        active = await locate(retryBefore, retryKnownOffset, 30000);
+      } else {
+        active = await locate(before, knownOffset, 22000);
+      }
+    }
     if (!active) {
       if (requirePromptEcho) {
         const recovered = await locateTranscriptTurnByPrompt({
@@ -697,12 +727,28 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         if (recovered) {
           return this.reconcileLocatedTranscript(runtime, recovered);
         }
+        const singlePrompt = await locateSingleHumanPromptTurn({
+          expectedSessionId: runtime.providerSessionId,
+          knownPath,
+          minOffset: knownOffset,
+          configDir,
+        });
+        if (singlePrompt) {
+          return this.reconcileLocatedTranscript(runtime, singlePrompt);
+        }
 
         const tail = screenTail(runtime.pty);
         // Do not type /exit here. On prompt-location failure Claude may still have the
         // user's prompt sitting in the input box; graceful /exit would append to it and
         // can submit a corrupted prompt.
-        await this.stopRuntimePty(runtime, { graceful: false });
+        if (runtime.pty?.isAlive) {
+          const ready = await runtime.pty.waitForReadyPrompt(1000);
+          if (ready) {
+            runtime.pty.clearInput();
+          } else {
+            await this.stopRuntimePty(runtime, { graceful: false });
+          }
+        }
         throw new Error(`Claude did not record the prompt in its transcript. Screen tail: ${tail}`);
       }
 
@@ -833,7 +879,6 @@ const CLAUDE_MODEL_FAILURE_MARKERS = [
   /notinyourorganizationsallowedmodels/,
   /notinyourorganization'sallowedmodels/,
   /requiresusagecredits/,
-  /usagecredits/,
   /enableusagecredits/,
   /unknownmodel/,
   /invalidmodel/,

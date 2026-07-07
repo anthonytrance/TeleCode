@@ -121,6 +121,12 @@ export type AgentProviderEvent =
       title: string;
     }
   | {
+      type: "model_updated";
+      sessionId: string;
+      jobId?: string;
+      model: string;
+    }
+  | {
       type: "usage_updated";
       sessionId: string;
       jobId?: string;

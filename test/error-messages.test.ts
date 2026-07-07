@@ -40,6 +40,12 @@ describe("error-messages", () => {
       expect(result.userMessage).toContain("Access denied");
     });
 
+    it("does not treat Claude Code footer text as access denial", () => {
+      const result = translateError(new Error("Claude did not record the prompt. Screen tail: bypass permissions on"));
+      expect(result.userMessage).toContain("did not record the prompt");
+      expect(result.userMessage).not.toContain("Access denied");
+    });
+
     it("translates model not found", () => {
       const result = translateError(new Error("404 model not found"));
       expect(result.userMessage).toContain("/model");

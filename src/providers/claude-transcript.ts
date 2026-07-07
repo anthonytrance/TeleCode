@@ -263,6 +263,29 @@ export async function locateTranscriptTurnByPrompt(options: {
   return null;
 }
 
+/**
+ * Last-resort recovery for interactive PTY races: if the exact prompt comparison
+ * missed, but the transcript contains a single real human prompt after the
+ * pre-send offset, use that prompt as the turn boundary. Tool-result user entries
+ * are deliberately ignored, because Claude writes those during its own tool loop.
+ */
+export async function locateSingleHumanPromptTurn(options: {
+  expectedSessionId?: string;
+  knownPath?: string;
+  minOffset?: number;
+  configDir?: string;
+}): Promise<ActiveTranscript | null> {
+  const candidates = await transcriptPromptRecoveryCandidates(options);
+  for (const candidate of candidates) {
+    const minOffset = candidate === options.knownPath ? options.minOffset : undefined;
+    const matches = findHumanPromptOffsets(candidate, minOffset);
+    if (matches.length === 1) {
+      return { path: candidate, startOffset: matches[0]! };
+    }
+  }
+  return null;
+}
+
 export function sessionIdFromTranscriptPath(transcriptPath: string): string {
   return path.basename(transcriptPath, ".jsonl");
 }
@@ -309,15 +332,25 @@ export function projectClaudeTranscriptEntry(
   const entryType = asString(entry.type);
   if (entryType === "assistant") {
     const message = asObject(entry.message);
-    if (entry.isApiErrorMessage === true || entry.error) {
-      const errorText = extractAssistantText(message) || asString(entry.error) || "Claude API error";
+    const observedModel = asString(message?.model);
+    if (observedModel && observedModel !== "<synthetic>") {
       events.push({
-        type: "error",
+        type: "model_updated",
         sessionId: options.sessionId,
         jobId: options.jobId,
-        message: errorText,
-        cause: entry.error,
+        model: observedModel,
       });
+    }
+    if (entry.isApiErrorMessage === true || entry.error) {
+      const errorText = extractAssistantText(message) || asString(entry.error) || "Claude API error";
+      assistantText += errorText;
+      events.push({
+        type: "assistant_text_delta",
+        sessionId: options.sessionId,
+        jobId: options.jobId,
+        text: errorText,
+      });
+      turnEnded = true;
       return { events, assistantText, turnEnded, compactBoundary, usage };
     }
     const content = asArray(message?.content);
@@ -398,11 +431,18 @@ export function projectClaudeTranscriptEntry(
         summary: formatCompactBoundary(compactBoundary),
       });
     } else if (subtype && !IGNORED_SYSTEM_SUBTYPES.has(subtype)) {
-      events.push({
-        type: "session_status_changed",
-        sessionId: options.sessionId,
-        status: "running",
-      });
+      const noticeText = extractSystemNoticeText(entry);
+      events.push(noticeText
+        ? {
+            type: "status_message",
+            sessionId: options.sessionId,
+            text: noticeText,
+          }
+        : {
+            type: "session_status_changed",
+            sessionId: options.sessionId,
+            status: "running",
+          });
     }
   } else if (entryType === "ai-title") {
     const title = asString(entry.aiTitle).trim();
@@ -644,6 +684,30 @@ function extractAssistantText(message: JsonObject | undefined): string {
   return parts.join("");
 }
 
+function extractSystemNoticeText(entry: JsonObject): string {
+  const direct = asString(entry.text) || asString(entry.message) || asString(entry.notice) || asString(entry.content);
+  if (direct) {
+    return truncateOneLine(direct, 1000);
+  }
+
+  const nested = asObject(entry.message);
+  const nestedText = asString(nested?.text) || asString(nested?.content);
+  if (nestedText) {
+    return truncateOneLine(nestedText, 1000);
+  }
+
+  const parts: string[] = [];
+  for (const block of asArray(entry.content ?? nested?.content)) {
+    const blockObject = asObject(block);
+    if (typeof block === "string") {
+      parts.push(block);
+    } else if (asString(blockObject?.type) === "text") {
+      parts.push(asString(blockObject?.text));
+    }
+  }
+  return truncateOneLine(parts.join(" "), 1000);
+}
+
 async function transcriptPromptRecoveryCandidates(options: {
   expectedSessionId?: string;
   knownPath?: string;
@@ -709,6 +773,33 @@ function findLastPromptOffset(filePath: string, normalizedPrompt: string, minOff
   return lastMatch;
 }
 
+function findHumanPromptOffsets(filePath: string, minOffset = 0): number[] {
+  let buffer: Buffer;
+  try {
+    buffer = readFileSync(filePath);
+  } catch {
+    return [];
+  }
+
+  const matches: number[] = [];
+  let lineStart = 0;
+  for (let index = 0; index <= buffer.length; index += 1) {
+    if (index < buffer.length && buffer[index] !== 0x0a) {
+      continue;
+    }
+    const lineEnd = index > lineStart && buffer[index - 1] === 0x0d ? index - 1 : index;
+    if (lineEnd > lineStart && lineStart >= minOffset) {
+      const line = buffer.subarray(lineStart, lineEnd).toString("utf8").trim();
+      if (humanPromptFromJsonLine(line)) {
+        matches.push(lineStart);
+      }
+    }
+    lineStart = index + 1;
+  }
+
+  return matches;
+}
+
 function dedupeTranscriptCandidates(
   candidates: Array<{ path: string; minOffset: number; priority: number }>,
 ): Array<{ path: string; minOffset: number; priority: number }> {
@@ -725,6 +816,10 @@ function dedupeTranscriptCandidates(
 }
 
 function userPromptFromJsonLine(line: string): string | undefined {
+  return humanPromptFromJsonLine(line);
+}
+
+function humanPromptFromJsonLine(line: string): string | undefined {
   let entry: JsonObject;
   try {
     entry = JSON.parse(line) as JsonObject;
@@ -737,7 +832,11 @@ function userPromptFromJsonLine(line: string): string | undefined {
   if (entry.isMeta === true || entry.isCompactSummary === true) {
     return undefined;
   }
-  return extractUserText(entry);
+  const text = extractUserText(entry);
+  if (!text || text.startsWith("<local-command-caveat>") || text.startsWith("<command-name>")) {
+    return undefined;
+  }
+  return text;
 }
 
 function normalizePromptText(text: string): string {

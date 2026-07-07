@@ -7,6 +7,7 @@ import type { CodexBackend, ProgressDelivery, TeleCodexConfig } from "./config.j
 import type { TelegramContextKey } from "./context-key.js";
 import { parseJsonFileText } from "./json.js";
 import type { AgentProviderKind } from "./providers/types.js";
+import { normalizePersistedWorkspace } from "./workspace-normalization.js";
 
 export interface ContextMetadata {
   contextKey: TelegramContextKey;
@@ -148,7 +149,7 @@ export class SessionRegistry {
     const next: ContextMetadata = {
       contextKey,
       threadId: info.threadId,
-      workspace: info.workspace,
+      workspace: normalizePersistedWorkspace(info.workspace, this.config.workspace),
       model: info.model,
       reasoningEffort: info.reasoningEffort,
       launchProfileId: info.nextLaunchProfileId ?? info.launchProfileId,
@@ -212,7 +213,10 @@ export class SessionRegistry {
       const data = parseJsonFileText<ContextMetadata[]>(raw);
       for (const entry of data) {
         if (entry.contextKey) {
-          this.metadata.set(entry.contextKey, entry);
+          this.metadata.set(entry.contextKey, {
+            ...entry,
+            workspace: normalizePersistedWorkspace(entry.workspace, this.config.workspace),
+          });
         }
       }
     } catch {

@@ -15,6 +15,7 @@ const mockClaude = vi.hoisted(() => {
   const getSessionInfo = vi.fn();
   const dispose = vi.fn();
   let createCount = 0;
+  let activeModel = "sonnet";
   let promptGate: Promise<void> | undefined;
   let releasePromptGate: (() => void) | undefined;
 
@@ -28,6 +29,10 @@ const mockClaude = vi.hoisted(() => {
       createCount += 1;
       return createCount;
     },
+    setActiveModel: (model: string) => {
+      activeModel = model;
+    },
+    getActiveModel: () => activeModel,
     blockNextPrompt: () => {
       promptGate = new Promise<void>((resolve) => {
         releasePromptGate = resolve;
@@ -45,6 +50,7 @@ const mockClaude = vi.hoisted(() => {
     reset: () => {
       prompts.length = 0;
       createCount = 0;
+      activeModel = "sonnet";
       releasePromptGate?.();
       promptGate = undefined;
       releasePromptGate = undefined;
@@ -75,6 +81,9 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
 
     async createSession(options: { workspace?: string; displayName?: string; metadata?: Record<string, unknown> }) {
       const createCount = mockClaude.nextCreateCount();
+      if (typeof options.metadata?.model === "string") {
+        mockClaude.setActiveModel(options.metadata.model);
+      }
       const descriptor = {
         id: `claude-provider-${createCount}`,
         provider: "claude",
@@ -107,7 +116,7 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
         capabilities: this.capabilities,
         createdAt: 1000,
         updatedAt: 2000,
-        metadata: { model: "sonnet", permissionMode: "acceptEdits" },
+        metadata: { model: mockClaude.getActiveModel(), permissionMode: "acceptEdits" },
       };
       mockClaude.getSessionInfo();
       return descriptor;
@@ -116,6 +125,10 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
     async *sendPrompt(options: { sessionId: string; jobId: string; input: { text?: string } }) {
       const text = options.input.text ?? "";
       mockClaude.prompts.push(text);
+      const modelMatch = text.match(/^\/model\s+(.+)$/u);
+      if (modelMatch?.[1]) {
+        mockClaude.setActiveModel(modelMatch[1].trim());
+      }
       yield {
         type: "session_status_changed",
         sessionId: options.sessionId,
@@ -362,6 +375,10 @@ describe("Claude bot flow", () => {
     expect(mockClaude.dispose).not.toHaveBeenCalledWith("claude-provider-1");
     expect(mockClaude.prompts).toEqual(["first", "/model opus"]);
     expect(sent.map((entry) => entry.text)).toContain("mock reply to /model opus");
+
+    await bot.handleUpdate(textUpdate(3, "/status"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Model: opus")));
+    expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude session:"))).toContain("Model: opus");
   });
 
   it("reports Claude diagnostics through /doctor while Claude is active", async () => {

@@ -140,6 +140,10 @@ export class ClaudePty extends EventEmitter {
     this.requireProc().write("\x1b");
   }
 
+  clearInput(): void {
+    this.requireProc().write("\x15");
+  }
+
   async sendPrompt(text: string): Promise<void> {
     if (/\r|\n/.test(text)) {
       this.requireProc().write(`\x1b[200~${text}\x1b[201~`);

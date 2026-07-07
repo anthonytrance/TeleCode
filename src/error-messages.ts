@@ -22,7 +22,7 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
     message: "Authentication failed. Use /login to re-authenticate or check your API key.",
   },
   {
-    pattern: /403|forbidden|permission/i,
+    pattern: /403|forbidden|permission denied|insufficient permission|not authorized|access denied/i,
     message: "Access denied. Check your API key permissions.",
   },
   {
