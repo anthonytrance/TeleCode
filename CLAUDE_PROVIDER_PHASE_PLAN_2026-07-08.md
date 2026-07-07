@@ -77,7 +77,17 @@ Phase A exit: build + full unit suite green, `npm run test:claude-bot-smoke` PAS
 
 File: `src/bot.ts` narration state machine (~lines 2196–2360). Invariant to enforce and test: EVERY assistant text block reaches Telegram EXACTLY once — as progress or as final, never both, never neither — including when: idle timer flushed the last block before `turn_duration` arrived (D5); the turn errors mid-way; delta and complete arrive in the same tailer batch. Add fixture tests in `test/bot-claude-flow.test.ts` for the three orderings (complete-before-timer, timer-before-complete, error-after-partial-stream). Fix any violation the tests reveal (likely: none delivered as "final" is fine content-wise since reactions signal completion — but assert no loss/no dup).
 
-### B2. Document + track the upstream transcript gap (D3)
+### B2. Edit-mode progress truncation — CROSS-PROVIDER (Anthony-reported 2026-07-08)
+
+Root cause found: in `edit` progress mode both providers render the rolling progress message through `renderAssistantProgressMessage` (`src/bot.ts:6646`), and `trimProgressText` (`src/bot.ts:6680`) hard-truncates EVERY narration line at 500 chars (also flattens its newlines); `trimProgressToolName` cuts tool lines at 120. Anthony reads narration blocks cut off mid-sentence. The caps exist to keep the single edited message under the 4000-char Telegram edit limit, but content loss is not acceptable.
+
+Fix (single point, applies to Codex AND Claude since the render function is shared):
+- Never truncate narration CONTENT. Budget the edited message at ~3500 chars total. Fit as many of the most recent COMPLETE lines as the budget allows (drop OLDEST lines first, not characters).
+- If a single narration block alone exceeds the budget: freeze the current progress message as-is, send the long block as its own ordinary message (chunked via `splitMarkdownForTelegram` — full content, no cuts), then continue the rolling edit message with subsequent lines. Preserve newlines inside a block (drop the `\s+`→single-space flattening for narration; keep it for tool lines).
+- Keep the 120-char tool-line trim (tool lines are summaries by design; full output is governed by TOOL_VERBOSITY).
+- Tests: fixture with a 2000-char and a 6000-char narration block in edit mode → assert no "..." truncation of narration, correct rollover message count/order, and the edited message never exceeds 4000 chars. Assert the same render path drives the Codex progress test.
+
+### B3. Document + track the upstream transcript gap (D3)
 
 Add a short section to `CLAUDE_PROVIDER_DESIGN.md` under Section 2 stating: on Claude Code 2.1.198 interim assistant text blocks are not reliably written to the transcript; PTY-backend narration is therefore BEST-EFFORT; the acceptance test "every interim block delivered" is only achievable on the SDK backend (Phase C). Check the installed Claude Code version (`claude --version`) during Phase C and note whether newer versions fix it.
 
@@ -92,6 +102,16 @@ Goal: same provider surface, same commands, same session UX — different engine
 - Verify billing status: fetch Anthropic support article 15036540 and the Agent SDK overview page; confirm the "separate credit bucket for Agent SDK / claude -p" change is still PAUSED (it was as of 2026-06-16 per CLAUDE_PROVIDER_DESIGN.md §6). If un-paused: STOP, report to Anthony, do not build on the subscription.
 - `npm install @anthropic-ai/claude-agent-sdk` (pin exact version). Auth: the SDK auto-reads `C:\Users\Anthony\.claude\.credentials.json` (verified 2026-06-17); no key handling in our code.
 - Spike script `scripts/claude-sdk-spike.mjs` (throwaway, do not commit results, delete after): one `query()` turn, print the raw message stream. Confirm: (a) an init/system message carries the session id; (b) EVERY assistant text block arrives as its own message (this is the D3 fix — if interim blocks are missing here too, abort Phase C and report); (c) `resume` with the session id continues the conversation; (d) usage totals arrive on the result message. Run it with env scrubbed of `TELEGRAM_BOT_TOKEN` and confirm no Telegram polling from the child (rule 1).
+- ORCHESTRATION-PARITY checklist (Anthony's question: does the SDK have everything interactive Claude Code has?). The SDK runs the same agent core, but parity is NOT the default — these options must be set and each one verified in the spike:
+  - `systemPrompt: { type: "preset", preset: "claude_code" }` — without this the SDK uses an empty system prompt, NOT Claude Code's.
+  - `settingSources: ["user", "project"]` — without this the SDK loads NO CLAUDE.md, NO user/project settings, NO skills from `~/.claude/skills`. This single option is what makes it behave like Anthony's interactive sessions.
+  - Tools: default full built-in toolset (Bash/Edit/Write/Glob/Grep/WebSearch/Task subagents) — confirm none need explicit `allowedTools`.
+  - Skills + custom slash commands from `.claude/commands` — confirm they load with the settingSources above.
+  - Built-in slash commands as input (`/compact`, `/clear`, `/model`): verify which are accepted through SDK input (streaming input mode) vs must stay EMULATE/SURFACE in the registry; update the C2 registry overrides with the verified list.
+  - `forkSession: true` alongside `resume` — the SDK-native session fork (needed for C5).
+  - `includePartialMessages` — optional finer-grained streaming deltas; if stable, narration can stream even within one text block.
+  - Hooks (PreToolUse/PostToolUse) and `canUseTool` — not needed for TeleCodex V1 (bypassPermissions), just confirm availability for later.
+  - Known interactive-ONLY features that will NOT work on the SDK backend and stay PTY/EMULATE: the TUI checkpoint/rewind system (`/rewind`), interactive pickers, `#` memory shortcut. Record the verified list in this file's Execution log.
 
 ### C1. Engine
 
@@ -102,9 +122,12 @@ New file `src/providers/claude-sdk-engine.ts`. It implements the SAME internal r
 - Abort: SDK interrupt/abort API (pin the exact call during C0 spike). Compact: if the SDK exposes no manual compact, implement `/compact` on the SDK backend as SURFACE ("automatic on the SDK backend") — do not fake it.
 - Options per turn: `model` (from lane state), `permissionMode: "bypassPermissions"` (matches `CLAUDE_PERMISSION_MODE`), `cwd: config.claudeWorkspace`, env WITHOUT `TELEGRAM_BOT_TOKEN`, plugins/settings sources restricted so no user-scoped plugin loads (pin exact option names during C0; the SDK has settings-source controls).
 
-### C2. Backend switch
+### C2. Backend switch — LIVE COMMAND, no restart (Anthony's requirement)
 
-- New env/config `CLAUDE_BACKEND=pty|sdk` (default `pty`; `src/config.ts` + `.env.example`). `createBot` constructs the adapter with the chosen engine. The adapter's Telegram-facing behavior (events, descriptors, reactions, queue from Phase A) is IDENTICAL — the A2 queue and A1 gate sit ABOVE the engine and apply to both.
+- TeleCodex already has a per-context, persisted, restart-free backend switch for Codex: `bot.command("backend", ...)` at `src/bot.ts:4523` (`/backend sdk|appserver`). EXTEND that same command for the Claude provider instead of inventing a new one: when the lane's active provider is Claude, `/backend` shows the current Claude engine, and `/backend sdk` / `/backend pty` switches it. Per-context, persisted in the same state store the Codex backend choice uses, effective from the NEXT turn (dispose the lane's current PTY runtime lazily on switch so the next prompt starts on the new engine; never dispose mid-turn — if busy, reply "will switch when the current turn ends" and apply at turn end).
+- `CLAUDE_BACKEND=pty|sdk` env var remains as the DEFAULT for contexts that never ran `/backend` (`src/config.ts` + `.env.example`). Register the command name in the Claude command registry as EMULATE so it is never typed into the PTY.
+- Session continuity across the switch: both engines speak the same session-id space (the SDK stores sessions in the same `~/.claude/projects` transcript format), so `resume` after a backend switch continues the SAME conversation. C3 must include a test/smoke step proving: turn on pty → `/backend sdk` → next turn resumes the same session, and back.
+- The adapter's Telegram-facing behavior (events, descriptors, reactions, queue from Phase A) is IDENTICAL on both engines — the A2 queue and A1 gate sit ABOVE the engine and apply to both.
 - `/steer` on the SDK backend: if the SDK's streaming-input mode is not wired (per-turn `resume` model), implement steer-while-running as: append to the A2 queue with a "steer" flag delivered immediately after the current turn (documented behavioral difference, tell the user "queued for after this turn"); steer-while-idle starts a turn (same as PTY).
 - Command registry: add optional `sdkClass?: ClaudeCommandClass` to `ClaudeCommandSpec` (`src/providers/claude-commands.ts`); default = same class. Known overrides only: `/compact` → surface (see C1); everything classed `dispatch`/`dispatch_arg` sends the same text as a prompt through the SDK (skills/workflows are just prompts and work unchanged); `emulate`/`surface`/`na`/`block` are backend-independent already. Add a test asserting every spec resolves to a handler class on BOTH backends.
 
@@ -116,13 +139,20 @@ New file `src/providers/claude-sdk-engine.ts`. It implements the SAME internal r
 
 ### C4. Ship
 
-- Anthony's `.env` gets `CLAUDE_BACKEND=sdk` ONLY after C3 passes; he restarts the bridge himself. Log line on boot must state the active backend. Document in `.env.example`: "sdk = full progress narration, currently billed to subscription (policy pause, revocable — see CLAUDE_PROVIDER_DESIGN.md §6); pty = guaranteed subscription floor."
+- After C3 passes, tell Anthony; he switches with `/backend sdk` in Telegram per context (no restart needed, per C2). `.env` `CLAUDE_BACKEND=sdk` optionally flips the default for new contexts. Log line on boot and on every switch must state the active backend. Document in `.env.example`: "sdk = full progress narration, currently billed to subscription (policy pause, revocable — see CLAUDE_PROVIDER_DESIGN.md §6); pty = guaranteed subscription floor."
+
+### C5. Session commands: /resume <target> and /fork (IN SCOPE — Anthony asked, 2026-07-08)
+
+- `/resume <target>`: the lane/session machinery already exists (`agent-session-manager.ts`, `/sessions`, `/switch`) — wire the Claude `/resume <n|id|title-prefix>` emulation (`src/bot.ts` ~2820, currently "not implemented") to select that agent session and attach its `providerSessionId` so the next turn resumes it. Bare `/resume` lists the lane's Claude sessions (reuse the `/sessions` renderer) instead of only "session is attached".
+- `/fork`: creates a NEW agent session in the lane pointing at the CURRENT conversation state, then continues there, leaving the original session intact. SDK backend: `resume: <id>, forkSession: true` (verified in C0). PTY backend: spawn with `--resume <id> --fork-session` (verify the exact CLI flag during C0; if interactive mode lacks a non-interactive fork flag, fork on the PTY backend = reply "fork requires the sdk backend, use /backend sdk" rather than a broken emulation).
+- `/branch`: alias of `/fork` unless a distinct Claude Code semantic is found during C0; then implement or NA it explicitly.
+- Tests: fork produces a new session whose next turn does not advance the original; `/resume <target>` switches transcripts; both covered by unit tests with faked engines, plus one smoke assertion each.
 
 Phase C exit: suite + both smokes green, committed, pushed, and a short summary appended to this file under "Execution log".
 
 ## Phase D (optional backlog, only if Anthony asks)
 
-- `/resume <target>` picking a specific session (currently "not implemented" reply, `src/bot.ts` ~2820), `/branch` `/fork` `/rewind` real emulations via the agent-session-manager.
+- `/rewind` real emulation (TUI checkpoint system — likely PTY-impossible and SDK-unsupported; investigate before promising).
 - Live-fetch CI check diffing `claude-commands.ts` against code.claude.com's command list (DESIGN.md §3 note from 2026-07-01).
 - Design §2's five-level `/verbosity` mapping (current three-level messages/edit/none works for Anthony today).
 
