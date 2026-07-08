@@ -1,6 +1,8 @@
 import {
   formatToolSummaryLine,
   formatTurnUsageLine,
+  isOversizedProgressBlock,
+  PROGRESS_EDIT_BUDGET_CHARS,
   renderAssistantProgressMessage,
   renderSummaryProgressMessage,
   summarizeToolName,
@@ -72,6 +74,33 @@ describe("tool summary formatting", () => {
     );
     expect(rendered.fallbackText).not.toContain("Working: bash");
     expect(rendered.fallbackText).not.toContain("Tools used");
+  });
+
+  it("never truncates narration blocks and preserves their newlines", () => {
+    const block = `first paragraph line\nsecond paragraph line\n\n${"x".repeat(2000)}`;
+    const rendered = renderAssistantProgressMessage([block]);
+
+    expect(rendered.fallbackText).toBe(`Progress:\n- ${block}`);
+    expect(rendered.fallbackText).not.toContain("...");
+    expect(rendered.text.length).toBeLessThanOrEqual(4000);
+  });
+
+  it("drops oldest blocks, never characters, when the edit budget is exceeded", () => {
+    const older = `OLDER ${"a".repeat(2000)}`;
+    const middle = `MIDDLE ${"b".repeat(2000)}`;
+    const newest = `NEWEST ${"c".repeat(2000)}`;
+    const rendered = renderAssistantProgressMessage([older, middle, newest]);
+
+    expect(rendered.fallbackText).toContain(newest);
+    expect(rendered.fallbackText).not.toContain("MIDDLE");
+    expect(rendered.fallbackText).not.toContain("OLDER");
+    expect(rendered.fallbackText).not.toContain("...");
+    expect(rendered.text.length).toBeLessThanOrEqual(4000);
+  });
+
+  it("classifies blocks larger than the budget as oversized", () => {
+    expect(isOversizedProgressBlock("short update")).toBe(false);
+    expect(isOversizedProgressBlock("y".repeat(PROGRESS_EDIT_BUDGET_CHARS + 1))).toBe(true);
   });
 
   it("keeps the turn usage line format stable when enabled", () => {

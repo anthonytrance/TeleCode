@@ -91,6 +91,9 @@ const FIRST_INTERMEDIATE_UPDATE_MS = 2500;
 const INTERMEDIATE_UPDATE_MIN_MS = 30000;
 const SUMMARY_PROGRESS_UPDATE_MIN_MS = 30000;
 const SUMMARY_PROGRESS_RECENT_LIMIT = 5;
+// Budget for the rolling edit-mode progress message. Kept under Telegram's 4096-char
+// edit limit so the header and HTML escaping never push a full-content render over it.
+export const PROGRESS_EDIT_BUDGET_CHARS = 3500;
 // A held Claude narration line is flushed after this idle gap so the first line does not
 // wait for Claude's next block. Long enough that a normal turn ends (clearing it) first.
 const NARRATION_IDLE_FLUSH_MS = 1500;
@@ -1384,7 +1387,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     };
 
     const recordAssistantProgress = (text: string): void => {
-      const trimmed = trimProgressText(text);
+      // Narration content is never truncated or flattened; the renderer budgets
+      // whole blocks and the call sites divert oversized blocks to full messages.
+      const trimmed = text.trim();
       if (!trimmed) {
         return;
       }
@@ -1764,9 +1769,30 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
       lastAssistantProgressText = text;
-      recordAssistantProgress(text);
       accumulatedText = "";
       pendingStreamText = "";
+
+      if (isOversizedProgressBlock(text)) {
+        // The block alone exceeds the rolling-message budget. Freeze the current
+        // progress message, deliver the block in full as ordinary messages, and let
+        // subsequent lines start a fresh rolling message below it. Content is never cut.
+        recentAssistantProgress.length = 0;
+        if (responseMessageId) {
+          await removeAbortKeyboard();
+          responseMessageId = undefined;
+        }
+        lastProgressText = "";
+        for (const chunk of splitMarkdownForTelegram(text)) {
+          await sendTextMessage(bot.api, chatId, chunk.text, {
+            parseMode: chunk.parseMode,
+            fallbackText: chunk.fallbackText,
+            messageThreadId,
+          });
+        }
+        return;
+      }
+
+      recordAssistantProgress(text);
       await sendProgressUpdate(renderAssistantProgressMessage(recentAssistantProgress));
     };
     activeProgressRefreshers.set(contextKey, refreshAssistantProgress);
@@ -2363,6 +2389,23 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
       if (!isProviderForeground(contextKey, "claude")) {
         bufferClaudeOutput("assistant", trimmed, false);
+        return;
+      }
+
+      if (mode === "edit" && isOversizedProgressBlock(trimmed)) {
+        // The block alone exceeds the rolling-message budget. Freeze the current
+        // progress message, deliver the block in full as ordinary messages, and let
+        // subsequent lines start a fresh rolling message below it. Content is never cut.
+        recentClaudeProgress.length = 0;
+        progressMessageId = undefined;
+        for (const chunk of splitMarkdownForTelegram(trimmed)) {
+          await sendTextMessage(bot.api, source.chatId, chunk.text, {
+            parseMode: chunk.parseMode,
+            fallbackText: chunk.fallbackText,
+            messageThreadId,
+          });
+        }
+        sentAssistantProgress = true;
         return;
       }
 
@@ -6834,13 +6877,28 @@ export function renderSummaryProgressMessage(
 }
 
 export function renderAssistantProgressMessage(recentProgressLines: string[]): RenderedText {
-  const recentLines = recentProgressLines.slice(-SUMMARY_PROGRESS_RECENT_LIMIT);
+  const recent = recentProgressLines.slice(-SUMMARY_PROGRESS_RECENT_LIMIT);
+  // Fit the most recent complete narration blocks into the edit budget. Blocks are
+  // never truncated; oldest blocks roll off first. Blocks larger than the whole
+  // budget are routed around this message entirely by the call sites.
+  const selected: string[] = [];
+  let total = 0;
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
+    const block = recent[index];
+    const cost = progressBlockCost(block);
+    if (selected.length > 0 && total + cost > PROGRESS_EDIT_BUDGET_CHARS) {
+      break;
+    }
+    selected.unshift(block);
+    total += cost;
+  }
+
   const htmlLines = ["<b>Progress:</b>"];
   const plainLines = ["Progress:"];
 
-  for (const line of recentLines) {
-    htmlLines.push(`- ${escapeHTML(trimProgressText(line))}`);
-    plainLines.push(`- ${trimProgressText(line)}`);
+  for (const block of selected) {
+    htmlLines.push(`- ${escapeHTML(block)}`);
+    plainLines.push(`- ${block}`);
   }
 
   return {
@@ -6877,6 +6935,16 @@ function renderProgressCompletedMessage(): RenderedText {
   };
 }
 
+// Cost of one narration block inside the rolling progress message, measured on the
+// HTML-escaped text because escaping can inflate length past Telegram's edit limit.
+function progressBlockCost(block: string): number {
+  return escapeHTML(block).length + 3;
+}
+
+export function isOversizedProgressBlock(text: string): boolean {
+  return progressBlockCost(text) > PROGRESS_EDIT_BUDGET_CHARS;
+}
+
 function trimProgressToolName(toolName: string): string {
   const singleLine = toolName.replace(/\s+/g, " ").trim();
   return singleLine.length <= 120 ? singleLine : `${singleLine.slice(0, 119)}...`;
@@ -6886,10 +6954,6 @@ function formatProgressToolName(toolName: string): string {
   return trimProgressToolName(summarizeToolName(toolName));
 }
 
-function trimProgressText(text: string): string {
-  const singleLine = text.replace(/\s+/g, " ").trim();
-  return singleLine.length <= 500 ? singleLine : `${singleLine.slice(0, 499)}...`;
-}
 
 function renderTodoList(items: Array<{ text: string; completed: boolean }>): string {
   const lines = items.map((item) => {

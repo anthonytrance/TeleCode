@@ -470,6 +470,34 @@ describe("Claude bot flow", () => {
     expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude session:"))).toContain("Model: opus");
   });
 
+  it("delivers narration in full in edit mode, rolling oversized blocks into their own messages", async () => {
+    const { bot, sent } = await createTestBot(tempDir, { progressDelivery: "edit" });
+    const midBlock = `MID ${"m".repeat(2000)}`;
+    const hugeBlock = `HUGE ${"h".repeat(6000)}`;
+    mockClaude.setNextEvents([
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: midBlock },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: hugeBlock },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "FINAL_MARK" },
+      { type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "job-1", text: "FINAL_MARK" },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude narrate a lot"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("FINAL_MARK")));
+
+    const texts = sent.map((entry) => entry.text ?? "");
+    const midMessage = texts.find((text) => text.includes("MID "));
+    expect(midMessage).toBeDefined();
+    expect(midMessage).toContain(midBlock);
+
+    const hugeChars = texts.join("").split("h").length - 1;
+    expect(hugeChars).toBeGreaterThanOrEqual(6000);
+
+    for (const text of texts) {
+      expect(text.length).toBeLessThanOrEqual(4096);
+      expect(text).not.toMatch(/[mh]{3}\.\.\./u);
+    }
+  });
+
   it("shows the unified session list for /sessions while Claude is active", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
