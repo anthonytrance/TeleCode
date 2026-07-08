@@ -5170,17 +5170,30 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     pendingUnsafeLaunchConfirmations.delete(contextKey);
 
     const keyboard = paginateKeyboard(launchButtons, 0, "launch");
+    // Enumerate profiles in the message text so the picker works without buttons.
+    const plainProfileLines = config.launchProfiles.map((profile, index) => {
+      const marker = profile.id === selectedLaunchProfile.id ? " (selected)" : "";
+      const unsafeNote = profile.unsafe ? " [danger-full-access, needs confirm]" : "";
+      return `${index + 1}. ${profile.id} - ${formatLaunchProfileBehavior(profile)}${unsafeNote}${marker}`;
+    });
+    const htmlProfileLines = config.launchProfiles.map((profile, index) => {
+      const marker = profile.id === selectedLaunchProfile.id ? " <i>(selected)</i>" : "";
+      const unsafeNote = profile.unsafe ? " ⚠️ <i>danger-full-access, needs confirm</i>" : "";
+      return `${index + 1}. <code>${escapeHTML(profile.id)}</code> - ${escapeHTML(formatLaunchProfileBehavior(profile))}${unsafeNote}${marker}`;
+    });
     const htmlLines = [
       `<b>Selected launch profile:</b> <code>${escapeHTML(selectedLaunchProfile.label)}</code>`,
       `<b>Behavior:</b> <code>${escapeHTML(formatLaunchProfileBehavior(selectedLaunchProfile))}</code>`,
       "",
-      "Select a profile for new or reattached threads:",
+      "Profiles for new or reattached threads. Send /launch &lt;id&gt; to select (add confirm for unsafe ones):",
+      ...htmlProfileLines,
     ];
     const plainLines = [
       `Selected launch profile: ${selectedLaunchProfile.label}`,
       `Behavior: ${formatLaunchProfileBehavior(selectedLaunchProfile)}`,
       "",
-      "Select a profile for new or reattached threads:",
+      "Profiles for new or reattached threads. Send /launch <id> to select (add confirm for unsafe ones):",
+      ...plainProfileLines,
     ];
 
     if (selectedLaunchProfile.unsafe) {
@@ -5858,11 +5871,31 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     pendingModelButtons.set(contextKey, modelButtons);
     const keyboard = paginateKeyboard(modelButtons, 0, "model");
 
+    // Enumerate models in the message text so the picker works without buttons.
+    const plainModelLines = models.map((model, index) => {
+      const marker = model.slug === currentModel ? " (selected)" : "";
+      return `${index + 1}. ${model.slug}${marker}`;
+    });
+    const htmlModelLines = models.map((model, index) => {
+      const marker = model.slug === currentModel ? " <i>(selected)</i>" : "";
+      return `${index + 1}. <code>${escapeHTML(model.slug)}</code>${marker}`;
+    });
+
     await safeReply(
       ctx,
-      [`<b>Current model:</b> <code>${escapeHTML(currentModel)}</code>`, "", "Select a model for new threads:"].join("\n"),
+      [
+        `<b>Current model:</b> <code>${escapeHTML(currentModel)}</code>`,
+        "",
+        "Models for new threads. Send /model &lt;name&gt; to select:",
+        ...htmlModelLines,
+      ].join("\n"),
       {
-        fallbackText: [`Current model: ${currentModel}`, "", "Select a model for new threads:"].join("\n"),
+        fallbackText: [
+          `Current model: ${currentModel}`,
+          "",
+          "Models for new threads. Send /model <name> to select:",
+          ...plainModelLines,
+        ].join("\n"),
         replyMarkup: keyboard,
       },
     );
@@ -5973,11 +6006,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }));
     pendingEffortButtons.set(contextKey, effortButtons);
     const keyboard = paginateKeyboard(effortButtons, 0, "effort");
+    const levelList = efforts
+      .map((effort) => (effort === current ? `${effort} (selected)` : effort))
+      .join(", ");
     const text = current
-      ? `<b>Reasoning effort:</b> <code>${escapeHTML(current)}</code>\n\nSelect for new threads:`
-      : "<b>Reasoning effort:</b> not set (model default)\n\nSelect for new threads:";
+      ? `<b>Reasoning effort:</b> <code>${escapeHTML(current)}</code>\n\nLevels: ${escapeHTML(levelList)}\nSend /effort &lt;level&gt; to select for new threads.`
+      : `<b>Reasoning effort:</b> not set (model default)\n\nLevels: ${escapeHTML(levelList)}\nSend /effort &lt;level&gt; to select for new threads.`;
+    const plain = current
+      ? `Reasoning effort: ${current}\n\nLevels: ${levelList}\nSend /effort <level> to select for new threads.`
+      : `Reasoning effort: not set (model default)\n\nLevels: ${levelList}\nSend /effort <level> to select for new threads.`;
     await safeReply(ctx, text, {
-      fallbackText: text.replace(/<[^>]+>/g, ""),
+      fallbackText: plain,
       replyMarkup: keyboard,
     });
   });
@@ -6562,7 +6601,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     if (session && await rejectPromptWhileInspecting(ctx, contextKey)) {
       return;
     }
-    if (isBusy(contextKey)) {
+    // Only concurrent transcription/switching blocks a voice note. A busy provider
+    // does NOT: the transcript is queued below exactly like a text message would be.
+    if (getBusyState(contextKey).transcribing || getBusyState(contextKey).switching) {
       await sendBusyReply(ctx);
       return;
     }
@@ -6609,10 +6650,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     lastPromptInput.set(contextKey, transcript);
-    await setReaction(ctx, "👀");
     if (isClaudeActive(contextKey)) {
+      // handleClaudePrompt queues internally when the Claude lane is busy.
+      await setReaction(ctx, "👀");
       startClaudePrompt(ctx, contextKey, chatId, transcript);
     } else if (session) {
+      if (isBusy(contextKey)) {
+        await queuePromptReply(ctx, contextKey, chatId, session, transcript);
+        return;
+      }
+      await setReaction(ctx, "👀");
       startUserPrompt(ctx, contextKey, chatId, session, transcript);
     }
   });
