@@ -88,6 +88,21 @@ describe("Claude transcript projection", () => {
     ]);
   });
 
+  it("surfaces model fallback system notices even when Claude writes only a subtype", () => {
+    const projection = projectClaudeTranscriptEntry({
+      type: "system",
+      subtype: "model_refusal_fallback",
+    }, { sessionId: "s1", jobId: "j1" });
+
+    expect(projection.events).toMatchObject([
+      {
+        type: "status_message",
+        sessionId: "s1",
+        text: "Claude Fable refused this request and Claude switched to a fallback model.",
+      },
+    ]);
+  });
+
   it("ignores meta command echoes", () => {
     const projection = projectClaudeTranscriptEntry({
       type: "user",
@@ -250,6 +265,51 @@ describe("TranscriptTailer", () => {
     expect(events).toMatchObject([
       { type: "assistant_text_delta", text: "Claude Fable handed this turn to Opus after a safety check." },
       { type: "assistant_message_complete", text: "Claude Fable handed this turn to Opus after a safety check." },
+    ]);
+  });
+
+  it("uses the longer active-tool idle timeout while a Claude tool is running", async () => {
+    const transcript = path.join(tempDir, "session.jsonl");
+    writeFileSync(transcript, [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", name: "PowerShell", input: { command: "ytclip --selftest" } }],
+        },
+      }),
+      "",
+    ].join("\n"), "utf8");
+
+    setTimeout(() => {
+      appendFileSync(transcript, [
+        JSON.stringify({
+          type: "user",
+          message: { content: [{ type: "tool_result", content: "ok" }] },
+        }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "DONE" }] } }),
+        JSON.stringify({ type: "system", subtype: "turn_duration" }),
+        "",
+      ].join("\n"), "utf8");
+    }, 60);
+
+    const tailer = new TranscriptTailer(transcript, { pollIntervalMs: 10 });
+    const events = [];
+    for await (const event of tailer.eventsUntilTurnEnd({
+      sessionId: "s1",
+      jobId: "j1",
+      idleTimeoutMs: 20,
+      activeToolIdleTimeoutMs: 500,
+    })) {
+      events.push(event);
+    }
+
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    expect(events).toMatchObject([
+      { type: "tool_started", toolName: "PowerShell" },
+      { type: "tool_completed", toolName: "tool" },
+      { type: "assistant_text_delta", text: "DONE" },
+      { type: "session_status_changed", status: "idle" },
+      { type: "assistant_message_complete", text: "DONE" },
     ]);
   });
 });

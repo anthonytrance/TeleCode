@@ -52,6 +52,8 @@ const CLAUDE_CAPABILITIES: AgentProviderCapabilities = {
   artifacts: false,
 };
 
+const CLAUDE_ACTIVE_TOOL_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
 interface RuntimeSession {
   descriptor: AgentSessionDescriptor;
   providerSessionId: string;
@@ -250,20 +252,25 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         sessionId: runtime.descriptor.id,
         jobId: options.jobId,
         idleTimeoutMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
+        activeToolIdleTimeoutMs: Math.max(
+          this.config.claudeTurnIdleTimeoutSeconds * 1000,
+          CLAUDE_ACTIVE_TOOL_IDLE_TIMEOUT_MS,
+        ),
         shouldStop: () => runtime.abortRequested === true,
       })) {
         if (event.type === "error") {
+          const errorMessage = appendScreenTail(event.message, runtime.pty);
           await this.stopRuntimePty(runtime);
           if (partialAssistantText.trim()) {
             yield {
               type: "assistant_message_complete",
               sessionId: runtime.descriptor.id,
               jobId: options.jobId,
-              text: `${partialAssistantText.trim()}\n\nClaude stopped before finishing the turn: ${event.message}`,
+              text: `${partialAssistantText.trim()}\n\nClaude stopped before finishing the turn: ${errorMessage}`,
             };
             return;
           }
-          throw new Error(event.message);
+          throw new Error(errorMessage);
         }
         if (event.type === "assistant_text_delta") {
           partialAssistantText += event.text;
@@ -961,6 +968,14 @@ function safeFileSize(filePath: string): number {
 function screenTail(ptySession: ClaudePty | undefined): string {
   const text = ptySession?.strippedText().replace(/\s+/g, " ").trim() ?? "";
   return text.slice(-1000) || "(empty)";
+}
+
+function appendScreenTail(message: string, ptySession: ClaudePty | undefined): string {
+  const tail = screenTail(ptySession);
+  if (!tail || tail === "(empty)" || message.includes("Screen tail:")) {
+    return message;
+  }
+  return `${message}. Screen tail: ${tail}`;
 }
 
 /**

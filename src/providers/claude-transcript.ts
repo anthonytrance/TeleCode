@@ -44,6 +44,16 @@ const IGNORED_SYSTEM_SUBTYPES = new Set([
   "summary",
 ]);
 
+const SYSTEM_NOTICE_FALLBACKS = new Map<string, string>([
+  ["model_fallback", "Claude switched models for this response."],
+  ["model_refusal_fallback", "Claude Fable refused this request and Claude switched to a fallback model."],
+  ["model_consent_fallback", "Claude is asking before switching models for this response."],
+  ["model_refusal_no_fallback", "Claude Fable refused this request and did not switch to a fallback model."],
+  ["refusal_banner", "Claude displayed a refusal notice."],
+]);
+
+const DEFAULT_ACTIVE_TOOL_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
 export async function findTranscript(
   sessionId: string,
   timeoutMs: number,
@@ -480,6 +490,7 @@ export class TranscriptTailer {
     sessionId: string;
     jobId: string;
     idleTimeoutMs: number;
+    activeToolIdleTimeoutMs?: number;
     /**
      * Optional cancellation check. Polled each loop; when it returns true the tailer
      * stops promptly (within one poll interval) instead of waiting out the idle timeout.
@@ -490,6 +501,7 @@ export class TranscriptTailer {
     let collectedText = "";
     let lastBytesAt = Date.now();
     let lastUsage: ClaudeUsageSnapshot | undefined;
+    let activeToolCount = 0;
 
     while (true) {
       if (options.shouldStop?.()) {
@@ -514,6 +526,11 @@ export class TranscriptTailer {
           lastUsage = projection.usage;
         }
         for (const event of projection.events) {
+          if (event.type === "tool_started") {
+            activeToolCount += 1;
+          } else if (event.type === "tool_completed" || event.type === "tool_failed") {
+            activeToolCount = Math.max(0, activeToolCount - 1);
+          }
           yield event;
         }
         if (projection.turnEnded) {
@@ -539,12 +556,21 @@ export class TranscriptTailer {
         }
       }
 
-      if (Date.now() - lastBytesAt > options.idleTimeoutMs) {
+      const timeoutMs = activeToolCount > 0
+        ? Math.max(
+            options.idleTimeoutMs,
+            options.activeToolIdleTimeoutMs ?? DEFAULT_ACTIVE_TOOL_IDLE_TIMEOUT_MS,
+          )
+        : options.idleTimeoutMs;
+      if (Date.now() - lastBytesAt > timeoutMs) {
+        const messagePrefix = activeToolCount > 0
+          ? "Claude active tool idle timeout"
+          : "Claude turn idle timeout";
         yield {
           type: "error",
           sessionId: options.sessionId,
           jobId: options.jobId,
-          message: `Claude turn idle timeout after ${Math.round(options.idleTimeoutMs / 1000)} seconds`,
+          message: `${messagePrefix} after ${Math.round(timeoutMs / 1000)} seconds`,
         };
         return;
       }
@@ -705,7 +731,12 @@ function extractSystemNoticeText(entry: JsonObject): string {
       parts.push(asString(blockObject?.text));
     }
   }
-  return truncateOneLine(parts.join(" "), 1000);
+  const extracted = truncateOneLine(parts.join(" "), 1000);
+  if (extracted) {
+    return extracted;
+  }
+
+  return SYSTEM_NOTICE_FALLBACKS.get(asString(entry.subtype)) ?? "";
 }
 
 async function transcriptPromptRecoveryCandidates(options: {

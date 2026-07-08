@@ -2479,7 +2479,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           case "assistant_message_complete":
             clearNarrationIdleTimer();
             finalText = event.text.trim() || streamedText.trim() || pendingAssistantProgressText.trim();
-            finalAssistantBlock = pendingAssistantProgressText;
+            finalAssistantBlock = pendingAssistantProgressText.trim() || remainingCompletionText(finalText, streamedText);
             pendingAssistantProgressText = "";
             break;
           case "session_title_changed":
@@ -6840,6 +6840,21 @@ export function renderAssistantProgressMessage(recentProgressLines: string[]): R
     fallbackText: plainLines.join("\n"),
     parseMode: "HTML",
   };
+}
+
+function remainingCompletionText(completionText: string, streamedText: string): string {
+  const completion = completionText.trim();
+  const streamed = streamedText.trim();
+  if (!completion || !streamed) {
+    return completion;
+  }
+  if (completion === streamed) {
+    return "";
+  }
+  if (completion.startsWith(streamed)) {
+    return completion.slice(streamed.length).trim();
+  }
+  return completion;
 }
 
 function renderProgressCompletedMessage(): RenderedText {

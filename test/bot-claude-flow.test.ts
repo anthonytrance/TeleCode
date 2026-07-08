@@ -18,6 +18,7 @@ const mockClaude = vi.hoisted(() => {
   let activeModel = "sonnet";
   let promptGate: Promise<void> | undefined;
   let releasePromptGate: (() => void) | undefined;
+  let nextEvents: Array<Record<string, unknown>> | undefined;
 
   return {
     prompts,
@@ -33,6 +34,14 @@ const mockClaude = vi.hoisted(() => {
       activeModel = model;
     },
     getActiveModel: () => activeModel,
+    setNextEvents: (events: Array<Record<string, unknown>>) => {
+      nextEvents = events;
+    },
+    takeNextEvents: () => {
+      const events = nextEvents;
+      nextEvents = undefined;
+      return events;
+    },
     blockNextPrompt: () => {
       promptGate = new Promise<void>((resolve) => {
         releasePromptGate = resolve;
@@ -54,6 +63,7 @@ const mockClaude = vi.hoisted(() => {
       releasePromptGate?.();
       promptGate = undefined;
       releasePromptGate = undefined;
+      nextEvents = undefined;
       createSession.mockReset();
       resumeSession.mockReset();
       getSessionInfo.mockReset();
@@ -146,6 +156,13 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
       const gate = mockClaude.takePromptGate();
       if (gate) {
         await gate;
+      }
+      const customEvents = mockClaude.takeNextEvents();
+      if (customEvents) {
+        for (const event of customEvents) {
+          yield event;
+        }
+        return;
       }
       yield {
         type: "assistant_text_delta",
@@ -259,6 +276,39 @@ describe("Claude bot flow", () => {
 
     expect(sent.map((entry) => entry.text)).toContain(
       "Claude Code finished in background: long answer\n\nmock reply to long answer",
+    );
+  });
+
+  it("delivers a timeout completion warning after prior Claude progress was flushed", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.setNextEvents([
+      {
+        type: "assistant_text_delta",
+        sessionId: "claude-provider-1",
+        jobId: "job-1",
+        text: "Working on it.",
+      },
+      {
+        type: "tool_started",
+        sessionId: "claude-provider-1",
+        jobId: "job-1",
+        toolName: "PowerShell",
+        text: "ytclip --selftest",
+      },
+      {
+        type: "assistant_message_complete",
+        sessionId: "claude-provider-1",
+        jobId: "job-1",
+        text: "Working on it.\n\nClaude stopped before finishing the turn: Claude active tool idle timeout after 1800 seconds. Screen tail: switched to Opus 4.8",
+      },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude long tool"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Claude active tool idle timeout")));
+
+    expect(sent.map((entry) => entry.text)).toContain("Working on it.");
+    expect(sent.map((entry) => entry.text)).toContain(
+      "Claude stopped before finishing the turn: Claude active tool idle timeout after 1800 seconds. Screen tail: switched to Opus 4.8",
     );
   });
 
