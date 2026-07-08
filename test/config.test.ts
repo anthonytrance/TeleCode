@@ -128,6 +128,7 @@ describe("loadConfig", () => {
       claudeLargeSessionResume: "summary",
       claudeTurnIdleTimeoutSeconds: 180,
       claudeContextWindow: 200000,
+      claudeBackend: "pty",
     });
   });
 

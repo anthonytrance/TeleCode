@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import { bridgeLog } from "../bridge-log.js";
 import type { ClaudePermissionMode, TeleCodexConfig } from "../config.js";
+import { runClaudeSdkTurn } from "./claude-sdk-engine.js";
 import type {
   AgentProviderAdapter,
   AgentProviderCapabilities,
@@ -53,12 +54,15 @@ const CLAUDE_CAPABILITIES: AgentProviderCapabilities = {
   artifacts: false,
 };
 
+export type ClaudeBackend = "pty" | "sdk";
+
 interface RuntimeSession {
   descriptor: AgentSessionDescriptor;
   providerSessionId: string;
   workspace: string;
   model: string;
   permissionMode: ClaudePermissionMode;
+  backend: ClaudeBackend;
   pty?: ClaudePty;
   busy: boolean;
   /** Set by abort(); the running turn's tailer stops promptly instead of idling out. */
@@ -67,6 +71,13 @@ interface RuntimeSession {
   /** Path to the transcript Claude actually writes; discovered on the first turn. */
   transcriptPath?: string;
   ptyPid?: number;
+  /** Aborts the in-flight SDK turn; present only while an SDK turn runs. */
+  sdkAbortController?: AbortController;
+  /**
+   * False until Claude has revealed a real session id (fresh sessions start with a
+   * random UUID Claude ignores). SDK turns only pass `resume` once this is true.
+   */
+  hasLiveProviderSession: boolean;
 }
 
 type LocatedTurnOutput =
@@ -114,6 +125,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     });
     const runtime = this.runtimeFromDescriptor(descriptor);
     this.sessions.set(descriptor.id, runtime);
+    if (runtime.backend === "sdk") {
+      // The SDK spawns per turn; nothing to start eagerly. The first turn's init
+      // message reveals the real session id.
+      return { ...runtime.descriptor };
+    }
     try {
       await this.ensurePty(runtime, "new", onStartupStatus);
     } catch (error) {
@@ -130,7 +146,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   ): Promise<AgentSessionDescriptor> {
     this.validateEnabled();
     const runtime = this.runtimeFromDescriptor(session);
+    runtime.hasLiveProviderSession = true;
     this.sessions.set(session.id, runtime);
+    if (runtime.backend === "sdk") {
+      return { ...runtime.descriptor };
+    }
     try {
       await this.ensurePty(runtime, "resume", onStartupStatus);
     } catch (error) {
@@ -162,6 +182,10 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     yield { type: "session_status_changed", sessionId: runtime.descriptor.id, status: "running" };
 
     try {
+      if (runtime.backend === "sdk") {
+        yield* this.sendPromptViaSdk(runtime, promptText, options.jobId);
+        return;
+      }
       const startupEvents: AgentProviderEvent[] = [];
       let startupError: unknown;
       let startupDone = false;
@@ -307,7 +331,115 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   async abort(sessionId: string): Promise<void> {
     const runtime = this.requireRuntime(sessionId);
     runtime.abortRequested = true;
+    runtime.sdkAbortController?.abort();
     runtime.pty?.pressEscape();
+  }
+
+  /**
+   * Switch the engine under an existing session. Takes effect from the next turn;
+   * a leftover PTY is disposed now when idle, otherwise lazily at the next SDK turn.
+   */
+  async setBackend(sessionId: string, backend: ClaudeBackend): Promise<void> {
+    const runtime = this.requireRuntime(sessionId);
+    runtime.backend = backend;
+    runtime.descriptor.metadata = { ...runtime.descriptor.metadata, backend };
+    runtime.descriptor.updatedAt = Date.now();
+    bridgeLog("backend", `claude engine set to ${backend} session=${runtime.providerSessionId}`);
+    if (backend === "sdk" && runtime.pty && !runtime.busy) {
+      await this.stopRuntimePty(runtime);
+    }
+  }
+
+  getBackend(sessionId: string): ClaudeBackend {
+    return this.requireRuntime(sessionId).backend;
+  }
+
+  private async *sendPromptViaSdk(
+    runtime: RuntimeSession,
+    promptText: string,
+    jobId: string,
+  ): AsyncIterable<AgentProviderEvent> {
+    // A PTY left over from a backend switch is disposed lazily here, never mid-turn.
+    if (runtime.pty) {
+      await this.stopRuntimePty(runtime);
+    }
+
+    const modelCommand = parseClaudeModelCommand(promptText);
+    if (modelCommand) {
+      runtime.model = modelCommand;
+      runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model: modelCommand };
+      runtime.descriptor.updatedAt = Date.now();
+      const text = `Claude model set to ${modelCommand} for the next turn (sdk backend).`;
+      yield { type: "assistant_text_delta", sessionId: runtime.descriptor.id, jobId, text };
+      yield { type: "assistant_message_complete", sessionId: runtime.descriptor.id, jobId, text };
+      return;
+    }
+
+    const abortController = new AbortController();
+    runtime.sdkAbortController = abortController;
+    let partialText = "";
+    try {
+      for await (const event of runClaudeSdkTurn({
+        sessionId: runtime.descriptor.id,
+        jobId,
+        promptText,
+        cwd: runtime.workspace,
+        claudeBin: this.config.claudeBin,
+        model: runtime.model,
+        permissionMode: runtime.permissionMode,
+        resume: runtime.hasLiveProviderSession ? runtime.providerSessionId : undefined,
+        forkSession: false,
+        abortController,
+        onProviderSessionId: (providerSessionId) => {
+          runtime.hasLiveProviderSession = true;
+          if (providerSessionId !== runtime.providerSessionId) {
+            runtime.providerSessionId = providerSessionId;
+            runtime.descriptor.providerSessionId = providerSessionId;
+            runtime.descriptor.updatedAt = Date.now();
+          }
+        },
+      })) {
+        if (event.type === "assistant_text_delta") {
+          partialText += `${event.text}\n\n`;
+        } else if (event.type === "usage_updated") {
+          runtime.lastUsage = {
+            inputTokens: event.inputTokens ?? 0,
+            cachedInputTokens: event.cachedInputTokens ?? 0,
+            outputTokens: event.outputTokens ?? 0,
+            contextTokens: (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
+          };
+        } else if (event.type === "model_updated") {
+          runtime.model = event.model;
+          runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model: event.model };
+          runtime.descriptor.updatedAt = Date.now();
+        } else if (event.type === "error") {
+          // Mirror the PTY path: salvage streamed partial text into a completion,
+          // otherwise fail the turn.
+          if (partialText.trim()) {
+            yield {
+              type: "assistant_message_complete",
+              sessionId: runtime.descriptor.id,
+              jobId,
+              text: `${partialText.trim()}\n\nClaude stopped before finishing the turn: ${event.message}`,
+            };
+            return;
+          }
+          throw new Error(event.message);
+        }
+        yield event;
+      }
+    } catch (error) {
+      if (abortController.signal.aborted) {
+        const text = partialText.trim()
+          ? `${partialText.trim()}\n\nTurn aborted.`
+          : "Turn aborted.";
+        yield { type: "assistant_message_complete", sessionId: runtime.descriptor.id, jobId, text };
+        return;
+      }
+      throw error;
+    } finally {
+      runtime.sdkAbortController = undefined;
+    }
   }
 
   async compact(sessionId: string): Promise<void> {
@@ -399,6 +531,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   async dispose(sessionId?: string): Promise<void> {
     if (sessionId) {
       const runtime = this.sessions.get(sessionId);
+      runtime?.sdkAbortController?.abort();
       if (runtime?.pty) {
         await runtime.pty.dispose(true);
       }
@@ -408,6 +541,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
 
     for (const runtime of this.sessions.values()) {
+      runtime.sdkAbortController?.abort();
       await runtime.pty?.dispose(true);
       this.removeRegisteredProcessSession(runtime.descriptor.id);
     }
@@ -853,8 +987,10 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       workspace: descriptor.workspace || this.config.claudeWorkspace,
       model: asString(descriptor.metadata?.model) || this.config.claudeDefaultModel,
       permissionMode: asPermissionMode(descriptor.metadata?.permissionMode) || this.config.claudePermissionMode,
+      backend: asClaudeBackend(descriptor.metadata?.backend) || this.config.claudeBackend,
       busy: false,
       transcriptPath: asString(descriptor.metadata?.transcriptPath) || undefined,
+      hasLiveProviderSession: false,
     };
   }
 
@@ -1092,6 +1228,10 @@ function asPermissionMode(value: unknown): ClaudePermissionMode | undefined {
   return value === "default" || value === "acceptEdits" || value === "plan" || value === "bypassPermissions"
     ? value
     : undefined;
+}
+
+function asClaudeBackend(value: unknown): ClaudeBackend | undefined {
+  return value === "pty" || value === "sdk" ? value : undefined;
 }
 
 function sleep(ms: number): Promise<void> {

@@ -11,6 +11,7 @@ import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import * as pty from "node-pty";
 
 import { bridgeLog, initBridgeLog } from "./bridge-log.js";
+import { ClaudeBackendPrefs, claudeBackendPrefsPath, type ClaudeBackendChoice } from "./claude-backend-prefs.js";
 import {
   probeCodexAppServer,
   runCodexAppServerSteeredTurn,
@@ -319,6 +320,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const claudeAdapter = config.enableClaudeProvider ? new ClaudeProviderAdapter(config) : undefined;
   const claudeState = config.enableClaudeProvider
     ? new ClaudeSessionStateIndex(new ClaudeStateStore(claudeProviderStatePath(config.workspace)))
+    : undefined;
+  const claudeBackendPrefs = config.enableClaudeProvider
+    ? new ClaudeBackendPrefs(claudeBackendPrefsPath(config.workspace))
     : undefined;
   const claudeSessions = new Map<TelegramContextKey, AgentSessionDescriptor>();
 
@@ -740,6 +744,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     },
   });
 
+  const getClaudeBackend = (contextKey: TelegramContextKey): ClaudeBackendChoice =>
+    claudeBackendPrefs?.get(contextKey) ?? config.claudeBackend;
+
   const canResumePersistedClaudeSession = (record: ClaudeSessionStateRecord): boolean => (
     record.permissionMode === config.claudePermissionMode &&
     record.workspace === config.claudeWorkspace
@@ -801,14 +808,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         persistedTranscript = null;
       }
     }
+    const backend = getClaudeBackend(contextKey);
     const descriptor = resumablePersisted && persistedTranscript
-      ? await claudeAdapter.resumeSession(buildClaudeDescriptor(resumablePersisted), onStartupStatus)
+      ? await claudeAdapter.resumeSession({
+          ...buildClaudeDescriptor(resumablePersisted),
+          metadata: {
+            model: resumablePersisted.model,
+            permissionMode: resumablePersisted.permissionMode,
+            transcriptPath: resumablePersisted.transcriptPath,
+            backend,
+          },
+        }, onStartupStatus)
       : await claudeAdapter.createSession({
           workspace: config.claudeWorkspace,
           displayName: `TeleCodex ${contextKey}`,
           metadata: {
             model: config.claudeDefaultModel,
             permissionMode: config.claudePermissionMode,
+            backend,
           },
         }, onStartupStatus);
     claudeSessions.set(contextKey, descriptor);
@@ -832,6 +849,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       metadata: {
         model,
         permissionMode: config.claudePermissionMode,
+        backend: getClaudeBackend(contextKey),
       },
     });
     if (previous && previous.id !== descriptor.id) {
@@ -868,7 +886,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       capabilities: claudeAdapter.capabilities,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
-      metadata: session.metadata,
+      metadata: { ...session.metadata, backend: getClaudeBackend(contextKey) },
     });
     if (previous && previous.id !== descriptor.id) {
       await disposeClaudeDescriptor(previous);
@@ -2941,6 +2959,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
       return;
     }
+    if (getClaudeBackend(contextKey) === "sdk") {
+      // Manual compaction drives the interactive TUI; the SDK engine has no such
+      // control and compacts automatically. Surface that instead of faking it.
+      const message = "Compaction is automatic on the sdk engine. Use /backend pty first if you need a manual /compact.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
     if (isBusy(contextKey)) {
       const message = "Cannot compact Claude while a prompt is running.";
       await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
@@ -4770,6 +4795,50 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   bot.command("backend", async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
+      return;
+    }
+
+    // When Claude is the active provider, /backend controls the CLAUDE engine
+    // (pty = interactive terminal, sdk = Agent SDK with full narration).
+    if (isClaudeActive(contextKey)) {
+      const rawClaudeBackend = getCommandArgument(ctx)?.trim().toLowerCase();
+      if (!rawClaudeBackend) {
+        const current = getClaudeBackend(contextKey);
+        const plain = [
+          `Claude engine for this Telegram context: ${current}`,
+          "",
+          "Available: pty, sdk",
+          "",
+          "Use /backend sdk for the Agent SDK engine (full progress narration; currently billed to the subscription like interactive use, policy pause, revocable).",
+          "Use /backend pty for the terminal engine (guaranteed subscription floor).",
+          "The choice persists for this Telegram context and takes effect from the next turn.",
+          "To change the Codex backend instead, switch with /codex first.",
+        ].join("\n");
+        await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+        return;
+      }
+      if (rawClaudeBackend !== "pty" && rawClaudeBackend !== "sdk") {
+        const plain = "Usage while Claude is active: /backend pty or /backend sdk";
+        await safeReply(ctx, escapeHTML(plain), { fallbackText: plain });
+        return;
+      }
+      claudeBackendPrefs?.set(contextKey, rawClaudeBackend);
+      const descriptor = claudeSessions.get(contextKey);
+      if (descriptor && claudeAdapter) {
+        try {
+          await claudeAdapter.setBackend?.(descriptor.id, rawClaudeBackend);
+          const refreshed = await claudeAdapter.getSessionInfo(descriptor.id);
+          claudeSessions.set(contextKey, refreshed);
+          persistClaudeSession(contextKey, refreshed);
+        } catch (error) {
+          console.warn("Failed to apply Claude backend to the live session", error);
+        }
+      }
+      const busyNote = isProviderBusy(contextKey, "claude")
+        ? " The running turn finishes on its current engine; the switch applies from the next turn."
+        : " It takes effect from the next turn, on the same conversation.";
+      const plain = `Claude engine for this Telegram context is now ${rawClaudeBackend}. This persists across restarts.${busyNote}`;
+      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
     }
 
@@ -6706,6 +6775,7 @@ function renderClaudeSessionPlain(
     `Workspace: ${descriptor.workspace}`,
     `Model: ${String(descriptor.metadata?.model ?? "(default)")}`,
     `Permission mode: ${String(descriptor.metadata?.permissionMode ?? "(default)")}`,
+    `Engine: ${String(descriptor.metadata?.backend ?? "pty")}`,
     `Status: ${descriptor.status}`,
     window > 0 ? formatClaudeContextLine(used, window) : undefined,
   ]

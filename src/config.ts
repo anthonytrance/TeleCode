@@ -51,6 +51,8 @@ export interface TeleCodexConfig {
   claudeLargeSessionResume: ClaudeLargeSessionResumePolicy;
   claudeTurnIdleTimeoutSeconds: number;
   claudeContextWindow: number;
+  /** Default Claude engine for contexts that never ran /backend: pty or sdk. */
+  claudeBackend: "pty" | "sdk";
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -123,6 +125,10 @@ export function loadConfig(): TeleCodexConfig {
     200000,
     "CLAUDE_CONTEXT_WINDOW",
   );
+  const rawClaudeBackend = optionalString(process.env.CLAUDE_BACKEND) ?? "pty";
+  if (rawClaudeBackend !== "pty" && rawClaudeBackend !== "sdk") {
+    throw new Error(`CLAUDE_BACKEND must be "pty" or "sdk", got: ${rawClaudeBackend}`);
+  }
 
   return {
     telegramBotToken,
@@ -155,6 +161,7 @@ export function loadConfig(): TeleCodexConfig {
     claudeLargeSessionResume,
     claudeTurnIdleTimeoutSeconds,
     claudeContextWindow,
+    claudeBackend: rawClaudeBackend,
   };
 }
 

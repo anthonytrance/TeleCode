@@ -1,0 +1,205 @@
+import { bridgeLog } from "../bridge-log.js";
+import type { ClaudePermissionMode } from "../config.js";
+import type { AgentProviderEvent } from "./types.js";
+
+/**
+ * Agent SDK turn runner — the D3 fix. The SDK streams EVERY assistant message
+ * (interim narration between tool calls included), unlike the interactive
+ * transcript, which drops some mid-turn text blocks. Verified by the C0 spike
+ * on @anthropic-ai/claude-agent-sdk 0.3.204 (2026-07-08): ALPHA/BETA/GAMMA all
+ * arrived as separate assistant messages, resume continued the session, and
+ * forkSession minted a new session id.
+ *
+ * One query() per turn with `resume` — restart-safe and identical to the PTY
+ * path's per-turn model. The SDK writes the same ~/.claude/projects transcript
+ * format, so sessions stay switchable between backends.
+ */
+
+export interface ClaudeSdkTurnOptions {
+  /** TeleCodex descriptor id — stamped on every emitted event. */
+  sessionId: string;
+  jobId: string;
+  promptText: string;
+  cwd: string;
+  claudeBin: string;
+  model?: string;
+  permissionMode: ClaudePermissionMode;
+  /** Provider (Claude) session id to resume; omitted for a fresh session. */
+  resume?: string;
+  forkSession?: boolean;
+  abortController?: AbortController;
+  /** Called as soon as the init message reveals the real Claude session id. */
+  onProviderSessionId?: (providerSessionId: string) => void;
+  /** Injectable for tests; defaults to the real SDK query(). */
+  queryFn?: (input: { prompt: string; options: Record<string, unknown> }) => AsyncIterable<SdkMessageLike>;
+}
+
+/** Structural view of the SDK messages this engine consumes. */
+export interface SdkMessageLike {
+  type: string;
+  subtype?: string;
+  session_id?: string;
+  message?: {
+    model?: string;
+    content?: Array<Record<string, unknown>>;
+  };
+  result?: string;
+  usage?: Record<string, unknown>;
+  total_cost_usd?: number;
+  errors?: unknown[];
+}
+
+export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIterable<AgentProviderEvent> {
+  const queryFn = options.queryFn ?? (await loadSdkQuery());
+  const { sessionId, jobId } = options;
+
+  const sdkOptions: Record<string, unknown> = {
+    cwd: options.cwd,
+    model: options.model,
+    permissionMode: options.permissionMode,
+    pathToClaudeCodeExecutable: options.claudeBin,
+    // Behave like Anthony's interactive sessions: Claude Code system prompt,
+    // user + project settings, CLAUDE.md, and skills.
+    systemPrompt: { type: "preset", preset: "claude_code" },
+    settingSources: ["user", "project"],
+    // Rule 1: the child must never start the user-scoped telegram plugin's
+    // poller (it kills the live bridge via a 409 on the shared bot token, and
+    // the C0 spike proved plugins load even without settingSources). Same flag
+    // the PTY path uses in production.
+    strictMcpConfig: true,
+    env: scrubbedEnv(),
+    ...(options.resume ? { resume: options.resume } : {}),
+    ...(options.forkSession ? { forkSession: true } : {}),
+    ...(options.abortController ? { abortController: options.abortController } : {}),
+  };
+
+  let lastModel: string | undefined;
+  let sawResult = false;
+
+  for await (const message of queryFn({ prompt: options.promptText, options: sdkOptions })) {
+    if (message.type === "system" && message.subtype === "init") {
+      if (message.session_id) {
+        options.onProviderSessionId?.(message.session_id);
+      }
+      continue;
+    }
+
+    if (message.type === "assistant") {
+      const model = message.message?.model;
+      if (model && model !== "<synthetic>" && model !== lastModel) {
+        lastModel = model;
+        yield { type: "model_updated", sessionId, jobId, model };
+      }
+      for (const block of message.message?.content ?? []) {
+        const blockType = typeof block.type === "string" ? block.type : "";
+        if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
+          yield { type: "assistant_text_delta", sessionId, jobId, text: block.text };
+        } else if (blockType === "tool_use") {
+          yield {
+            type: "tool_started",
+            sessionId,
+            jobId,
+            toolName: typeof block.name === "string" && block.name ? block.name : "tool",
+            text: summarizeSdkToolInput(block.input),
+          };
+        }
+      }
+      continue;
+    }
+
+    if (message.type === "user") {
+      for (const block of message.message?.content ?? []) {
+        if (block.type !== "tool_result") {
+          continue;
+        }
+        yield {
+          type: block.is_error === true ? "tool_failed" : "tool_completed",
+          sessionId,
+          jobId,
+          toolName: "tool",
+        };
+      }
+      continue;
+    }
+
+    if (message.type === "result") {
+      sawResult = true;
+      const usage = message.usage ?? {};
+      const inputTokens = asNumber(usage.input_tokens) ?? 0;
+      const cachedInputTokens = (asNumber(usage.cache_read_input_tokens) ?? 0) +
+        (asNumber(usage.cache_creation_input_tokens) ?? 0);
+      const outputTokens = asNumber(usage.output_tokens) ?? 0;
+      yield { type: "usage_updated", sessionId, jobId, inputTokens, cachedInputTokens, outputTokens };
+
+      if (message.subtype === "success") {
+        yield {
+          type: "assistant_message_complete",
+          sessionId,
+          jobId,
+          text: (message.result ?? "").trim(),
+        };
+      } else {
+        const detail = message.result?.trim() || describeSdkErrors(message.errors) || message.subtype || "unknown error";
+        bridgeLog("error", `sdk turn result ${message.subtype ?? "?"}: ${detail}`);
+        yield { type: "error", sessionId, jobId, message: `Claude SDK turn ended: ${detail}` };
+      }
+      continue;
+    }
+
+    // rate_limit_event, status, hook events, partial messages, etc. — not part
+    // of the provider event contract; ignored deliberately.
+  }
+
+  if (!sawResult) {
+    yield {
+      type: "error",
+      sessionId,
+      jobId,
+      message: "Claude SDK stream ended without a result message (aborted or crashed).",
+    };
+  }
+}
+
+async function loadSdkQuery(): Promise<NonNullable<ClaudeSdkTurnOptions["queryFn"]>> {
+  const sdk = await import("@anthropic-ai/claude-agent-sdk");
+  return sdk.query as unknown as NonNullable<ClaudeSdkTurnOptions["queryFn"]>;
+}
+
+function scrubbedEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env };
+  delete env.TELEGRAM_BOT_TOKEN;
+  for (const key of Object.keys(env)) {
+    if (key === "CLAUDECODE" || key.startsWith("CLAUDE_CODE_") || key.startsWith("TELECODEX_")) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
+function summarizeSdkToolInput(input: unknown): string | undefined {
+  if (input === undefined || input === null) {
+    return undefined;
+  }
+  try {
+    const text = typeof input === "string" ? input : JSON.stringify(input);
+    const singleLine = text.replace(/\s+/g, " ").trim();
+    return singleLine.length <= 300 ? singleLine : `${singleLine.slice(0, 299)}…`;
+  } catch {
+    return undefined;
+  }
+}
+
+function describeSdkErrors(errors: unknown[] | undefined): string | undefined {
+  if (!errors?.length) {
+    return undefined;
+  }
+  try {
+    return errors.map((error) => (typeof error === "string" ? error : JSON.stringify(error))).join("; ").slice(0, 500);
+  } catch {
+    return undefined;
+  }
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}

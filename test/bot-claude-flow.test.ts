@@ -598,6 +598,25 @@ describe("Claude bot flow", () => {
     expect(selection).toBeDefined();
   });
 
+  it("switches the Claude engine with /backend while Claude is active", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+
+    await bot.handleUpdate(textUpdate(2, "/backend"));
+    expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude engine for this Telegram context: pty"))).toBeDefined();
+
+    await bot.handleUpdate(textUpdate(3, "/backend sdk"));
+    expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude engine for this Telegram context is now sdk"))).toBeDefined();
+
+    await bot.handleUpdate(textUpdate(4, "/backend"));
+    expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude engine for this Telegram context: sdk"))).toBeDefined();
+
+    await bot.handleUpdate(textUpdate(5, "/compact"));
+    expect(sent.map((entry) => entry.text).find((text) => text?.includes("Compaction is automatic on the sdk engine"))).toBeDefined();
+  });
+
   it("reports Claude diagnostics through /doctor while Claude is active", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
@@ -692,6 +711,7 @@ function createConfig(workspace: string): TeleCodexConfig {
     claudeLargeSessionResume: "summary",
     claudeTurnIdleTimeoutSeconds: 180,
     claudeContextWindow: 200000,
+    claudeBackend: "pty",
   };
 }
 
