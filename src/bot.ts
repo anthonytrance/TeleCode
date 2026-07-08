@@ -10,6 +10,7 @@ import type { ModelReasoningEffort } from "@openai/codex-sdk";
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import * as pty from "node-pty";
 
+import { bridgeLog, initBridgeLog } from "./bridge-log.js";
 import {
   probeCodexAppServer,
   runCodexAppServerSteeredTurn,
@@ -278,6 +279,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const bot = new Bot<Context>(config.telegramBotToken) as TeleCodexBot;
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
   const startedAt = Date.now();
+  initBridgeLog(config.workspace);
+  bridgeLog("startup", `bridge starting; workspace=${config.workspace} claudeProvider=${config.enableClaudeProvider}`);
   const agentSessionStore = new JsonAgentSessionStore(agentSessionStatePath(config.workspace));
   const agentSessionState = agentSessionStore.load();
   for (const session of agentSessionState.sessions) {
@@ -521,6 +524,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   };
 
   const disposeProviderSessions = async (): Promise<void> => {
+    bridgeLog("shutdown", "disposing provider sessions");
     if (!claudeAdapter) {
       return;
     }
@@ -2266,8 +2270,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   ): Promise<void> => {
     const messageThreadId = source.messageThreadId ?? parseContextKey(contextKey).messageThreadId;
     const busyState = getBusyState(contextKey);
+    bridgeLog("intake", `message received lane=${contextKey} chars=${text.length}`);
 
     if (claudeIntakeLocks.get(contextKey)) {
+      bridgeLog("intake", `queued (intake lock held) lane=${contextKey}`);
       if (source.ctx) {
         lastPromptInput.set(contextKey, text);
         await queueClaudePromptReply(source.ctx, contextKey, source.chatId, text);
@@ -2290,6 +2296,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
       if (isProviderBusy(contextKey, "claude")) {
+        bridgeLog("intake", `queued (provider busy) lane=${contextKey} depth=${queuedClaudePrompts.depth(contextKey) + 1}`);
         if (source.ctx) {
           lastPromptInput.set(contextKey, text);
           await queueClaudePromptReply(source.ctx, contextKey, source.chatId, text);
@@ -2301,10 +2308,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       busyState.processing = true;
       markProviderBusy(contextKey, "claude", true);
       claimedBusy = true;
+      bridgeLog("intake", `dispatched lane=${contextKey}`);
     } finally {
       claudeIntakeLocks.delete(contextKey);
     }
 
+    const turnStartedAt = Date.now();
     const releaseClaimedBusy = (): void => {
       if (!claimedBusy) {
         return;
@@ -2650,6 +2659,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       await setClaudeRunReaction(source, "👍");
     } catch (error) {
       console.error("Claude prompt failed:", error);
+      bridgeLog("error", `claude turn failed lane=${contextKey}: ${String(error)}`);
       if (error instanceof PromptNotDeliveredError) {
         enqueueClaudePromptFromSource(source, contextKey, error.promptText, { front: true });
         deferQueuedDispatch = true;
@@ -2692,6 +2702,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       if (agentJobId) {
         finishAgentJob(agentJobId, completedSuccessfully ? "completed" : "failed");
       }
+      bridgeLog(
+        "turn",
+        `end lane=${contextKey} ok=${completedSuccessfully} durationMs=${Date.now() - turnStartedAt} queueDepth=${queuedClaudePrompts.depth(contextKey)}`,
+      );
       markProviderBusy(contextKey, "claude", false);
       busyState.processing = false;
       if (!deferQueuedDispatch) {

@@ -1,7 +1,8 @@
 import { existsSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { bridgeLog } from "../bridge-log.js";
 import type { ClaudePermissionMode, TeleCodexConfig } from "../config.js";
 import type {
   AgentProviderAdapter,
@@ -464,6 +465,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       configDir: strictMcp ? undefined : this.config.claudeConfigDir,
     });
     runtime.ptyPid = ptySession.pid;
+    bridgeLog("pty", `spawn pid=${runtime.ptyPid ?? "?"} mode=${mode} session=${runtime.providerSessionId}`);
     if (runtime.ptyPid) {
       this.registerProcess({
         pid: runtime.ptyPid,
@@ -641,6 +643,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     const pid = runtime.ptyPid;
     runtime.pty = undefined;
     runtime.ptyPid = undefined;
+    bridgeLog("pty", `dispose pid=${pid ?? "?"} graceful=${options.graceful ?? true} session=${runtime.providerSessionId}`);
     await ptySession.dispose(options.graceful ?? true);
     if (pid) {
       this.removeRegisteredProcessPid(pid);
@@ -792,6 +795,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     active: { path: string; startOffset: number },
   ): { transcriptPath: string; startOffset: number } {
     runtime.transcriptPath = active.path;
+    bridgeLog("echo", `located ${basename(active.path)} offset=${active.startOffset}`);
     runtime.descriptor.metadata = {
       ...runtime.descriptor.metadata,
       transcriptPath: active.path,

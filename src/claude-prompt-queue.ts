@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
+import { bridgeLog } from "./bridge-log.js";
 import type { TelegramContextKey } from "./context-key.js";
 import { parseJsonFileText } from "./json.js";
 
@@ -95,8 +96,11 @@ export class ClaudePromptQueue {
       if (parsed.version !== 1) {
         return [];
       }
-      return (parsed.entries ?? []).filter(isClaudePromptQueueEntry);
-    } catch {
+      const entries = (parsed.entries ?? []).filter(isClaudePromptQueueEntry);
+      bridgeLog("queue", `loaded ${entries.length} persisted prompt(s)`);
+      return entries;
+    } catch (error) {
+      bridgeLog("queue", `load failed: ${String(error)}`);
       return [];
     }
   }
@@ -110,6 +114,7 @@ export class ClaudePromptQueue {
     const tempPath = `${this.filePath}.tmp`;
     writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
     renameSync(tempPath, this.filePath);
+    bridgeLog("queue", `saved ${this.entries.length} prompt(s)`);
   }
 }
 
