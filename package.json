@@ -25,6 +25,7 @@
     "test:claude-smoke": "npm run build && node scripts/claude-provider-smoke.mjs",
     "test:claude-tool-smoke": "npm run build && node scripts/claude-tool-smoke.mjs",
     "test:claude-bot-smoke": "npm run build && node scripts/claude-bot-flow-smoke.mjs",
+    "test:claude-sdk-smoke": "npm run build && node scripts/claude-sdk-bot-flow-smoke.mjs",
     "test:claude-live": "npm run build && node scripts/claude-provider-smoke.mjs && node scripts/claude-tool-smoke.mjs && node scripts/claude-bot-flow-smoke.mjs"
   },
   "dependencies": {

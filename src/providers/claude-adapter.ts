@@ -935,6 +935,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     active: { path: string; startOffset: number },
   ): { transcriptPath: string; startOffset: number } {
     runtime.transcriptPath = active.path;
+    // A located transcript means Claude's real session id is known; SDK turns may
+    // resume it from here on, including after a live backend switch.
+    runtime.hasLiveProviderSession = true;
     bridgeLog("echo", `located ${basename(active.path)} offset=${active.startOffset}`);
     runtime.descriptor.metadata = {
       ...runtime.descriptor.metadata,
