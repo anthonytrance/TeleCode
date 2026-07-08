@@ -268,7 +268,7 @@ describe("TranscriptTailer", () => {
     ]);
   });
 
-  it("uses the longer active-tool idle timeout while a Claude tool is running", async () => {
+  it("warns instead of erroring when Claude goes quiet, then finishes the turn", async () => {
     const transcript = path.join(tempDir, "session.jsonl");
     writeFileSync(transcript, [
       JSON.stringify({
@@ -298,13 +298,17 @@ describe("TranscriptTailer", () => {
       sessionId: "s1",
       jobId: "j1",
       idleTimeoutMs: 20,
-      activeToolIdleTimeoutMs: 500,
     })) {
       events.push(event);
     }
 
     expect(events.some((event) => event.type === "error")).toBe(false);
-    expect(events).toMatchObject([
+    const quietWarnings = events.filter(
+      (event) => event.type === "status_message" && event.text.startsWith("Claude has been quiet for"),
+    );
+    expect(quietWarnings.length).toBeGreaterThan(0);
+    expect(quietWarnings[0].text).toContain("while a tool is running");
+    expect(events.filter((event) => event.type !== "status_message")).toMatchObject([
       { type: "tool_started", toolName: "PowerShell" },
       { type: "tool_completed", toolName: "tool" },
       { type: "assistant_text_delta", text: "DONE" },

@@ -52,8 +52,6 @@ const CLAUDE_CAPABILITIES: AgentProviderCapabilities = {
   artifacts: false,
 };
 
-const CLAUDE_ACTIVE_TOOL_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
-
 interface RuntimeSession {
   descriptor: AgentSessionDescriptor;
   providerSessionId: string;
@@ -252,10 +250,6 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         sessionId: runtime.descriptor.id,
         jobId: options.jobId,
         idleTimeoutMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
-        activeToolIdleTimeoutMs: Math.max(
-          this.config.claudeTurnIdleTimeoutSeconds * 1000,
-          CLAUDE_ACTIVE_TOOL_IDLE_TIMEOUT_MS,
-        ),
         shouldStop: () => runtime.abortRequested === true,
       })) {
         if (event.type === "error") {

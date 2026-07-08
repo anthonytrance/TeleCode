@@ -108,6 +108,7 @@ const DEFAULT_PROVIDER_SESSION_LIST_LIMIT = 20;
 const MAX_PROVIDER_SESSION_LIST_LIMIT = 50;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
+const CLAUDE_QUIET_WARNING_PREFIX = "Claude has been quiet for ";
 const NATIVE_CODEX_COMMANDS = [
   "compact",
   "agents",
@@ -2430,8 +2431,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       if (!trimmed) {
         return;
       }
-      if (isProviderForeground(contextKey, "claude")) {
-        await replyToClaudeRunSource(source, escapeHTML(trimmed), { fallbackText: trimmed, messageThreadId });
+      const quietWarning = isClaudeQuietWarning(trimmed);
+      const replyMarkup = quietWarning ? claudeQuietWarningKeyboard(contextKey) : undefined;
+      if (quietWarning || isProviderForeground(contextKey, "claude")) {
+        await replyToClaudeRunSource(source, escapeHTML(trimmed), {
+          fallbackText: trimmed,
+          messageThreadId,
+          replyMarkup,
+        });
       } else {
         bufferClaudeOutput("status", trimmed, false);
       }
@@ -5834,6 +5841,53 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
   });
 
+  bot.callbackQuery(/^claude_quiet_(stop|wait):(.+)$/, async (ctx) => {
+    const action = ctx.match?.[1];
+    const contextKey = ctx.match?.[2] as TelegramContextKey | undefined;
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (!action || !contextKey) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    if (chatId && messageId) {
+      await bot.api.editMessageReplyMarkup(chatId, messageId, {
+        reply_markup: new InlineKeyboard(),
+      }).catch((error) => {
+        if (!isMessageNotModifiedError(error)) {
+          console.warn("Failed to clear Claude quiet warning buttons", error);
+        }
+      });
+    }
+
+    if (action === "wait") {
+      await ctx.answerCallbackQuery({ text: "Keeping Claude running" });
+      return;
+    }
+
+    const descriptor = claudeSessions.get(contextKey);
+    if (!descriptor || !claudeAdapter) {
+      await ctx.answerCallbackQuery({ text: "No active Claude turn" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Stopping Claude..." });
+    try {
+      await claudeAdapter.abort?.(descriptor.id);
+      getBusyState(contextKey).processing = false;
+      await safeReply(ctx, escapeHTML("Stop sent to Claude."), {
+        fallbackText: "Stop sent to Claude.",
+        messageThreadId: parseContextKey(contextKey).messageThreadId,
+      });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        messageThreadId: parseContextKey(contextKey).messageThreadId,
+      });
+    }
+  });
+
   bot.callbackQuery(/^sess_(\d+)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
     const messageId = ctx.callbackQuery.message?.message_id;
@@ -6855,6 +6909,17 @@ function remainingCompletionText(completionText: string, streamedText: string): 
     return completion.slice(streamed.length).trim();
   }
   return completion;
+}
+
+function isClaudeQuietWarning(text: string): boolean {
+  return text.startsWith(CLAUDE_QUIET_WARNING_PREFIX);
+}
+
+function claudeQuietWarningKeyboard(contextKey: TelegramContextKey): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("Stop Claude", `claude_quiet_stop:${contextKey}`)
+    .row()
+    .text("Keep waiting", `claude_quiet_wait:${contextKey}`);
 }
 
 function renderProgressCompletedMessage(): RenderedText {

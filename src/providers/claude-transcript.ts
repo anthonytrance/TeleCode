@@ -52,8 +52,6 @@ const SYSTEM_NOTICE_FALLBACKS = new Map<string, string>([
   ["refusal_banner", "Claude displayed a refusal notice."],
 ]);
 
-const DEFAULT_ACTIVE_TOOL_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
-
 export async function findTranscript(
   sessionId: string,
   timeoutMs: number,
@@ -490,16 +488,16 @@ export class TranscriptTailer {
     sessionId: string;
     jobId: string;
     idleTimeoutMs: number;
-    activeToolIdleTimeoutMs?: number;
     /**
      * Optional cancellation check. Polled each loop; when it returns true the tailer
-     * stops promptly (within one poll interval) instead of waiting out the idle timeout.
+     * stops promptly (within one poll interval) instead of waiting for more transcript output.
      * Used by /abort so an interrupted turn does not stall the session for minutes.
      */
     shouldStop?: () => boolean;
   }): AsyncIterable<AgentProviderEvent> {
     let collectedText = "";
     let lastBytesAt = Date.now();
+    let lastQuietWarningAt = 0;
     let lastUsage: ClaudeUsageSnapshot | undefined;
     let activeToolCount = 0;
 
@@ -518,6 +516,7 @@ export class TranscriptTailer {
       const projections = await this.readNewProjections(options.sessionId, options.jobId);
       if (projections.length > 0) {
         lastBytesAt = Date.now();
+        lastQuietWarningAt = 0;
       }
 
       for (const projection of projections) {
@@ -556,23 +555,18 @@ export class TranscriptTailer {
         }
       }
 
-      const timeoutMs = activeToolCount > 0
-        ? Math.max(
-            options.idleTimeoutMs,
-            options.activeToolIdleTimeoutMs ?? DEFAULT_ACTIVE_TOOL_IDLE_TIMEOUT_MS,
-          )
-        : options.idleTimeoutMs;
-      if (Date.now() - lastBytesAt > timeoutMs) {
-        const messagePrefix = activeToolCount > 0
-          ? "Claude active tool idle timeout"
-          : "Claude turn idle timeout";
+      const now = Date.now();
+      if (
+        now - lastBytesAt > options.idleTimeoutMs &&
+        (lastQuietWarningAt === 0 || now - lastQuietWarningAt > options.idleTimeoutMs)
+      ) {
+        lastQuietWarningAt = now;
         yield {
-          type: "error",
+          type: "status_message",
           sessionId: options.sessionId,
           jobId: options.jobId,
-          message: `${messagePrefix} after ${Math.round(timeoutMs / 1000)} seconds`,
+          text: formatQuietWarning(options.idleTimeoutMs, activeToolCount),
         };
-        return;
       }
 
       await sleep(this.pollIntervalMs);
@@ -645,6 +639,25 @@ export class TranscriptTailer {
       await handle.close();
     }
   }
+}
+
+function formatQuietWarning(idleTimeoutMs: number, activeToolCount: number): string {
+  const duration = formatQuietDuration(idleTimeoutMs);
+  const toolContext = activeToolCount > 0 ? " while a tool is running" : "";
+  return [
+    `Claude has been quiet for ${duration}${toolContext}.`,
+    "It may still be working. Stop Claude?",
+    "If you do nothing, I will keep waiting.",
+  ].join(" ");
+}
+
+function formatQuietDuration(milliseconds: number): string {
+  if (milliseconds < 60000) {
+    const seconds = Math.max(1, Math.round(milliseconds / 1000));
+    return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+  }
+  const minutes = Math.max(1, Math.round(milliseconds / 60000));
+  return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
 }
 
 async function findTranscriptOnce(sessionId: string, configDir?: string): Promise<string | null> {
