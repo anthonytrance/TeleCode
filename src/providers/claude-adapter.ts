@@ -383,7 +383,13 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       permissionMode: source.permissionMode,
       status: "idle",
     });
-    descriptor.metadata = { ...descriptor.metadata, backend: source.backend };
+    // forkSourceSessionId is persisted so the fork survives a bridge restart before
+    // its first turn: the placeholder id cannot be resumed, the source id can.
+    descriptor.metadata = {
+      ...descriptor.metadata,
+      backend: source.backend,
+      forkSourceSessionId: source.providerSessionId,
+    };
     const runtime = this.runtimeFromDescriptor(descriptor);
     runtime.forkSourceSessionId = source.providerSessionId;
     this.sessions.set(descriptor.id, runtime);
@@ -429,6 +435,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         abortController,
         onProviderSessionId: (providerSessionId) => {
           runtime.forkSourceSessionId = undefined;
+          if (runtime.descriptor.metadata?.forkSourceSessionId) {
+            delete runtime.descriptor.metadata.forkSourceSessionId;
+          }
           runtime.hasLiveProviderSession = true;
           if (providerSessionId !== runtime.providerSessionId) {
             runtime.providerSessionId = providerSessionId;
@@ -1013,6 +1022,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       ...runtime.descriptor.metadata,
       transcriptPath: active.path,
     };
+    // The fork (if any) is resolved to a real session now; a persisted source id
+    // must not trigger a second fork after a restart.
+    delete runtime.descriptor.metadata.forkSourceSessionId;
     const realSessionId = sessionIdFromTranscriptPath(active.path);
     if (realSessionId && realSessionId !== runtime.providerSessionId) {
       runtime.providerSessionId = realSessionId;
@@ -1064,6 +1076,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       busy: false,
       transcriptPath: asString(descriptor.metadata?.transcriptPath) || undefined,
       hasLiveProviderSession: false,
+      forkSourceSessionId: asString(descriptor.metadata?.forkSourceSessionId) || undefined,
     };
   }
 
