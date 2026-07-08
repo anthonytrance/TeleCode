@@ -646,7 +646,7 @@ function formatQuietWarning(idleTimeoutMs: number, activeToolCount: number): str
   const toolContext = activeToolCount > 0 ? " while a tool is running" : "";
   return [
     `Claude has been quiet for ${duration}${toolContext}.`,
-    "It may still be working. Stop Claude?",
+    "It may still be working. Send /stop to stop it.",
     "If you do nothing, I will keep waiting.",
   ].join(" ");
 }
