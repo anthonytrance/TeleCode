@@ -124,6 +124,22 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
       return session;
     }
 
+    async forkSession(sourceSessionId: string, displayName?: string) {
+      const createCount = mockClaude.nextCreateCount();
+      return {
+        id: `claude-fork-${createCount}`,
+        provider: "claude",
+        workspace: "C:\\workspace",
+        displayName: displayName ?? "Mock Claude (fork)",
+        providerSessionId: `forked-session-${createCount}`,
+        status: "idle",
+        capabilities: this.capabilities,
+        createdAt: 2000,
+        updatedAt: 2000,
+        metadata: { model: mockClaude.getActiveModel(), backend: "pty" },
+      };
+    }
+
     async getSessionInfo() {
       const descriptor = {
         id: "claude-provider-1",
@@ -596,6 +612,25 @@ describe("Claude bot flow", () => {
     await bot.handleUpdate(textUpdate(3, "/resume 1"));
     const selection = sent.map((entry) => entry.text).find((text) => text?.includes("Selected #1"));
     expect(selection).toBeDefined();
+  });
+
+  it("forks the Claude conversation with /fork and keeps the original in /sessions", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+
+    await bot.handleUpdate(textUpdate(2, "/fork my experiment"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Forked this conversation")));
+
+    await bot.handleUpdate(textUpdate(3, "/sessions"));
+    const list = sent
+      .map((entry) => entry.text ?? "")
+      .filter((text) => text.includes("Recent provider sessions"))
+      .pop();
+    expect(list).toContain("my experiment");
+    // The original session must still be listed alongside the selected fork.
+    expect((list?.match(/^\d+\. Claude/gm) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 
   it("switches the Claude engine with /backend while Claude is active", async () => {

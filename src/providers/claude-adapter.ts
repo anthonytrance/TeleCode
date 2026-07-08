@@ -74,6 +74,12 @@ interface RuntimeSession {
   /** Aborts the in-flight SDK turn; present only while an SDK turn runs. */
   sdkAbortController?: AbortController;
   /**
+   * Set on a freshly forked session: the next turn resumes THIS session id with
+   * fork semantics (SDK forkSession / PTY --fork-session), then Claude mints a new
+   * id and the field is cleared. The descriptor carries a placeholder id until then.
+   */
+  forkSourceSessionId?: string;
+  /**
    * False until Claude has revealed a real session id (fresh sessions start with a
    * random UUID Claude ignores). SDK turns only pass `resume` once this is true.
    */
@@ -354,6 +360,37 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     return this.requireRuntime(sessionId).backend;
   }
 
+  /**
+   * Create a NEW session that continues from the source session's current state,
+   * leaving the source intact. Works on both engines: the SDK turn runs with
+   * `resume` + `forkSession`, the PTY spawns with `--resume <src> --fork-session`.
+   * The fork's real session id appears on its first turn; until then the returned
+   * descriptor carries a fresh placeholder id (so it never collides with the source).
+   */
+  async forkSession(sourceSessionId: string, displayName?: string): Promise<AgentSessionDescriptor> {
+    this.validateEnabled();
+    const source = this.requireRuntime(sourceSessionId);
+    if (!source.hasLiveProviderSession) {
+      throw new Error("Nothing to fork yet. Run at least one turn first.");
+    }
+    const placeholderId = randomUUID();
+    const descriptor = this.buildDescriptor({
+      id: `claude-${placeholderId.slice(0, 12)}`,
+      providerSessionId: placeholderId,
+      workspace: source.workspace,
+      displayName: displayName || `${source.descriptor.displayName ?? "Claude"} (fork)`,
+      model: source.model,
+      permissionMode: source.permissionMode,
+      status: "idle",
+    });
+    descriptor.metadata = { ...descriptor.metadata, backend: source.backend };
+    const runtime = this.runtimeFromDescriptor(descriptor);
+    runtime.forkSourceSessionId = source.providerSessionId;
+    this.sessions.set(descriptor.id, runtime);
+    bridgeLog("fork", `forked from session=${source.providerSessionId} backend=${runtime.backend}`);
+    return { ...runtime.descriptor };
+  }
+
   private async *sendPromptViaSdk(
     runtime: RuntimeSession,
     promptText: string,
@@ -387,10 +424,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         claudeBin: this.config.claudeBin,
         model: runtime.model,
         permissionMode: runtime.permissionMode,
-        resume: runtime.hasLiveProviderSession ? runtime.providerSessionId : undefined,
-        forkSession: false,
+        resume: runtime.forkSourceSessionId ?? (runtime.hasLiveProviderSession ? runtime.providerSessionId : undefined),
+        forkSession: Boolean(runtime.forkSourceSessionId),
         abortController,
         onProviderSessionId: (providerSessionId) => {
+          runtime.forkSourceSessionId = undefined;
           runtime.hasLiveProviderSession = true;
           if (providerSessionId !== runtime.providerSessionId) {
             runtime.providerSessionId = providerSessionId;
@@ -561,7 +599,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
 
     const ptySession = new ClaudePty();
-    const args = mode === "new"
+    const args = mode === "new" && !runtime.forkSourceSessionId
       ? [
           "--session-id",
           runtime.providerSessionId,
@@ -570,12 +608,20 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           "--permission-mode",
           runtime.permissionMode,
         ]
-      : [
-          "--resume",
-          runtime.providerSessionId,
-          "--permission-mode",
-          runtime.permissionMode,
-        ];
+      : runtime.forkSourceSessionId
+        ? [
+            "--resume",
+            runtime.forkSourceSessionId,
+            "--fork-session",
+            "--permission-mode",
+            runtime.permissionMode,
+          ]
+        : [
+            "--resume",
+            runtime.providerSessionId,
+            "--permission-mode",
+            runtime.permissionMode,
+          ];
 
     if (shouldPassClaudeModel(runtime.model)) {
       args.push("--model", runtime.model);
@@ -605,6 +651,12 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       configDir: strictMcp ? undefined : this.config.claudeConfigDir,
     });
     runtime.ptyPid = ptySession.pid;
+    if (runtime.forkSourceSessionId) {
+      // The spawn itself performed the fork; the new session id is discovered when
+      // the first turn's transcript is located.
+      runtime.forkSourceSessionId = undefined;
+      runtime.hasLiveProviderSession = false;
+    }
     bridgeLog("pty", `spawn pid=${runtime.ptyPid ?? "?"} mode=${mode} session=${runtime.providerSessionId}`);
     if (runtime.ptyPid) {
       this.registerProcess({

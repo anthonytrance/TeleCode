@@ -867,6 +867,50 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     return descriptor;
   };
 
+  const forkClaudeConversation = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    title?: string,
+    messageThreadId?: number,
+  ): Promise<void> => {
+    if (!claudeAdapter) {
+      const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+    if (isProviderBusy(contextKey, "claude")) {
+      const message = "Cannot fork while Claude is running. Wait for the turn to finish, then /fork again.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+    const current = claudeSessions.get(contextKey);
+    if (!current?.providerSessionId) {
+      const message = "No Claude conversation to fork yet. Send Claude a message first.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      return;
+    }
+    try {
+      const forked = await claudeAdapter.forkSession(current.id, title);
+      claudeSessions.set(contextKey, forked);
+      ensureAgentSessionRecord(contextKey, "claude", {
+        workspace: forked.workspace,
+        displayName: forked.displayName ?? "Claude (fork)",
+        providerSessionId: forked.providerSessionId,
+        select: true,
+        metadata: forked.metadata,
+      });
+      persistClaudeSession(contextKey, forked);
+      const message = "Forked this conversation. You are now on the fork; the original stays available under /sessions. Your next message continues from the fork point.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+    } catch (error) {
+      const message = `Fork failed: ${friendlyErrorText(error)}`;
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: message,
+        messageThreadId,
+      });
+    }
+  };
+
   const resumeClaudeAgentSession = async (
     contextKey: TelegramContextKey,
     session: AgentSessionRecord,
@@ -3101,6 +3145,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
+    if (commandName === "fork" || commandName === "branch") {
+      await forkClaudeConversation(ctx, contextKey, argument.trim() || undefined, messageThreadId);
+      return;
+    }
+
     if (commandName === "resume") {
       if (!argument) {
         const plain = renderUnifiedSessions(contextKey);
@@ -3942,6 +3991,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const providerPrefix = parseProviderPrefix(rawNewArg);
     const requestedProvider = providerPrefix?.provider;
     const remainingArg = providerPrefix?.rest ?? rawNewArg;
+
+    // /fork on a Claude lane is a REAL fork: a new session continuing from the
+    // current conversation state, original intact. /new stays "fresh session".
+    if (
+      rawContextKey &&
+      commandNameFromSlashLine(rawText) === "fork" &&
+      isClaudeActive(rawContextKey) &&
+      requestedProvider !== "codex"
+    ) {
+      await forkClaudeConversation(ctx, rawContextKey, remainingArg || undefined);
+      return;
+    }
 
     if (rawContextKey && (requestedProvider === "claude" || (!requestedProvider && isClaudeActive(rawContextKey)))) {
       if (!config.enableClaudeProvider) {
