@@ -129,6 +129,7 @@ describe("Claude transcript projection", () => {
     }, { sessionId: "s1", jobId: "j1" }).events[0]).toMatchObject({
       type: "compact_boundary",
       summary: "Compacted: 26,056 -> 3,146 tokens",
+      postTokens: 3146,
     });
   });
 

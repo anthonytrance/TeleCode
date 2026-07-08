@@ -3255,9 +3255,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const context = await claudeAdapter.getContext(descriptor.id);
     const used = Number(context.usedTokens ?? 0);
     const window = Number(context.contextWindow ?? config.claudeContextWindow);
-    const percent = window > 0 ? Math.round((used / window) * 100) : 0;
     const plain = [
-      `Context: ${used} of ${window} tokens (${percent}%).`,
+      formatClaudeContextLine(used, window),
       `Last turn: in ${Number(usage.inputTokens ?? 0)}, cached ${Number(usage.cachedInputTokens ?? 0)}, out ${Number(usage.outputTokens ?? 0)}.`,
     ].join("\n");
     await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
@@ -6701,7 +6700,6 @@ function renderClaudeSessionPlain(
 ): string {
   const used = Number(context?.usedTokens ?? 0);
   const window = Number(context?.contextWindow ?? 0);
-  const percent = window > 0 ? Math.round((used / window) * 100) : 0;
   return [
     "Claude session:",
     `Session UUID: ${descriptor.providerSessionId ?? "(unknown)"}`,
@@ -6709,10 +6707,20 @@ function renderClaudeSessionPlain(
     `Model: ${String(descriptor.metadata?.model ?? "(default)")}`,
     `Permission mode: ${String(descriptor.metadata?.permissionMode ?? "(default)")}`,
     `Status: ${descriptor.status}`,
-    window > 0 ? `Context: ${used} of ${window} tokens (${percent}%).` : undefined,
+    window > 0 ? formatClaudeContextLine(used, window) : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+// A configured CLAUDE_CONTEXT_WINDOW is only a default; models like Fable have larger
+// windows, and reporting "114%" of the wrong denominator reads as impossible (it was).
+export function formatClaudeContextLine(used: number, window: number): string {
+  if (window > 0 && used > window) {
+    return `Context: ${used} tokens used. That exceeds the configured ${window}-token window, so this model's real window is larger and no reliable percentage exists. Set CLAUDE_CONTEXT_WINDOW to this model's window for accurate percentages.`;
+  }
+  const percent = window > 0 ? Math.round((used / window) * 100) : 0;
+  return `Context: ${used} of ${window} tokens (${percent}%).`;
 }
 
 function renderAppServerProbePlain(result: AppServerProbeResult): string {

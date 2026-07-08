@@ -287,6 +287,12 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         } else if (event.type === "session_title_changed") {
           runtime.descriptor.displayName = event.title;
           runtime.descriptor.updatedAt = Date.now();
+        } else if (event.type === "compact_boundary") {
+          // Auto/manual compaction shrinks the live context; without this the stale
+          // pre-compact figure is reported until the next turn's usage arrives.
+          if (event.postTokens !== undefined && runtime.lastUsage) {
+            runtime.lastUsage = { ...runtime.lastUsage, contextTokens: event.postTokens };
+          }
         }
         yield event;
       }

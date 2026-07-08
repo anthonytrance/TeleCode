@@ -138,6 +138,8 @@ export type AgentProviderEvent =
       type: "compact_boundary";
       sessionId: string;
       summary?: string;
+      /** Context tokens remaining after the compaction, when the transcript reports it. */
+      postTokens?: number;
     }
   | {
       type: "error";

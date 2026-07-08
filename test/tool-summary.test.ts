@@ -1,4 +1,5 @@
 import {
+  formatClaudeContextLine,
   formatToolSummaryLine,
   formatTurnUsageLine,
   isOversizedProgressBlock,
@@ -101,6 +102,14 @@ describe("tool summary formatting", () => {
   it("classifies blocks larger than the budget as oversized", () => {
     expect(isOversizedProgressBlock("short update")).toBe(false);
     expect(isOversizedProgressBlock("y".repeat(PROGRESS_EDIT_BUDGET_CHARS + 1))).toBe(true);
+  });
+
+  it("reports a percentage only when usage fits the configured context window", () => {
+    expect(formatClaudeContextLine(100000, 200000)).toBe("Context: 100000 of 200000 tokens (50%).");
+    const exceeded = formatClaudeContextLine(228000, 200000);
+    expect(exceeded).toContain("Context: 228000 tokens used.");
+    expect(exceeded).toContain("real window is larger");
+    expect(exceeded).not.toContain("%");
   });
 
   it("keeps the turn usage line format stable when enabled", () => {

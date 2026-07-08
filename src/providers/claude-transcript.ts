@@ -437,6 +437,7 @@ export function projectClaudeTranscriptEntry(
         type: "compact_boundary",
         sessionId: options.sessionId,
         summary: formatCompactBoundary(compactBoundary),
+        postTokens: compactBoundary.postTokens,
       });
     } else if (subtype && !IGNORED_SYSTEM_SUBTYPES.has(subtype)) {
       const noticeText = extractSystemNoticeText(entry);
