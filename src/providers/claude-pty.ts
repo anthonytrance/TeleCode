@@ -5,6 +5,11 @@ import * as pty from "node-pty";
 
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r/g;
 const BUFFER_LIMIT = 256 * 1024;
+// Prompts longer than this are sent via bracketed paste even without newlines.
+const LONG_PROMPT_PASTE_THRESHOLD = 200;
+// Per-poll output growth below this counts as "quiet" while waiting for input to settle;
+// cursor-blink repaints are tiny, paste echo bursts are not.
+const INPUT_SETTLE_QUIET_BYTES = 256;
 
 export interface ClaudePtySpawnOptions {
   bin: string;
@@ -19,6 +24,9 @@ export interface ClaudePtySpawnOptions {
 export class ClaudePty extends EventEmitter {
   private proc: pty.IPty | null = null;
   private rawBuffer = "";
+  // Monotonic byte counter; rawBuffer is capped at BUFFER_LIMIT so its length
+  // cannot be used to detect whether output is still flowing.
+  private receivedBytes = 0;
   private exited = false;
 
   spawn(options: ClaudePtySpawnOptions): void {
@@ -48,6 +56,7 @@ export class ClaudePty extends EventEmitter {
 
     this.proc.onData((data) => {
       this.rawBuffer += data;
+      this.receivedBytes += data.length;
       if (this.rawBuffer.length > BUFFER_LIMIT) {
         this.rawBuffer = this.rawBuffer.slice(-BUFFER_LIMIT);
       }
@@ -145,14 +154,44 @@ export class ClaudePty extends EventEmitter {
   }
 
   async sendPrompt(text: string): Promise<void> {
-    if (/\r|\n/.test(text)) {
+    // Bracketed paste for anything multi-line or long: character-at-a-time input of a
+    // long text is slow and can trip TUI shortcuts, and paste is what interactive use does.
+    const paste = /\r|\n/.test(text) || text.length > LONG_PROMPT_PASTE_THRESHOLD;
+    if (paste) {
       this.requireProc().write(`\x1b[200~${text}\x1b[201~`);
-      await sleep(800);
+      await this.waitForInputSettled(text.length, 800);
     } else {
       this.requireProc().write(text);
-      await sleep(150);
+      await this.waitForInputSettled(text.length, 150);
     }
     this.pressEnter();
+  }
+
+  /**
+   * Wait until the terminal has finished ingesting typed/pasted input before Enter is
+   * pressed. A fixed delay submits long prompts mid-paste: Claude then runs a truncated
+   * message, the transcript echo never matches, and the turn is burned. After the
+   * historical minimum delay, require the output stream to go quiet (echo/redraw burst
+   * finished), bounded by a length-scaled deadline so a busy repaint loop cannot stall us.
+   */
+  private async waitForInputSettled(promptLength: number, minWaitMs: number): Promise<void> {
+    await sleep(minWaitMs);
+    const deadline = Date.now() + Math.min(20000, Math.max(minWaitMs, promptLength * 3));
+    let lastReceived = this.receivedBytes;
+    let quietPolls = 0;
+    while (Date.now() <= deadline) {
+      await sleep(150);
+      const growth = this.receivedBytes - lastReceived;
+      lastReceived = this.receivedBytes;
+      if (growth < INPUT_SETTLE_QUIET_BYTES) {
+        quietPolls += 1;
+        if (quietPolls >= 2) {
+          return;
+        }
+      } else {
+        quietPolls = 0;
+      }
+    }
   }
 
   async sendCommand(command: string): Promise<void> {
