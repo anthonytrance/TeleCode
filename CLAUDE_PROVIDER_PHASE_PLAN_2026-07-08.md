@@ -160,6 +160,15 @@ Phase C exit: suite + both smokes green, committed, pushed, and a short summary 
 
 (append results per phase here)
 
+- 2026-07-08 Claude (Fable 5) continuation slice, commits 1d822cb..046af70:
+  - Finished Codex's uncommitted quiet-warning work: idle transcript no longer errors/kills the turn; the tailer emits a periodic status warning instead. Per Anthony's accessibility feedback the warning is plain text instructing /stop (inline buttons removed, he does not use them).
+  - Fixed /sessions, /switch, /use while Claude is the active provider (they were intercepted by the Claude command filter and replied "not classified yet"); added them to TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE.
+  - C5 partial: Claude /resume now renders the unified session list when bare and selects via the unified machinery with an argument ("not implemented yet" removed). /fork and forkSession remain open for Phase C.
+  - B2 DONE: narration content is never truncated in edit mode on either provider. Budgeted rolling message (3500 chars on HTML-escaped text), oldest blocks roll off whole, oversized blocks are delivered in full as their own chunked messages and the rolling message restarts below. trimProgressText removed; tool-line 120-char trim kept.
+  - NEW Anthony-reported (2026-07-08): long inbound prompts were submitted mid-paste because ClaudePty.sendPrompt pressed Enter on a fixed delay. Now bracketed paste for >200 chars and Enter held until PTY output settles (length-scaled deadline). This also explains prior "prompt echo not found" turn kills.
+  - Verification: npm run build + npm test green, 35 files / 346 tests.
+  - Note for Phase C/D: Telegram splits user messages over 4096 chars into separate updates; the bridge runs them as separate turns. If Anthony's cut prompts exceed that, an intake stitcher (hold a ~4096-char message briefly and join the continuation) is the fix; not built yet.
+
 - 2026-07-08 Codex partial Phase A/B bugfix slice:
   - Implemented persistent FIFO Claude prompt queue at `.telecodex/provider-state/claude-queue.json`, with restart recovery and no-BOM JSON writes.
   - Added atomic Claude intake gate so same-tick Telegram messages cannot both enter `sendPrompt`; queued prompts now run FIFO instead of last-wins replacement.
