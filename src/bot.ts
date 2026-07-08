@@ -138,6 +138,9 @@ const TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "provider",
   "new",
   "fork",
+  "sessions",
+  "switch",
+  "use",
   "workspaces",
   "workspace",
   "backend",
@@ -3014,12 +3017,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     if (commandName === "resume") {
-      const descriptor = await ensureClaudeSession(contextKey);
-      persistClaudeSession(contextKey, descriptor);
-      const message = argument
-        ? "Explicit Claude resume targets are not implemented yet. The saved session is attached."
-        : "Claude session is attached. Send a normal message to continue.";
-      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+      if (!argument) {
+        const plain = renderUnifiedSessions(contextKey);
+        await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+        return;
+      }
+      await selectUnifiedAgentSession(ctx, contextKey, argument);
       return;
     }
 

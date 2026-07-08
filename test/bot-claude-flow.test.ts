@@ -470,6 +470,48 @@ describe("Claude bot flow", () => {
     expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude session:"))).toContain("Model: opus");
   });
 
+  it("shows the unified session list for /sessions while Claude is active", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+    await bot.handleUpdate(textUpdate(2, "/sessions"));
+
+    expect(sent.map((entry) => entry.text)).not.toContain(
+      "Claude command /sessions is not classified yet, so I did not run it.",
+    );
+    const list = sent.map((entry) => entry.text).find((text) => text?.includes("Recent provider sessions"));
+    expect(list).toBeDefined();
+    expect(list).toContain("Claude");
+  });
+
+  it("switches sessions with /switch while Claude is active", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+    await bot.handleUpdate(textUpdate(2, "/sessions"));
+    await bot.handleUpdate(textUpdate(3, "/switch 1"));
+
+    const selection = sent.map((entry) => entry.text).find((text) => text?.includes("Selected #1"));
+    expect(selection).toBeDefined();
+  });
+
+  it("lists sessions for bare /resume and selects with /resume <n> while Claude is active", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+    await bot.handleUpdate(textUpdate(2, "/resume"));
+
+    const list = sent.map((entry) => entry.text).find((text) => text?.includes("Recent provider sessions"));
+    expect(list).toBeDefined();
+
+    await bot.handleUpdate(textUpdate(3, "/resume 1"));
+    const selection = sent.map((entry) => entry.text).find((text) => text?.includes("Selected #1"));
+    expect(selection).toBeDefined();
+  });
+
   it("reports Claude diagnostics through /doctor while Claude is active", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
