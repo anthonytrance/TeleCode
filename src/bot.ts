@@ -114,6 +114,8 @@ const MAX_PROVIDER_SESSION_LIST_LIMIT = 50;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
 const CLAUDE_QUIET_WARNING_PREFIX = "Claude has been quiet for ";
+// How long an unanswered idle-steer y/n question stays valid.
+const IDLE_STEER_CONFIRM_TTL_MS = 5 * 60 * 1000;
 const NATIVE_CODEX_COMMANDS = [
   "compact",
   "agents",
@@ -315,6 +317,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const queuedClaudePrompts = new ClaudePromptQueue(claudePromptQueuePath(config.workspace));
   const liveQueuedClaudeContexts = new Map<string, Context>();
   const claudeIntakeLocks = new Map<TelegramContextKey, boolean>();
+  // /steer sent while no turn is running: held here until the user answers y/n.
+  const pendingIdleSteers = new Map<TelegramContextKey, {
+    text: string;
+    provider: "claude" | "codex";
+    expiresAt: number;
+  }>();
   const activeProgressRefreshers = new Map<TelegramContextKey, () => Promise<void>>();
   const pendingClaudeLogins = new Map<TelegramContextKey, PendingClaudeLogin>();
   const claudeAdapter = config.enableClaudeProvider ? new ClaudeProviderAdapter(config) : undefined;
@@ -557,6 +565,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
     queuedClaudePrompts.removeContext(key);
     claudeIntakeLocks.delete(key);
+    pendingIdleSteers.delete(key);
     activeProgressRefreshers.delete(key);
     cancelPendingClaudeLogin(key);
     void disposeClaudeDescriptor(claudeSessions.get(key)).catch((error) => {
@@ -4245,11 +4254,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         await queueClaudePromptReply(ctx, rawContextKey, chatId, prompt, { kind: "steer" });
         return;
       }
-      await safeReply(ctx, escapeHTML("Claude Code does not support live steering through TeleCodex yet. I sent this as a normal Claude follow-up."), {
-        fallbackText: "Claude Code does not support live steering through TeleCodex yet. I sent this as a normal Claude follow-up.",
+      pendingIdleSteers.set(rawContextKey, {
+        text: prompt,
+        provider: "claude",
+        expiresAt: Date.now() + IDLE_STEER_CONFIRM_TTL_MS,
       });
-      await setReaction(ctx, "👀");
-      startClaudePrompt(ctx, rawContextKey, chatId, prompt);
+      const message = "No Claude turn is running. Reply y to start a new turn with this steer text, or n to discard it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       return;
     }
 
@@ -4258,7 +4269,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
-    const { session } = contextSession;
+    const { contextKey, session } = contextSession;
+    if (!isBusy(contextKey)) {
+      pendingIdleSteers.set(contextKey, {
+        text: prompt,
+        provider: "codex",
+        expiresAt: Date.now() + IDLE_STEER_CONFIRM_TTL_MS,
+      });
+      const message = "No Codex turn is running. Reply y to start a new turn with this steer text, or n to discard it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
     if (!session.steer) {
       await safeReply(ctx, escapeHTML("Native steering requires the app-server backend. The live backend is still SDK."), {
         fallbackText: "Native steering requires the app-server backend. The live backend is still SDK.",
@@ -4274,6 +4295,55 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         fallbackText: `Failed: ${friendlyErrorText(error)}`,
       });
     }
+  });
+
+  // y/n answers to the idle-steer question above. Passes through to the normal
+  // text pipeline when nothing is pending, so a literal "y" message still reaches
+  // the provider in every other situation.
+  bot.hears(/^(y|yes|n|no)[.!]?$/i, async (ctx, next) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      await next();
+      return;
+    }
+    const pending = pendingIdleSteers.get(contextKey);
+    if (!pending) {
+      await next();
+      return;
+    }
+    pendingIdleSteers.delete(contextKey);
+    if (Date.now() > pending.expiresAt) {
+      await next();
+      return;
+    }
+
+    const confirmed = (ctx.match?.[1] ?? "").toLowerCase().startsWith("y");
+    if (!confirmed) {
+      await safeReply(ctx, escapeHTML("Discarded the steer text."), { fallbackText: "Discarded the steer text." });
+      return;
+    }
+
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+    if (pending.provider === "claude") {
+      lastPromptInput.set(contextKey, pending.text);
+      await setReaction(ctx, "👀");
+      startClaudePrompt(ctx, contextKey, chatId, pending.text);
+      return;
+    }
+    const contextSession = await getContextSession(ctx);
+    if (!contextSession) {
+      return;
+    }
+    if (isBusy(contextKey)) {
+      await queuePromptReply(ctx, contextKey, chatId, contextSession.session, pending.text);
+      return;
+    }
+    lastPromptInput.set(contextKey, pending.text);
+    await setReaction(ctx, "👀");
+    startUserPrompt(ctx, contextKey, chatId, contextSession.session, pending.text);
   });
 
   bot.command("goal", async (ctx) => {

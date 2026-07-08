@@ -355,6 +355,35 @@ describe("Claude bot flow", () => {
     ]);
   });
 
+  it("asks y/n for /steer with no active turn and starts the turn on y", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "/steer investigate the login bug"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("No Claude turn is running")));
+    expect(mockClaude.prompts).toEqual([]);
+
+    await bot.handleUpdate(textUpdate(3, "y"));
+    await waitFor(() => mockClaude.prompts.includes("investigate the login bug"));
+    expect(mockClaude.prompts).toEqual(["investigate the login bug"]);
+  });
+
+  it("discards an idle steer on n and passes a bare y through when nothing is pending", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "/steer try the other approach"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("No Claude turn is running")));
+    await bot.handleUpdate(textUpdate(3, "n"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Discarded the steer text")));
+    expect(mockClaude.prompts).toEqual([]);
+
+    // No pending question anymore: a literal y is a normal prompt.
+    await bot.handleUpdate(textUpdate(4, "y"));
+    await waitFor(() => mockClaude.prompts.includes("y"));
+    expect(mockClaude.prompts).toEqual(["y"]);
+  });
+
   it("serializes same-tick Claude messages and runs the queued prompts FIFO", async () => {
     const { bot, sent } = await createTestBot(tempDir);
     mockClaude.blockNextPrompt();

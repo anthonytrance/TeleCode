@@ -667,85 +667,103 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       });
     }
 
+    // Startup dialogs can CHAIN (e.g. trust prompt, then the large-session resume
+    // picker). Handle whatever appears, in any order, until the prompt is ready.
     const readyTimeoutMs = mode === "resume" ? 90000 : 30000;
-    const firstMarker = await ptySession.waitForMarker([
+    const disposeWith = async (message: string): Promise<never> => {
+      const tail = screenTail(ptySession);
+      await ptySession.dispose(false);
+      this.removeRegisteredProcessSession(runtime.descriptor.id);
+      throw new Error(`${message} Screen tail: ${tail}`);
+    };
+    let marker = await ptySession.waitForMarker([
       ...CLAUDE_TRUST_MARKERS,
       ...CLAUDE_FULLSCREEN_PROMPT_MARKERS,
       ...CLAUDE_RESUME_WARNING_MARKERS,
       ...CLAUDE_READY_MARKERS,
     ], readyTimeoutMs);
-    if (!firstMarker) {
-      await ptySession.dispose(false);
-      this.removeRegisteredProcessSession(runtime.descriptor.id);
-      throw new Error(`Claude did not reach a ready prompt. Screen tail: ${screenTail(ptySession)}`);
+    if (!marker) {
+      await disposeWith("Claude did not reach a ready prompt.");
     }
-    if (firstMarker === CLAUDE_TRUST_MARKERS[0]!.source) {
-      ptySession.pressEnter();
-      ptySession.clearBuffer();
-      const ready = await ptySession.waitForReadyPrompt(30000);
-      if (!ready) {
-        await ptySession.dispose(false);
-        this.removeRegisteredProcessSession(runtime.descriptor.id);
-        throw new Error(`Claude trust dialog was accepted, but the prompt did not become ready. Screen tail: ${screenTail(ptySession)}`);
+    let dialogsHandled = 0;
+    while (marker && !CLAUDE_READY_MARKERS.some((ready) => ready.source === marker)) {
+      if (dialogsHandled >= 4) {
+        await disposeWith("Claude kept showing startup dialogs and never became ready.");
       }
-    }
-    if (firstMarker === CLAUDE_FULLSCREEN_PROMPT_MARKERS[0]!.source) {
-      ptySession.typeText("2");
-      ptySession.pressEnter();
-      ptySession.clearBuffer();
-      const ready = await ptySession.waitForReadyPrompt(30000);
-      if (!ready) {
-        await ptySession.dispose(false);
-        this.removeRegisteredProcessSession(runtime.descriptor.id);
-        throw new Error(`Claude fullscreen prompt was dismissed, but the prompt did not become ready. Screen tail: ${screenTail(ptySession)}`);
-      }
-    }
-    if (CLAUDE_RESUME_WARNING_MARKERS.some((marker) => marker.source === firstMarker)) {
-      if (this.config.claudeLargeSessionResume === "manual") {
-        await ptySession.dispose(false);
-        this.removeRegisteredProcessSession(runtime.descriptor.id);
-        throw new Error(
-          "Claude is asking how to resume a very large session. Set CLAUDE_LARGE_SESSION_RESUME=summary or full, then restart TeleCodex.",
-        );
-      }
-      const resumeStartedAt = Date.now();
-      const resumeStrategy = this.config.claudeLargeSessionResume;
-      runtime.descriptor.metadata = {
-        ...runtime.descriptor.metadata,
-        startupResumeStrategy: resumeStrategy,
-        startupResumeStartedAt: resumeStartedAt,
-        startupResumeFinishedAt: undefined,
-      };
-      runtime.descriptor.updatedAt = resumeStartedAt;
-      await onStartupStatus?.(
-        resumeStrategy === "full"
-          ? "Claude is resuming a very large session in full. This can take a while; I will wait before sending your prompt."
-          : "Claude is compacting a very large session into a summary. I will wait before sending your prompt.",
-      );
-      if (this.config.claudeLargeSessionResume === "full") {
+      dialogsHandled += 1;
+      let nextWaitMs = 30000;
+
+      if (marker === CLAUDE_TRUST_MARKERS[0]!.source) {
+        ptySession.pressEnter();
+        ptySession.clearBuffer();
+      } else if (marker === CLAUDE_FULLSCREEN_PROMPT_MARKERS[0]!.source) {
         ptySession.typeText("2");
+        ptySession.pressEnter();
+        ptySession.clearBuffer();
+      } else {
+        // Large-session resume picker.
+        if (this.config.claudeLargeSessionResume === "manual") {
+          await disposeWith(
+            "Claude is asking how to resume a very large session. Set CLAUDE_LARGE_SESSION_RESUME=summary or full, then restart TeleCodex.",
+          );
+        }
+        const resumeStartedAt = Date.now();
+        const resumeStrategy = this.config.claudeLargeSessionResume;
+        runtime.descriptor.metadata = {
+          ...runtime.descriptor.metadata,
+          startupResumeStrategy: resumeStrategy,
+          startupResumeStartedAt: resumeStartedAt,
+          startupResumeFinishedAt: undefined,
+        };
+        runtime.descriptor.updatedAt = resumeStartedAt;
+        await onStartupStatus?.(
+          resumeStrategy === "full"
+            ? "Claude is resuming a very large session in full. This can take a while; I will wait before sending your prompt."
+            : "Claude is compacting a very large session into a summary. I will wait before sending your prompt.",
+        );
+        if (resumeStrategy === "full") {
+          ptySession.typeText("2");
+        }
+        ptySession.pressEnter();
+        ptySession.clearBuffer();
+        nextWaitMs = 600000;
+        const ready = await ptySession.waitForReadyPrompt(nextWaitMs);
+        if (!ready) {
+          await disposeWith("Claude resume warning was accepted, but the prompt did not become ready.");
+        }
+        const resumeFinishedAt = Date.now();
+        runtime.descriptor.metadata = {
+          ...runtime.descriptor.metadata,
+          startupResumeStrategy: resumeStrategy,
+          startupResumeStartedAt: resumeStartedAt,
+          startupResumeFinishedAt: resumeFinishedAt,
+        };
+        runtime.descriptor.updatedAt = resumeFinishedAt;
+        await onStartupStatus?.(
+          resumeStrategy === "full"
+            ? "Claude full-session resume finished. Sending your prompt now."
+            : "Claude summary compaction finished. Sending your prompt now.",
+        );
+        bridgeLog("pty", `large-session resume (${resumeStrategy}) took ${resumeFinishedAt - resumeStartedAt}ms`);
+        break;
       }
-      ptySession.pressEnter();
-      ptySession.clearBuffer();
-      const ready = await ptySession.waitForReadyPrompt(600000);
-      if (!ready) {
-        await ptySession.dispose(false);
-        this.removeRegisteredProcessSession(runtime.descriptor.id);
-        throw new Error(`Claude resume warning was accepted, but the prompt did not become ready. Screen tail: ${screenTail(ptySession)}`);
+
+      marker = await ptySession.waitForMarker([
+        ...CLAUDE_TRUST_MARKERS,
+        ...CLAUDE_FULLSCREEN_PROMPT_MARKERS,
+        ...CLAUDE_RESUME_WARNING_MARKERS,
+        ...CLAUDE_READY_MARKERS,
+      ], nextWaitMs);
+      if (!marker) {
+        await disposeWith("Claude startup dialog was dismissed, but the prompt did not become ready.");
       }
-      const resumeFinishedAt = Date.now();
-      runtime.descriptor.metadata = {
-        ...runtime.descriptor.metadata,
-        startupResumeStrategy: resumeStrategy,
-        startupResumeStartedAt: resumeStartedAt,
-        startupResumeFinishedAt: resumeFinishedAt,
-      };
-      runtime.descriptor.updatedAt = resumeFinishedAt;
-      await onStartupStatus?.(
-        resumeStrategy === "full"
-          ? "Claude full-session resume finished. Sending your prompt now."
-          : "Claude summary compaction finished. Sending your prompt now.",
-      );
+    }
+
+    // Busy-aware settle check: the footer alone must not count as ready while
+    // startup output (e.g. auto-compaction) is still flowing. Instant when quiet.
+    const settledReady = await ptySession.waitForReadyPrompt(30000);
+    if (!settledReady) {
+      await disposeWith("Claude looked ready but the prompt did not settle.");
     }
 
     ptySession.on("exit", () => {
