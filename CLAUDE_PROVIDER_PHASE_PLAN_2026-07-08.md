@@ -159,3 +159,10 @@ Phase C exit: suite + both smokes green, committed, pushed, and a short summary 
 ## Execution log
 
 (append results per phase here)
+
+- 2026-07-08 Codex partial Phase A/B bugfix slice:
+  - Implemented persistent FIFO Claude prompt queue at `.telecodex/provider-state/claude-queue.json`, with restart recovery and no-BOM JSON writes.
+  - Added atomic Claude intake gate so same-tick Telegram messages cannot both enter `sendPrompt`; queued prompts now run FIFO instead of last-wins replacement.
+  - Added `PromptNotDeliveredError`; missed transcript echo on a live PTY now requeues the prompt and keeps Claude alive instead of force-killing the process.
+  - Fixed Claude `/usage` leakage by cropping the screen scrape to the latest usage panel and routing top-level Telegram `/usage` through the same Claude usage-report path.
+  - Verification: `npm run build` passed; focused tests passed; full `npm test` passed, 35 files / 333 tests.

@@ -40,6 +40,12 @@ import {
   type CodexSessionCallbacks,
   type CodexSessionInfo,
 } from "./codex-session.js";
+import {
+  ClaudePromptQueue,
+  claudePromptQueuePath,
+  type ClaudePromptQueueEntry,
+  type ClaudeQueuedPromptKind,
+} from "./claude-prompt-queue.js";
 import { createCodexSession, type CodexSessionRuntime } from "./codex-backend.js";
 import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "./codex-auth.js";
 import {
@@ -62,7 +68,7 @@ import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { applyGoalModeConstraints, formatThreadGoal, parseGoalModeArgument } from "./goal-mode.js";
 import { OutputBuffer, type BufferedOutputEvent } from "./output-buffer.js";
-import { ClaudeProviderAdapter } from "./providers/claude-adapter.js";
+import { ClaudeProviderAdapter, PromptNotDeliveredError } from "./providers/claude-adapter.js";
 import { classifyClaudeSlashCommand } from "./providers/claude-commands.js";
 import { claudeProcessRegistryPath } from "./providers/claude-process-registry.js";
 import {
@@ -181,6 +187,12 @@ type QueuedPrompt = {
   userInput: CodexPromptInput;
 };
 
+type ClaudePromptRunSource = {
+  ctx?: Context;
+  chatId: TelegramChatId;
+  messageThreadId?: number;
+};
+
 type PendingClaudeLogin = {
   proc: pty.IPty;
   chatId: TelegramChatId;
@@ -190,12 +202,6 @@ type PendingClaudeLogin = {
   codeSubmitted: boolean;
   submittedCode?: string;
   timeout: ReturnType<typeof setTimeout>;
-};
-
-type QueuedClaudePrompt = {
-  ctx: Context;
-  chatId: TelegramChatId;
-  text: string;
 };
 
 type ProviderSessionPick =
@@ -295,7 +301,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const lastAssistantReply = new Map<TelegramContextKey, string>();
   const queuedPrompts = new Map<TelegramContextKey, QueuedPrompt>();
-  const queuedClaudePrompts = new Map<TelegramContextKey, QueuedClaudePrompt>();
+  const queuedClaudePrompts = new ClaudePromptQueue(claudePromptQueuePath(config.workspace));
+  const liveQueuedClaudeContexts = new Map<string, Context>();
+  const claudeIntakeLocks = new Map<TelegramContextKey, boolean>();
   const activeProgressRefreshers = new Map<TelegramContextKey, () => Promise<void>>();
   const pendingClaudeLogins = new Map<TelegramContextKey, PendingClaudeLogin>();
   const claudeAdapter = config.enableClaudeProvider ? new ClaudeProviderAdapter(config) : undefined;
@@ -529,7 +537,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     lastPromptInput.delete(key);
     lastAssistantReply.delete(key);
     queuedPrompts.delete(key);
-    queuedClaudePrompts.delete(key);
+    for (const entry of queuedClaudePrompts.list(key)) {
+      liveQueuedClaudeContexts.delete(entry.id);
+    }
+    queuedClaudePrompts.removeContext(key);
+    claudeIntakeLocks.delete(key);
     activeProgressRefreshers.delete(key);
     cancelPendingClaudeLogin(key);
     void disposeClaudeDescriptor(claudeSessions.get(key)).catch((error) => {
@@ -1101,24 +1113,51 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     await safeReply(ctx, escapeHTML(text), { fallbackText: text });
   };
 
+  const enqueueClaudePromptFromSource = (
+    source: ClaudePromptRunSource,
+    contextKey: TelegramContextKey,
+    text: string,
+    options: { kind?: ClaudeQueuedPromptKind; front?: boolean } = {},
+  ): number => {
+    const queuedText = options.kind === "steer"
+      ? `Additional instruction for the previous Claude task:\n\n${text}`
+      : text;
+    const entry: ClaudePromptQueueEntry = {
+      id: randomUUID(),
+      contextKey,
+      chatId: source.chatId,
+      messageThreadId: source.messageThreadId ?? parseContextKey(contextKey).messageThreadId,
+      text: queuedText,
+      queuedAt: Date.now(),
+      kind: options.kind ?? "prompt",
+    };
+    const depth = options.front
+      ? queuedClaudePrompts.enqueueFront(entry)
+      : queuedClaudePrompts.enqueue(entry);
+    if (source.ctx) {
+      liveQueuedClaudeContexts.set(entry.id, source.ctx);
+    }
+    return depth;
+  };
+
   const queueClaudePromptReply = async (
     ctx: Context,
     contextKey: TelegramContextKey,
     chatId: TelegramChatId,
     text: string,
-    options: { kind?: "prompt" | "steer" } = {},
+    options: { kind?: ClaudeQueuedPromptKind; front?: boolean } = {},
   ): Promise<void> => {
-    const replaced = queuedClaudePrompts.has(contextKey);
-    const queuedText = options.kind === "steer"
-      ? `Additional instruction for the previous Claude task:\n\n${text}`
-      : text;
-    queuedClaudePrompts.set(contextKey, { ctx, chatId, text: queuedText });
+    const depth = enqueueClaudePromptFromSource({
+      ctx,
+      chatId,
+      messageThreadId: parseContextKey(contextKey).messageThreadId,
+    }, contextKey, text, options);
     const replyText = options.kind === "steer"
-      ? replaced
-        ? "Claude is still working. I replaced the queued Claude follow-up with this /steer instruction. It will run after the current turn finishes."
+      ? depth > 1
+        ? `Claude is still working. I queued this /steer instruction as Claude follow-up #${depth}.`
         : "Claude is still working. I queued this /steer instruction as a Claude follow-up after the current turn finishes."
-      : replaced
-        ? "Claude is still working. I replaced the queued Claude message with your latest one. Use /stop if the current task is stuck."
+      : depth > 1
+        ? `Claude is still working. I queued this Claude message as item #${depth}. Use /stop if the current task is stuck.`
         : "Claude is still working. I queued this Claude message and will run it next. Use /stop if the current task is stuck.";
     await safeReply(ctx, escapeHTML(replyText), { fallbackText: replyText });
   };
@@ -1150,6 +1189,46 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       await ctx.api.setMessageReaction(chatId, messageId, []);
     } catch {
       // Fail silently.
+    }
+  };
+
+  const replyToClaudeRunSource = async (
+    source: ClaudePromptRunSource,
+    text: string,
+    options: TextOptions = {},
+  ): Promise<void> => {
+    if (source.ctx) {
+      await safeReply(source.ctx, text, {
+        ...options,
+        messageThreadId: options.messageThreadId ?? source.messageThreadId,
+      });
+      return;
+    }
+    const parseMode = options.parseMode !== undefined ? options.parseMode : ("HTML" as TelegramParseMode);
+    const chunks = splitTelegramText(text);
+    const fallbackChunks = options.fallbackText ? splitTelegramText(options.fallbackText) : [];
+    for (const [index, chunk] of chunks.entries()) {
+      await sendTextMessage(bot.api, source.chatId, chunk, {
+        parseMode,
+        fallbackText: fallbackChunks[index] ?? chunk,
+        replyMarkup: index === 0 ? options.replyMarkup : undefined,
+        messageThreadId: source.messageThreadId,
+      });
+    }
+  };
+
+  const setClaudeRunReaction = async (
+    source: ClaudePromptRunSource,
+    emoji: Parameters<typeof setReaction>[1],
+  ): Promise<void> => {
+    if (source.ctx) {
+      await setReaction(source.ctx, emoji);
+    }
+  };
+
+  const clearClaudeRunReaction = async (source: ClaudePromptRunSource): Promise<void> => {
+    if (source.ctx) {
+      await clearReaction(source.ctx);
     }
   };
 
@@ -2151,44 +2230,82 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   };
 
   const handleClaudePrompt = async (
-    ctx: Context,
+    source: ClaudePromptRunSource,
     contextKey: TelegramContextKey,
-    chatId: TelegramChatId,
     text: string,
   ): Promise<void> => {
-    const messageThreadId = parseContextKey(contextKey).messageThreadId;
+    const messageThreadId = source.messageThreadId ?? parseContextKey(contextKey).messageThreadId;
     const busyState = getBusyState(contextKey);
+
+    if (claudeIntakeLocks.get(contextKey)) {
+      if (source.ctx) {
+        lastPromptInput.set(contextKey, text);
+        await queueClaudePromptReply(source.ctx, contextKey, source.chatId, text);
+      } else {
+        enqueueClaudePromptFromSource(source, contextKey, text, { front: true });
+      }
+      return;
+    }
+
+    let claimedBusy = false;
+    claudeIntakeLocks.set(contextKey, true);
+    try {
+      if (busyState.switching || busyState.transcribing) {
+        if (source.ctx) {
+          await sendBusyReply(source.ctx);
+        } else {
+          const message = "Still working on previous message...";
+          await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
+        }
+        return;
+      }
+      if (isProviderBusy(contextKey, "claude")) {
+        if (source.ctx) {
+          lastPromptInput.set(contextKey, text);
+          await queueClaudePromptReply(source.ctx, contextKey, source.chatId, text);
+        } else {
+          enqueueClaudePromptFromSource(source, contextKey, text, { front: true });
+        }
+        return;
+      }
+      busyState.processing = true;
+      markProviderBusy(contextKey, "claude", true);
+      claimedBusy = true;
+    } finally {
+      claudeIntakeLocks.delete(contextKey);
+    }
+
+    const releaseClaimedBusy = (): void => {
+      if (!claimedBusy) {
+        return;
+      }
+      markProviderBusy(contextKey, "claude", false);
+      busyState.processing = false;
+      claimedBusy = false;
+    };
+
     if (!claudeAdapter) {
+      releaseClaimedBusy();
       const message = "Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.";
-      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
       return;
     }
     const embeddedCommand = findEmbeddedClaudeCommandLine(text);
     if (embeddedCommand && !isStandaloneClaudeDispatchPrompt(text)) {
+      releaseClaimedBusy();
       const message = [
         `I did not send this to Claude because it contains ${embeddedCommand} on its own line.`,
         "Send the text first, then send the command as a separate Telegram message.",
       ].join("\n");
-      await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
-      return;
-    }
-    if (busyState.switching || busyState.transcribing) {
-      await sendBusyReply(ctx);
-      return;
-    }
-    if (isProviderBusy(contextKey, "claude")) {
-      lastPromptInput.set(contextKey, text);
-      await queueClaudePromptReply(ctx, contextKey, chatId, text);
+      await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
       return;
     }
 
-    busyState.processing = true;
-    markProviderBusy(contextKey, "claude", true);
     const typingInterval = setInterval(() => {
       if (!isProviderForeground(contextKey, "claude")) {
         return;
       }
-      void ctx.api.sendChatAction(chatId, "typing", {
+      void bot.api.sendChatAction(source.chatId, "typing", {
         ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
       }).catch(() => {});
     }, TYPING_INTERVAL_MS);
@@ -2208,6 +2325,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     let descriptor: AgentSessionDescriptor | undefined;
     let agentJobId: string | undefined;
     let completedSuccessfully = false;
+    let deferQueuedDispatch = false;
 
     const bufferClaudeOutput = (
       kind: BufferedOutputEvent["kind"],
@@ -2252,21 +2370,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       if (mode === "edit") {
         const rendered = renderAssistantProgressMessage(recentClaudeProgress);
         if (!progressMessageId) {
-          const message = await sendTextMessage(ctx.api, chatId, rendered.text, {
+          const message = await sendTextMessage(bot.api, source.chatId, rendered.text, {
             parseMode: rendered.parseMode,
             fallbackText: rendered.fallbackText,
             messageThreadId,
           });
           progressMessageId = message.message_id;
         } else {
-          await safeEditMessage(bot, chatId, progressMessageId, rendered.text, {
+          await safeEditMessage(bot, source.chatId, progressMessageId, rendered.text, {
             parseMode: rendered.parseMode,
             fallbackText: rendered.fallbackText,
           }).catch(() => {});
         }
       } else {
         for (const chunk of splitMarkdownForTelegram(trimmed)) {
-          await sendTextMessage(ctx.api, chatId, chunk.text, {
+          await sendTextMessage(bot.api, source.chatId, chunk.text, {
             parseMode: chunk.parseMode,
             fallbackText: chunk.fallbackText,
             messageThreadId,
@@ -2313,7 +2431,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
       if (isProviderForeground(contextKey, "claude")) {
-        await safeReply(ctx, escapeHTML(trimmed), { fallbackText: trimmed, messageThreadId });
+        await replyToClaudeRunSource(source, escapeHTML(trimmed), { fallbackText: trimmed, messageThreadId });
       } else {
         bufferClaudeOutput("status", trimmed, false);
       }
@@ -2376,7 +2494,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             if (registry.getProgressDelivery(contextKey) !== "none" && config.toolVerbosity === "all") {
               const line = event.text ? `Claude started ${event.toolName}: ${event.text}` : `Claude started ${event.toolName}`;
               if (isProviderForeground(contextKey, "claude")) {
-                await safeReply(ctx, escapeHTML(line), { fallbackText: line, messageThreadId });
+                await replyToClaudeRunSource(source, escapeHTML(line), { fallbackText: line, messageThreadId });
               } else {
                 bufferClaudeOutput("tool", line, false);
               }
@@ -2392,7 +2510,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
               ? `Claude error: ${event.message}`
               : `Claude tool failed: ${event.toolName}${event.text ? `: ${event.text}` : ""}`;
             if (isProviderForeground(contextKey, "claude")) {
-              await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+              await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
             } else {
               bufferClaudeOutput("error", message, true);
             }
@@ -2455,7 +2573,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       const deliverClaudeFinal = async (outputText: string, header?: string): Promise<void> => {
         const textToSend = header ? `${header}\n\n${outputText}` : outputText;
         for (const chunk of splitMarkdownForTelegram(textToSend)) {
-          await sendTextMessage(ctx.api, chatId, chunk.text, {
+          await sendTextMessage(bot.api, source.chatId, chunk.text, {
             parseMode: chunk.parseMode,
             fallbackText: chunk.fallbackText,
             messageThreadId,
@@ -2478,19 +2596,45 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         persistClaudeSession(contextKey, descriptor);
       }
       completedSuccessfully = true;
-      await setReaction(ctx, "👍");
+      await setClaudeRunReaction(source, "👍");
     } catch (error) {
       console.error("Claude prompt failed:", error);
+      if (error instanceof PromptNotDeliveredError) {
+        enqueueClaudePromptFromSource(source, contextKey, error.promptText, { front: true });
+        deferQueuedDispatch = true;
+        const queuedMessage = "Claude did not accept the message yet. I put it back at the front of the Claude queue and will retry after the current session becomes idle.";
+        await replyToClaudeRunSource(source, escapeHTML(queuedMessage), {
+          fallbackText: queuedMessage,
+          messageThreadId,
+        });
+        const retryTimer = setTimeout(() => {
+          dispatchNextQueuedClaudePrompt(contextKey);
+        }, 30000);
+        retryTimer.unref?.();
+        await clearClaudeRunReaction(source);
+        return;
+      }
       const message = `Claude failed: ${friendlyErrorText(error)}`;
       if (isProviderForeground(contextKey, "claude")) {
-        await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
+        await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
       } else {
         bufferClaudeOutput("error", message, true);
         if (descriptor) {
-          await sendBackgroundCompletionNotice(ctx, contextKey, descriptor, message, messageThreadId);
+          if (source.ctx) {
+            await sendBackgroundCompletionNotice(source.ctx, contextKey, descriptor, message, messageThreadId);
+          } else {
+            const label = descriptor.displayName || descriptor.providerSessionId?.slice(0, 8);
+            const header = label
+              ? `Claude Code finished in background: ${label}`
+              : "Claude Code finished in background.";
+            await replyToClaudeRunSource(source, formatTelegramHTML(`${header}\n\n${message}`), {
+              fallbackText: `${header}\n\n${message}`,
+              messageThreadId,
+            });
+          }
         }
       }
-      await clearReaction(ctx);
+      await clearClaudeRunReaction(source);
     } finally {
       clearInterval(typingInterval);
       clearNarrationIdleTimer();
@@ -2499,12 +2643,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
       markProviderBusy(contextKey, "claude", false);
       busyState.processing = false;
-      const queued = queuedClaudePrompts.get(contextKey);
-      if (queued) {
-        queuedClaudePrompts.delete(contextKey);
-        lastPromptInput.set(contextKey, queued.text);
-        await setReaction(queued.ctx, "👀");
-        startClaudePrompt(queued.ctx, contextKey, queued.chatId, queued.text);
+      if (!deferQueuedDispatch) {
+        dispatchNextQueuedClaudePrompt(contextKey);
       }
     }
   };
@@ -2515,9 +2655,64 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     chatId: TelegramChatId,
     text: string,
   ): void => {
-    void handleClaudePrompt(ctx, contextKey, chatId, text).catch((error) => {
+    void handleClaudePrompt({
+      ctx,
+      chatId,
+      messageThreadId: parseContextKey(contextKey).messageThreadId,
+    }, contextKey, text).catch((error) => {
       console.error("Claude prompt task failed:", error);
     });
+  };
+
+  const startQueuedClaudePrompt = (entry: ClaudePromptQueueEntry): void => {
+    const ctx = liveQueuedClaudeContexts.get(entry.id);
+    liveQueuedClaudeContexts.delete(entry.id);
+    void handleClaudePrompt({
+      ctx,
+      chatId: entry.chatId,
+      messageThreadId: entry.messageThreadId,
+    }, entry.contextKey, entry.text).catch((error) => {
+      console.error("Queued Claude prompt task failed:", error);
+    });
+  };
+
+  const dispatchNextQueuedClaudePrompt = (contextKey: TelegramContextKey): void => {
+    if (!claudeAdapter || isProviderBusy(contextKey, "claude") || getBusyState(contextKey).processing) {
+      return;
+    }
+    const queued = queuedClaudePrompts.dequeue(contextKey);
+    if (!queued) {
+      return;
+    }
+    lastPromptInput.set(contextKey, queued.text);
+    const ctx = liveQueuedClaudeContexts.get(queued.id);
+    if (ctx) {
+      void setReaction(ctx, "👀").catch(() => {});
+    }
+    startQueuedClaudePrompt(queued);
+  };
+
+  const recoverPersistedClaudeQueue = (): void => {
+    if (!claudeAdapter) {
+      return;
+    }
+    for (const contextKey of queuedClaudePrompts.contextKeys()) {
+      const first = queuedClaudePrompts.peek(contextKey);
+      if (!first) {
+        continue;
+      }
+      const depth = queuedClaudePrompts.depth(contextKey);
+      const message = depth === 1
+        ? "One queued Claude message from before the restart will be sent now."
+        : `${depth} queued Claude messages from before the restart will be sent now.`;
+      void sendTextMessage(bot.api, first.chatId, escapeHTML(message), {
+        fallbackText: message,
+        messageThreadId: first.messageThreadId,
+      }).catch((error) => {
+        console.warn("Failed to report recovered Claude queue", error);
+      });
+      dispatchNextQueuedClaudePrompt(contextKey);
+    }
   };
 
   const sendBackgroundCompletionNotice = async (
@@ -4347,22 +4542,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
   bot.command("usage", async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
     if (contextKey && isClaudeActive(contextKey)) {
-      const descriptor = claudeSessions.get(contextKey);
-      if (!descriptor || !claudeAdapter) {
-        const message = "No Claude usage is available yet. Send a message to Claude first.";
-        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
-        return;
-      }
-      const usage = await claudeAdapter.getUsage(descriptor.id);
-      const context = await claudeAdapter.getContext(descriptor.id);
-      const used = Number(context.usedTokens ?? 0);
-      const window = Number(context.contextWindow ?? config.claudeContextWindow);
-      const percent = window > 0 ? Math.round((used / window) * 100) : 0;
-      const plain = [
-        `Context: ${used} of ${window} tokens (${percent}%).`,
-        `Last turn: in ${Number(usage.inputTokens ?? 0)}, cached ${Number(usage.cachedInputTokens ?? 0)}, out ${Number(usage.outputTokens ?? 0)}.`,
-      ].join("\n");
-      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      await sendClaudeUsageReport(ctx, contextKey, parseContextKey(contextKey).messageThreadId);
       return;
     }
 
@@ -6353,6 +6533,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const message = error.error instanceof Error ? error.error.message : String(error.error);
     console.error("Telegram bot error:", message);
   });
+
+  queueMicrotask(recoverPersistedClaudeQueue);
 
   return bot;
 }

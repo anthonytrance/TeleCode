@@ -74,6 +74,16 @@ type LocatedTurnOutput =
 
 type StartupStatusCallback = (text: string) => void | Promise<void>;
 
+export class PromptNotDeliveredError extends Error {
+  constructor(
+    readonly promptText: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "PromptNotDeliveredError";
+  }
+}
+
 export class ClaudeProviderAdapter implements AgentProviderAdapter {
   readonly id = "claude";
   readonly displayName = "Claude Code";
@@ -746,9 +756,14 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           if (ready) {
             runtime.pty.clearInput();
           } else {
-            await this.stopRuntimePty(runtime, { graceful: false });
+            runtime.pty.clearInput();
           }
+          throw new PromptNotDeliveredError(
+            promptText,
+            `Claude did not accept the message yet. Screen tail: ${tail}`,
+          );
         }
+        await this.stopRuntimePty(runtime, { graceful: false });
         throw new Error(`Claude did not record the prompt in its transcript. Screen tail: ${tail}`);
       }
 
@@ -953,10 +968,12 @@ function screenTail(ptySession: ClaudePty | undefined): string {
  * drop box-drawing chrome, the input prompt/footer, and the TeleCodex system-prompt echo,
  * then collapse blank runs. Returns null when nothing usable is left.
  */
-function cleanUsagePanel(screen: string): string | null {
-  const lines = screen
+export function cleanUsagePanel(screen: string): string | null {
+  const rawLines = screen
     .replace(/[─-╿⬢⬡●▌▐█]/g, " ")
-    .split(/\r?\n/)
+    .split(/\r?\n/);
+  const panelStart = latestUsagePanelStart(rawLines);
+  const lines = (panelStart >= 0 ? rawLines.slice(panelStart) : rawLines)
     .map((line) => line.replace(/\s+/g, " ").trim())
     .filter((line) => {
       if (!line) {
@@ -986,6 +1003,23 @@ function cleanUsagePanel(screen: string): string | null {
 
   const text = deduped.join("\n").trim();
   return text.length > 0 ? text : null;
+}
+
+function latestUsagePanelStart(lines: string[]): number {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const lower = lines[index]?.replace(/\s+/g, " ").trim().toLowerCase() ?? "";
+    if (
+      lower === "usage" ||
+      lower.includes("usage limits") ||
+      lower.includes("usage limit") ||
+      lower.includes("current usage") ||
+      lower.includes("claude usage") ||
+      lower.includes("/usage")
+    ) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function extractScreenFallbackText(before: string, after: string): string | undefined {

@@ -63,6 +63,15 @@ const mockClaude = vi.hoisted(() => {
 });
 
 vi.mock("../src/providers/claude-adapter.js", () => ({
+  PromptNotDeliveredError: class PromptNotDeliveredError extends Error {
+    constructor(
+      readonly promptText: string,
+      message: string,
+    ) {
+      super(message);
+      this.name = "PromptNotDeliveredError";
+    }
+  },
   ClaudeProviderAdapter: class {
     readonly capabilities = {
       streamingText: true,
@@ -162,6 +171,10 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
 
     async getUsage() {
       return { contextTokens: 3 };
+    }
+
+    async getUsageReport() {
+      return "Mock Claude usage panel";
     }
 
     async getContext() {
@@ -269,6 +282,32 @@ describe("Claude bot flow", () => {
       "first task",
       "Additional instruction for the previous Claude task:\n\nadd this detail",
     ]);
+  });
+
+  it("serializes same-tick Claude messages and runs the queued prompts FIFO", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.blockNextPrompt();
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    const first = bot.handleUpdate(textUpdate(2, "first task"));
+    const second = bot.handleUpdate(textUpdate(3, "second task"));
+    const third = bot.handleUpdate(textUpdate(4, "third task"));
+
+    await waitFor(() => mockClaude.prompts.includes("first task"));
+    expect(mockClaude.prompts).toEqual(["first task"]);
+    await Promise.all([first, second, third]);
+
+    expect(sent.map((entry) => entry.text)).toContain(
+      "Claude is still working. I queued this Claude message and will run it next. Use /stop if the current task is stuck.",
+    );
+    expect(sent.map((entry) => entry.text)).toContain(
+      "Claude is still working. I queued this Claude message as item #2. Use /stop if the current task is stuck.",
+    );
+
+    mockClaude.releaseBlockedPrompt();
+    await waitFor(() => mockClaude.prompts.length === 3);
+
+    expect(mockClaude.prompts).toEqual(["first task", "second task", "third task"]);
   });
 
   it("rejects embedded slash commands before they are pasted into Claude", async () => {
