@@ -160,6 +160,11 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
       const customEvents = mockClaude.takeNextEvents();
       if (customEvents) {
         for (const event of customEvents) {
+          const delay = (event as { __delayMs?: number }).__delayMs;
+          if (typeof delay === "number") {
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            continue;
+          }
           yield event;
         }
         return;
@@ -468,6 +473,59 @@ describe("Claude bot flow", () => {
     await bot.handleUpdate(textUpdate(3, "/status"));
     await waitFor(() => sent.some((entry) => entry.text?.includes("Model: opus")));
     expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude session:"))).toContain("Model: opus");
+  });
+
+  it("delivers every narration block exactly once when complete arrives promptly", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.setNextEvents([
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "BLOCK_ONE" },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "BLOCK_TWO" },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "FINAL_BLOCK" },
+      { type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "job-1", text: "FINAL_BLOCK" },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude narrate"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("FINAL_BLOCK")));
+
+    const texts = sent.map((entry) => entry.text ?? "");
+    for (const marker of ["BLOCK_ONE", "BLOCK_TWO", "FINAL_BLOCK"]) {
+      expect(texts.filter((text) => text.includes(marker))).toHaveLength(1);
+    }
+  });
+
+  it("does not re-send a final block that the idle timer already flushed as progress", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.setNextEvents([
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "ONLY_BLOCK" },
+      { __delayMs: 1800 },
+      { type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "job-1", text: "ONLY_BLOCK" },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude slow finish"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("ONLY_BLOCK")), 3000);
+    // Let the delayed completion land and the turn finish fully before counting.
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    const texts = sent.map((entry) => entry.text ?? "");
+    expect(texts.filter((text) => text.includes("ONLY_BLOCK"))).toHaveLength(1);
+  });
+
+  it("flushes the held narration block before reporting a mid-turn error", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.setNextEvents([
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "PART_ONE" },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "PART_TWO" },
+      { type: "error", sessionId: "claude-provider-1", jobId: "job-1", message: "boom mid-turn" },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude fail midway"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("boom mid-turn")), 3000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const texts = sent.map((entry) => entry.text ?? "");
+    expect(texts.filter((text) => text.includes("PART_ONE"))).toHaveLength(1);
+    expect(texts.filter((text) => text.includes("PART_TWO"))).toHaveLength(1);
+    expect(texts.filter((text) => text.includes("boom mid-turn"))).toHaveLength(1);
   });
 
   it("delivers narration in full in edit mode, rolling oversized blocks into their own messages", async () => {

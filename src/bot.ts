@@ -2566,6 +2566,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             break;
           case "tool_failed":
           case "error": {
+            // B1 invariant: a held narration block must not be lost when the turn
+            // errors mid-way; flush it as progress before reporting the failure.
+            await flushPendingClaudeAssistantProgress();
             const message = event.type === "error"
               ? `Claude error: ${event.message}`
               : `Claude tool failed: ${event.toolName}${event.text ? `: ${event.text}` : ""}`;

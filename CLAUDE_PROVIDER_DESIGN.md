@@ -59,6 +59,10 @@ Delivery mechanics (both projects):
 
 Acceptance for this feature: at `progress`, every interim assistant narration block from a multi-step turn reaches Telegram as its own message, in order, for both Codex and Claude providers and for Hermes delegated turns. Covered by transcript-fixture tests (a turn with 3 interim narration blocks + tool calls + final message asserts 4 assistant messages delivered in order).
 
+### Upstream transcript gap (D3) — PTY narration is BEST-EFFORT
+
+Verified by live forensics 2026-07-07/08 on Claude Code 2.1.198: interactive Claude Code does NOT reliably write mid-turn assistant text blocks to the transcript jsonl. The first text of a turn and the final text are written reliably; texts between tool calls are often missing entirely (confirmed by phrase search against text that was visibly rendered in the TUI). Transcript tailing therefore CANNOT deliver complete progress narration, and no bridge-side fix exists. On the PTY backend the acceptance test above ("every interim block delivered") is unachievable; narration there is best-effort. The full guarantee is only achievable on the Agent SDK backend (phase plan Phase C), where every assistant message arrives on the stream. Installed version at plan execution time was 2.1.204 (2026-07-08); recheck whether newer Claude Code versions close the transcript gap during Phase C0.
+
 ---
 
 ## 3. TeleCodex V1 — full command coverage
