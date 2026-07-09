@@ -29,7 +29,7 @@ This plan is scoped to TeleCodex first. Hermes reuse remains later work.
 - `/claude <prompt>` and `/claude`, then normal text, both route to Claude.
 - Claude final answers are delivered from `assistant_message_complete` as the authoritative full answer. If the user switches providers while Claude is working, TeleCodex sends the final answer directly with a background header instead of only buffering a notice.
 - Normal messages sent while Claude is busy are queued as the next Claude turn, replacing the previous queued Claude message.
-- `/steer` while Claude is busy is allowed through TeleCodex command routing and queued as a Claude follow-up. It is not true live steering yet.
+- `/steer` while Claude is busy is live steering now. PTY sessions type the instruction into the active Claude Code TUI; SDK sessions use streaming input mode and push a priority `now` user message into the active query. If the turn is still starting and no live input channel is available yet, TeleCodex falls back to queueing the steer as a Claude follow-up.
 - `/exit`, `/clear`, replacement, context removal, shutdown, and fatal polling cleanup dispose Claude PTYs.
 - TeleCodex-owned Claude PIDs are tracked and stale registered processes are cleaned on startup.
 - Startup safety ignores old `cmd.exe` launcher wrappers and only treats actual `claude.exe` processes with the Telegram plugin as legacy Claude Telegram plugin processes.
@@ -67,7 +67,7 @@ The command table exists, but many `emulate` commands still return "not complete
 - Next useful emulations: `/rename`, `/export`, `/background` or `/bg`, `/fork` or `/branch`, `/rewind`.
 - For all `dispatch_arg` commands, bare form must never hang. It should return current value or a usage hint.
 - For `na` and `block`, responses should be terse and consistent.
-- Decide whether Claude `/steer` should remain queued follow-up only or become real live steering if Claude Code exposes a reliable input channel for it.
+- Claude `/steer` is now real live steering for both PTY and SDK backends. Keep the queued follow-up fallback for startup races or rejected live input.
 
 2. Mixed Codex and Claude session behavior
 
@@ -106,7 +106,7 @@ Anthony should test from Telegram after this commit:
 - `/claude hello`
 - a tool-use prompt, for example ask Claude to run a harmless PowerShell `Write-Output` command
 - while Claude is working, send a normal follow-up message and confirm it is queued and then run
-- while Claude is working, send `/steer <instruction>` and confirm it is queued as a follow-up
+- while Claude is working, send `/steer <instruction>` and confirm TeleCodex replies `Steer sent to the active Claude turn.`
 - switch to Codex while Claude works and confirm Claude's final answer still arrives
 - run `/sessions` and confirm titles are useful for both Codex and Claude
 

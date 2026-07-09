@@ -195,6 +195,74 @@ describe("AppServerSessionService", () => {
     ]);
   });
 
+  it("passes app-server agent message phases and keeps their text deltas separate", async () => {
+    let client: FakeAppServerClient | null = null;
+    client = new FakeAppServerClient((method, _params, activeClient) => {
+      if (method === "thread/start") {
+        return { thread: { id: "thread-1" } };
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          activeClient.emit({
+            method: "item/completed",
+            params: {
+              turnId: "turn-1",
+              item: { id: "agent-1", type: "agentMessage", phase: "commentary", text: "Checking markers." },
+            },
+          });
+          activeClient.emit({
+            method: "item/completed",
+            params: {
+              turnId: "turn-1",
+              item: { id: "agent-2", type: "agentMessage", phase: "final_answer", text: "Result: clean." },
+            },
+          });
+          activeClient.emit({
+            method: "item/completed",
+            params: {
+              turnId: "turn-1",
+              item: { id: "agent-3", type: "agentMessage", phase: "commentary", text: "Checking markers. Still clean." },
+            },
+          });
+          activeClient.emit({
+            method: "item/completed",
+            params: {
+              turnId: "turn-1",
+              item: { id: "agent-4", type: "agentMessage", phase: "final_answer", text: "Result: clean. No routing found." },
+            },
+          });
+          activeClient.emit({
+            method: "turn/completed",
+            params: { turn: { id: "turn-1", status: "completed" } },
+          });
+        }, 0);
+        return { turn: { id: "turn-1" } };
+      }
+      throw new Error(`unexpected request ${method}`);
+    });
+
+    const service = await AppServerSessionService.create(createConfig(), {
+      appServerClientFactory: () => client!,
+    });
+    const events: string[] = [];
+
+    await service.prompt("hello", {
+      onTextDelta: (delta, metadata) => events.push(`${metadata?.phase ?? "none"}:${delta}`),
+      onToolStart: vi.fn(),
+      onToolUpdate: vi.fn(),
+      onToolEnd: vi.fn(),
+      onAgentEnd: () => events.push("agent:end"),
+    });
+
+    expect(events).toEqual([
+      "commentary:Checking markers.",
+      "final_answer:Result: clean.",
+      "commentary: Still clean.",
+      "final_answer: No routing found.",
+      "agent:end",
+    ]);
+  });
+
   it("sends steer and interrupt to the active turn", async () => {
     let client: FakeAppServerClient | null = null;
     client = new FakeAppServerClient((method, _params, activeClient) => {

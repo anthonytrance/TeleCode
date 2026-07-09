@@ -732,7 +732,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     status: "idle",
     capabilities: claudeAdapter?.capabilities ?? {
       streamingText: true,
-      streamingInput: false,
+      streamingInput: true,
       abort: true,
       fork: false,
       rename: false,
@@ -1373,6 +1373,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const recentAssistantProgress: string[] = [];
     let accumulatedText = "";
     let pendingStreamText = "";
+    let finalAnswerText = "";
     let sentResponseText = false;
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
@@ -1894,6 +1895,22 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
     };
 
+    const deliverPendingProgressBeforeFinal = async (): Promise<void> => {
+      if (!finalAnswerText.trim() || !pendingStreamText.trim()) {
+        return;
+      }
+
+      const progressDelivery = getProgressDelivery();
+      if (progressDelivery === "messages") {
+        await flushResponse(true);
+      } else if (progressDelivery === "edit") {
+        await refreshAssistantProgress();
+      }
+
+      accumulatedText = "";
+      pendingStreamText = "";
+    };
+
     const finalizeResponse = async (): Promise<void> => {
       if (finalized) {
         return;
@@ -1911,10 +1928,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         }
       }
 
-      lastAssistantReply.set(contextKey, buildFinalResponseText(accumulatedText));
-      const finalUndeliveredText = buildFinalResponseText(pendingStreamText);
+      await deliverPendingProgressBeforeFinal();
+
+      const finalSourceText = finalAnswerText.trim() ? finalAnswerText : pendingStreamText;
+      const rememberedText = finalAnswerText.trim() ? finalAnswerText : accumulatedText;
+      lastAssistantReply.set(contextKey, buildFinalResponseText(rememberedText));
+      const finalUndeliveredText = buildFinalResponseText(finalSourceText);
       if (finalUndeliveredText) {
         pendingStreamText = "";
+        finalAnswerText = "";
         if (isCodexForeground() && getProgressDelivery() === "edit" && responseMessageId && !sentResponseText) {
           const completed = renderProgressCompletedMessage();
           await safeEditMessage(bot, chatId, responseMessageId, completed.text, {
@@ -1950,7 +1972,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     };
 
     const callbacks: CodexSessionCallbacks = {
-      onTextDelta: (delta: string) => {
+      onTextDelta: (delta: string, metadata) => {
+        const phase = metadata?.phase ?? null;
+        if (phase === "final_answer" || phase === "final") {
+          finalAnswerText += delta;
+          return;
+        }
         accumulatedText += delta;
         pendingStreamText += delta;
         if (shouldStreamAssistantText()) {
@@ -4251,6 +4278,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const chatId = ctx.chat?.id;
     if (rawContextKey && chatId && isClaudeActive(rawContextKey)) {
       if (isProviderBusy(rawContextKey, "claude") || getBusyState(rawContextKey).processing) {
+        const descriptor = claudeSessions.get(rawContextKey);
+        if (descriptor && claudeAdapter?.streamInput) {
+          try {
+            await claudeAdapter.streamInput(descriptor.id, { text: prompt });
+            await safeReply(ctx, escapeHTML("Steer sent to the active Claude turn."), {
+              fallbackText: "Steer sent to the active Claude turn.",
+            });
+            return;
+          } catch (error) {
+            bridgeLog("steer", `live Claude steer failed lane=${rawContextKey}: ${String(error)}`);
+          }
+        }
         await queueClaudePromptReply(ctx, rawContextKey, chatId, prompt, { kind: "steer" });
         return;
       }
@@ -6893,7 +6932,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "goal", description: "Control native goal mode" },
     { command: "abort", description: "Cancel current operation" },
     { command: "stop", description: "Cancel current operation" },
-    { command: "steer", description: "Steer active app-server turn" },
+    { command: "steer", description: "Steer active Codex app-server or Claude turn" },
     { command: "launch_profiles", description: "Select launch profile" },
     { command: "model", description: "View & change model" },
     { command: "effort", description: "Set reasoning effort" },
@@ -7200,10 +7239,10 @@ function isClaudeQuietWarning(text: string): boolean {
   return text.startsWith(CLAUDE_QUIET_WARNING_PREFIX);
 }
 
-function renderProgressCompletedMessage(): RenderedText {
+export function renderProgressCompletedMessage(): RenderedText {
   return {
-    text: "<b>Completed.</b>",
-    fallbackText: "Completed.",
+    text: "<b>Progress complete.</b>\nFinal answer follows below.",
+    fallbackText: "Progress complete.\nFinal answer follows below.",
     parseMode: "HTML",
   };
 }

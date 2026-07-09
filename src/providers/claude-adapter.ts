@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import { bridgeLog } from "../bridge-log.js";
 import type { ClaudePermissionMode, TeleCodexConfig } from "../config.js";
-import { runClaudeSdkTurn } from "./claude-sdk-engine.js";
+import { ClaudeSdkInputController, runClaudeSdkTurn } from "./claude-sdk-engine.js";
 import type {
   AgentProviderAdapter,
   AgentProviderCapabilities,
@@ -41,7 +41,7 @@ import {
 
 const CLAUDE_CAPABILITIES: AgentProviderCapabilities = {
   streamingText: true,
-  streamingInput: false,
+  streamingInput: true,
   abort: true,
   fork: false,
   rename: false,
@@ -73,6 +73,8 @@ interface RuntimeSession {
   ptyPid?: number;
   /** Aborts the in-flight SDK turn; present only while an SDK turn runs. */
   sdkAbortController?: AbortController;
+  /** Pushes user steering messages into an active SDK streaming-input turn. */
+  sdkInputController?: ClaudeSdkInputController;
   /**
    * Set on a freshly forked session: the next turn resumes THIS session id with
    * fork semantics (SDK forkSession / PTY --fork-session), then Claude mints a new
@@ -341,6 +343,32 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime.pty?.pressEscape();
   }
 
+  async streamInput(sessionId: string, input: AgentSendPromptOptions["input"]): Promise<void> {
+    const runtime = this.requireRuntime(sessionId);
+    const text = promptToText(input).trim();
+    if (!text) {
+      throw new Error("Claude steer text is empty");
+    }
+    if (!runtime.busy) {
+      throw new Error("No active Claude turn to steer");
+    }
+
+    if (runtime.backend === "sdk") {
+      if (!runtime.sdkInputController) {
+        throw new Error("Claude SDK turn is not accepting live input yet");
+      }
+      runtime.sdkInputController.push(text, "now");
+      bridgeLog("steer", `sdk live steer session=${runtime.providerSessionId} chars=${text.length}`);
+      return;
+    }
+
+    if (!runtime.pty?.isAlive) {
+      throw new Error("Claude PTY is not running");
+    }
+    await runtime.pty.sendPrompt(text);
+    bridgeLog("steer", `pty live steer session=${runtime.providerSessionId} chars=${text.length}`);
+  }
+
   /**
    * Switch the engine under an existing session. Takes effect from the next turn;
    * a leftover PTY is disposed now when idle, otherwise lazily at the next SDK turn.
@@ -419,7 +447,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
 
     const abortController = new AbortController();
+    const inputController = new ClaudeSdkInputController(promptText);
     runtime.sdkAbortController = abortController;
+    runtime.sdkInputController = inputController;
     let partialText = "";
     try {
       for await (const event of runClaudeSdkTurn({
@@ -433,6 +463,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         resume: runtime.forkSourceSessionId ?? (runtime.hasLiveProviderSession ? runtime.providerSessionId : undefined),
         forkSession: Boolean(runtime.forkSourceSessionId),
         abortController,
+        inputController,
         onProviderSessionId: (providerSessionId) => {
           runtime.forkSourceSessionId = undefined;
           if (runtime.descriptor.metadata?.forkSourceSessionId) {
@@ -486,6 +517,8 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       throw error;
     } finally {
       runtime.sdkAbortController = undefined;
+      runtime.sdkInputController = undefined;
+      inputController.close();
     }
   }
 

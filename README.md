@@ -101,7 +101,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/switch <id>` | Switch directly to a thread by ID |
 | `/retry` | Resend the last prompt |
 | `/abort` | Cancel the current turn |
-| `/steer <text>` | Steer an active app-server turn |
+| `/steer <text>` | Steer an active Codex app-server turn or active Claude turn |
 | `/launch_profiles` | Select launch profile for new or reattached threads (`/launch` alias kept) |
 | `/model` | View and change the model |
 | `/effort` | Set reasoning effort: `minimal` · `low` · `medium` · `high` · `xhigh` |

@@ -10,6 +10,7 @@ import { SessionRegistry } from "../src/session-registry.js";
 
 const mockClaude = vi.hoisted(() => {
   const prompts: string[] = [];
+  const steers: string[] = [];
   const createSession = vi.fn();
   const resumeSession = vi.fn();
   const getSessionInfo = vi.fn();
@@ -22,6 +23,7 @@ const mockClaude = vi.hoisted(() => {
 
   return {
     prompts,
+    steers,
     createSession,
     resumeSession,
     getSessionInfo,
@@ -58,6 +60,7 @@ const mockClaude = vi.hoisted(() => {
     },
     reset: () => {
       prompts.length = 0;
+      steers.length = 0;
       createCount = 0;
       activeModel = "sonnet";
       releasePromptGate?.();
@@ -85,7 +88,7 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
   ClaudeProviderAdapter: class {
     readonly capabilities = {
       streamingText: true,
-      streamingInput: false,
+      streamingInput: true,
       abort: true,
       fork: false,
       rename: false,
@@ -205,6 +208,10 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
         jobId: options.jobId,
         text: `mock reply to ${text}`,
       };
+    }
+
+    async streamInput(_sessionId: string, input: { text?: string }) {
+      mockClaude.steers.push(input.text ?? "");
     }
 
     async getUsage() {
@@ -333,7 +340,7 @@ describe("Claude bot flow", () => {
     );
   });
 
-  it("queues /steer as a Claude follow-up while Claude is already running", async () => {
+  it("sends /steer into the active Claude turn while Claude is already running", async () => {
     const { bot, sent } = await createTestBot(tempDir);
     mockClaude.blockNextPrompt();
 
@@ -341,18 +348,15 @@ describe("Claude bot flow", () => {
     await waitFor(() => mockClaude.prompts.includes("first task"));
     await bot.handleUpdate(textUpdate(2, "/steer add this detail"));
 
-    await waitFor(() => sent.some((entry) => entry.text?.includes("queued this /steer instruction")));
+    await waitFor(() => mockClaude.steers.includes("add this detail"));
     expect(sent.map((entry) => entry.text)).toContain(
-      "Claude is still working. I queued this /steer instruction as a Claude follow-up after the current turn finishes.",
+      "Steer sent to the active Claude turn.",
     );
 
     mockClaude.releaseBlockedPrompt();
-    await waitFor(() => mockClaude.prompts.some((prompt) => prompt.includes("add this detail")));
 
-    expect(mockClaude.prompts).toEqual([
-      "first task",
-      "Additional instruction for the previous Claude task:\n\nadd this detail",
-    ]);
+    expect(mockClaude.prompts).toEqual(["first task"]);
+    expect(mockClaude.steers).toEqual(["add this detail"]);
   });
 
   it("asks y/n for /steer with no active turn and starts the turn on y", async () => {

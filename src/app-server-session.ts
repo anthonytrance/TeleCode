@@ -49,6 +49,7 @@ type AppServerTurn = {
 type AppServerThreadItem = {
   id: string;
   type: string;
+  phase?: string | null;
   text?: string;
   command?: string;
   aggregatedOutput?: string | null;
@@ -110,7 +111,7 @@ export class AppServerSessionService {
   private activeGoal: CodexThreadGoal | null = null;
   private activeGoalCleared = false;
   private goalIdleTimer: ReturnType<typeof setTimeout> | null = null;
-  private finalText = "";
+  private readonly agentTextByPhase = new Map<string, string>();
   private readonly lastCommandOutput = new Map<string, string>();
   private sessionTokens = { input: 0, cached: 0, output: 0 };
 
@@ -205,7 +206,7 @@ export class AppServerSessionService {
 
     this.activeRunKind = "prompt";
     this.activeCallbacks = callbacks;
-    this.finalText = "";
+    this.agentTextByPhase.clear();
     this.lastCommandOutput.clear();
 
     const completed = new Promise<void>((resolve, reject) => {
@@ -281,7 +282,7 @@ export class AppServerSessionService {
     this.activeCallbacks = callbacks;
     this.activeGoal = null;
     this.activeGoalCleared = false;
-    this.finalText = "";
+    this.agentTextByPhase.clear();
     this.lastCommandOutput.clear();
 
     const completed = new Promise<void>((resolve, reject) => {
@@ -772,7 +773,7 @@ export class AppServerSessionService {
       }
       if (!this.activeTurnId) {
         this.activeTurnId = params.turn.id;
-        this.finalText = "";
+        this.agentTextByPhase.clear();
         this.lastCommandOutput.clear();
         this.clearGoalIdleTimeout();
       }
@@ -869,7 +870,7 @@ export class AppServerSessionService {
         callbacks.onAgentEnd();
         if (this.activeRunKind === "goal") {
           this.activeTurnId = null;
-          this.finalText = "";
+          this.agentTextByPhase.clear();
           this.lastCommandOutput.clear();
           if (this.activeGoalCleared || (this.activeGoal && !isActiveGoal(this.activeGoal))) {
             this.resolveActiveRun();
@@ -941,10 +942,14 @@ export class AppServerSessionService {
 
   private handleCompletedItem(item: AppServerThreadItem, callbacks: CodexSessionCallbacks): void {
     if (item.type === "agentMessage") {
-      const delta = computeTextDelta(this.finalText, item.text ?? "");
-      this.finalText = item.text ?? "";
+      const phase = normalizeAgentMessagePhase(item.phase);
+      const phaseKey = phase ?? "";
+      const nextText = item.text ?? "";
+      const previousText = this.agentTextByPhase.get(phaseKey) ?? "";
+      const delta = computeTextDelta(previousText, nextText);
+      this.agentTextByPhase.set(phaseKey, nextText);
       if (delta) {
-        callbacks.onTextDelta(delta);
+        callbacks.onTextDelta(delta, { phase });
       }
     } else if (item.type === "commandExecution") {
       const prev = this.lastCommandOutput.get(item.id) ?? "";
@@ -1040,7 +1045,7 @@ export class AppServerSessionService {
     this.activeReject = null;
     this.activeGoal = null;
     this.activeGoalCleared = false;
-    this.finalText = "";
+    this.agentTextByPhase.clear();
     this.lastCommandOutput.clear();
   }
 
@@ -1172,6 +1177,10 @@ function isThreadNotFoundError(error: unknown): boolean {
 function getNotificationItem(notification: AppServerNotification): AppServerThreadItem | null {
   const params = notification.params as { item?: AppServerThreadItem } | undefined;
   return params?.item ?? null;
+}
+
+function normalizeAgentMessagePhase(phase: unknown): string | null {
+  return typeof phase === "string" && phase.trim() ? phase : null;
 }
 
 function readTokenUsage(params: unknown): { input: number; cached: number; output: number } | null {

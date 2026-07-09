@@ -25,8 +25,12 @@ import {
   type CodexLaunchProfile,
 } from "./codex-launch.js";
 
+export type CodexTextDeltaMetadata = {
+  phase?: string | null;
+};
+
 export interface CodexSessionCallbacks {
-  onTextDelta: (delta: string) => void;
+  onTextDelta: (delta: string, metadata?: CodexTextDeltaMetadata) => void;
   onToolStart: (toolName: string, toolCallId: string) => void;
   onToolUpdate: (toolCallId: string, partialResult: string) => void;
   onToolEnd: (toolCallId: string, isError: boolean) => void;

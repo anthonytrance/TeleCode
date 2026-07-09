@@ -5,6 +5,7 @@ import {
   isOversizedProgressBlock,
   PROGRESS_EDIT_BUDGET_CHARS,
   renderAssistantProgressMessage,
+  renderProgressCompletedMessage,
   renderSummaryProgressMessage,
   summarizeToolName,
 } from "../src/bot.js";
@@ -75,6 +76,13 @@ describe("tool summary formatting", () => {
     );
     expect(rendered.fallbackText).not.toContain("Working: bash");
     expect(rendered.fallbackText).not.toContain("Tools used");
+  });
+
+  it("labels completed progress as separate from the final answer", () => {
+    const rendered = renderProgressCompletedMessage();
+
+    expect(rendered.fallbackText).toBe("Progress complete.\nFinal answer follows below.");
+    expect(rendered.text).toContain("<b>Progress complete.</b>");
   });
 
   it("never truncates narration blocks and preserves their newlines", () => {

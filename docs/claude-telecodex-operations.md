@@ -45,7 +45,7 @@ Runtime rules:
 - TeleCodex scans Claude transcripts by file growth, not just by guessed session ID.
 - If a persisted Claude session has no transcript file, TeleCodex starts fresh instead of resuming a stale UUID.
 - If Claude is working and another normal message arrives, TeleCodex queues it as the next Claude turn instead of dropping it.
-- If Claude is working and `/steer <instruction>` arrives, TeleCodex queues it as a Claude follow-up. It is not live mid-turn steering yet.
+- If Claude is working and `/steer <instruction>` arrives, TeleCodex sends it into the active Claude turn. PTY sessions type the instruction into the running Claude Code TUI; SDK sessions push it through the SDK streaming-input channel. If the turn is still starting and cannot accept live input yet, TeleCodex falls back to queueing it as the next Claude follow-up.
 - If Claude finishes while Codex is foreground, TeleCodex sends the Claude final answer directly with a background header.
 
 Self-test:

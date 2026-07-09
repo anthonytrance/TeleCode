@@ -251,7 +251,22 @@ describe("runCodexAppServerTurn", () => {
                 threadId: "thread-1",
                 turnId: "turn-1",
                 completedAtMs: Date.now(),
-                item: { id: "agent-1", type: "agentMessage", text: "OK", phase: null, memoryCitation: null },
+                item: {
+                  id: "agent-progress",
+                  type: "agentMessage",
+                  text: "Checking first",
+                  phase: "commentary",
+                  memoryCitation: null,
+                },
+              },
+            });
+            process.send({
+              method: "item/completed",
+              params: {
+                threadId: "thread-1",
+                turnId: "turn-1",
+                completedAtMs: Date.now(),
+                item: { id: "agent-1", type: "agentMessage", text: "OK", phase: "final_answer", memoryCitation: null },
               },
             });
             process.send({
@@ -285,7 +300,7 @@ describe("runCodexAppServerTurn", () => {
     expect(result.finalText).toBe("OK");
     expect(result.threadId).toBe("thread-1");
     expect(result.turnId).toBe("turn-1");
-    expect(result.itemTypes).toEqual(["agentMessage"]);
+    expect(result.itemTypes).toEqual(["agentMessage", "agentMessage"]);
     expect(requests.find((request) => request.method === "thread/start")?.params.ephemeral).toBe(true);
     expect(requests.find((request) => request.method === "turn/start")?.params.input[0].text).toBe("say OK");
   });

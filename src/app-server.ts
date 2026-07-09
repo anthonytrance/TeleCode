@@ -582,12 +582,16 @@ export async function runCodexAppServerTurn(
 
   client.onNotification((notification) => {
     if (notification.method === "item/completed") {
-      const params = notification.params as { item?: { type?: unknown; text?: unknown } } | undefined;
+      const params = notification.params as { item?: { type?: unknown; text?: unknown; phase?: unknown } } | undefined;
       const itemType = typeof params?.item?.type === "string" ? params.item.type : "";
       if (itemType) {
         itemTypes.push(itemType);
       }
-      if (itemType === "agentMessage" && typeof params?.item?.text === "string") {
+      if (
+        itemType === "agentMessage" &&
+        typeof params?.item?.text === "string" &&
+        shouldUseAgentMessageAsFinalText(params.item.phase)
+      ) {
         finalText = params.item.text;
       }
     } else if (notification.method === "turn/completed") {
@@ -694,12 +698,16 @@ export async function runCodexAppServerSteeredTurn(
 
   client.onNotification((notification) => {
     if (notification.method === "item/completed") {
-      const params = notification.params as { item?: { type?: unknown; text?: unknown } } | undefined;
+      const params = notification.params as { item?: { type?: unknown; text?: unknown; phase?: unknown } } | undefined;
       const itemType = typeof params?.item?.type === "string" ? params.item.type : "";
       if (itemType) {
         itemTypes.push(itemType);
       }
-      if (itemType === "agentMessage" && typeof params?.item?.text === "string") {
+      if (
+        itemType === "agentMessage" &&
+        typeof params?.item?.text === "string" &&
+        shouldUseAgentMessageAsFinalText(params.item.phase)
+      ) {
         finalText = params.item.text;
       }
     } else if (notification.method === "turn/completed") {
@@ -904,6 +912,10 @@ function formatTurnError(error: unknown): string {
   const record = error as { message?: unknown; code?: unknown };
   const message = firstString(record.message) || "app-server turn failed";
   return typeof record.code === "string" ? `${message} (${record.code})` : message;
+}
+
+function shouldUseAgentMessageAsFinalText(phase: unknown): boolean {
+  return phase === null || phase === undefined || phase === "final_answer" || phase === "final";
 }
 
 function formatModelName(value: unknown): string {

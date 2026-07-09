@@ -30,8 +30,13 @@ export interface ClaudeSdkTurnOptions {
   abortController?: AbortController;
   /** Called as soon as the init message reveals the real Claude session id. */
   onProviderSessionId?: (providerSessionId: string) => void;
+  /** Optional streaming input controller. When present, promptText is sent as the first user message. */
+  inputController?: ClaudeSdkInputController;
   /** Injectable for tests; defaults to the real SDK query(). */
-  queryFn?: (input: { prompt: string; options: Record<string, unknown> }) => AsyncIterable<SdkMessageLike>;
+  queryFn?: (input: {
+    prompt: string | AsyncIterable<SdkUserMessageLike>;
+    options: Record<string, unknown>;
+  }) => AsyncIterable<SdkMessageLike> & { close?: () => void };
 }
 
 /** Structural view of the SDK messages this engine consumes. */
@@ -47,6 +52,72 @@ export interface SdkMessageLike {
   usage?: Record<string, unknown>;
   total_cost_usd?: number;
   errors?: unknown[];
+}
+
+export interface SdkUserMessageLike {
+  type: "user";
+  message: {
+    role: "user";
+    content: Array<{ type: "text"; text: string }>;
+  };
+  parent_tool_use_id: null;
+  priority?: "now" | "next" | "later";
+  shouldQuery?: boolean;
+  timestamp?: string;
+}
+
+export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLike> {
+  private readonly queue: SdkUserMessageLike[] = [];
+  private readonly waiters: Array<(result: IteratorResult<SdkUserMessageLike>) => void> = [];
+  private closed = false;
+
+  constructor(initialText: string) {
+    this.push(initialText);
+  }
+
+  push(text: string, priority: SdkUserMessageLike["priority"] = "now"): void {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      throw new Error("Claude steer text is empty");
+    }
+    if (this.closed) {
+      throw new Error("Claude SDK input stream is closed");
+    }
+    const message = sdkUserMessage(trimmed, priority);
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter({ value: message, done: false });
+    } else {
+      this.queue.push(message);
+    }
+  }
+
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter({ value: undefined, done: true });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<SdkUserMessageLike> {
+    return {
+      next: async (): Promise<IteratorResult<SdkUserMessageLike>> => {
+        const next = this.queue.shift();
+        if (next) {
+          return { value: next, done: false };
+        }
+        if (this.closed) {
+          return { value: undefined, done: true };
+        }
+        return await new Promise<IteratorResult<SdkUserMessageLike>>((resolve) => {
+          this.waiters.push(resolve);
+        });
+      },
+    };
+  }
 }
 
 export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIterable<AgentProviderEvent> {
@@ -75,79 +146,86 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
 
   let lastModel: string | undefined;
   let sawResult = false;
+  const inputController = options.inputController;
+  const query = queryFn({ prompt: inputController ?? options.promptText, options: sdkOptions });
 
-  for await (const message of queryFn({ prompt: options.promptText, options: sdkOptions })) {
-    if (message.type === "system" && message.subtype === "init") {
-      if (message.session_id) {
-        options.onProviderSessionId?.(message.session_id);
+  try {
+    for await (const message of query) {
+      if (message.type === "system" && message.subtype === "init") {
+        if (message.session_id) {
+          options.onProviderSessionId?.(message.session_id);
+        }
+        continue;
       }
-      continue;
-    }
 
-    if (message.type === "assistant") {
-      const model = message.message?.model;
-      if (model && model !== "<synthetic>" && model !== lastModel) {
-        lastModel = model;
-        yield { type: "model_updated", sessionId, jobId, model };
+      if (message.type === "assistant") {
+        const model = message.message?.model;
+        if (model && model !== "<synthetic>" && model !== lastModel) {
+          lastModel = model;
+          yield { type: "model_updated", sessionId, jobId, model };
+        }
+        for (const block of message.message?.content ?? []) {
+          const blockType = typeof block.type === "string" ? block.type : "";
+          if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
+            yield { type: "assistant_text_delta", sessionId, jobId, text: block.text };
+          } else if (blockType === "tool_use") {
+            yield {
+              type: "tool_started",
+              sessionId,
+              jobId,
+              toolName: typeof block.name === "string" && block.name ? block.name : "tool",
+              text: summarizeSdkToolInput(block.input),
+            };
+          }
+        }
+        continue;
       }
-      for (const block of message.message?.content ?? []) {
-        const blockType = typeof block.type === "string" ? block.type : "";
-        if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
-          yield { type: "assistant_text_delta", sessionId, jobId, text: block.text };
-        } else if (blockType === "tool_use") {
+
+      if (message.type === "user") {
+        for (const block of message.message?.content ?? []) {
+          if (block.type !== "tool_result") {
+            continue;
+          }
           yield {
-            type: "tool_started",
+            type: block.is_error === true ? "tool_failed" : "tool_completed",
             sessionId,
             jobId,
-            toolName: typeof block.name === "string" && block.name ? block.name : "tool",
-            text: summarizeSdkToolInput(block.input),
+            toolName: "tool",
           };
         }
+        continue;
       }
-      continue;
-    }
 
-    if (message.type === "user") {
-      for (const block of message.message?.content ?? []) {
-        if (block.type !== "tool_result") {
-          continue;
+      if (message.type === "result") {
+        sawResult = true;
+        const usage = message.usage ?? {};
+        const inputTokens = asNumber(usage.input_tokens) ?? 0;
+        const cachedInputTokens = (asNumber(usage.cache_read_input_tokens) ?? 0) +
+          (asNumber(usage.cache_creation_input_tokens) ?? 0);
+        const outputTokens = asNumber(usage.output_tokens) ?? 0;
+        yield { type: "usage_updated", sessionId, jobId, inputTokens, cachedInputTokens, outputTokens };
+
+        if (message.subtype === "success") {
+          yield {
+            type: "assistant_message_complete",
+            sessionId,
+            jobId,
+            text: (message.result ?? "").trim(),
+          };
+        } else {
+          const detail = message.result?.trim() || describeSdkErrors(message.errors) || message.subtype || "unknown error";
+          bridgeLog("error", `sdk turn result ${message.subtype ?? "?"}: ${detail}`);
+          yield { type: "error", sessionId, jobId, message: `Claude SDK turn ended: ${detail}` };
         }
-        yield {
-          type: block.is_error === true ? "tool_failed" : "tool_completed",
-          sessionId,
-          jobId,
-          toolName: "tool",
-        };
+        break;
       }
-      continue;
+
+      // rate_limit_event, status, hook events, partial messages, etc. - not part
+      // of the provider event contract; ignored deliberately.
     }
-
-    if (message.type === "result") {
-      sawResult = true;
-      const usage = message.usage ?? {};
-      const inputTokens = asNumber(usage.input_tokens) ?? 0;
-      const cachedInputTokens = (asNumber(usage.cache_read_input_tokens) ?? 0) +
-        (asNumber(usage.cache_creation_input_tokens) ?? 0);
-      const outputTokens = asNumber(usage.output_tokens) ?? 0;
-      yield { type: "usage_updated", sessionId, jobId, inputTokens, cachedInputTokens, outputTokens };
-
-      if (message.subtype === "success") {
-        yield {
-          type: "assistant_message_complete",
-          sessionId,
-          jobId,
-          text: (message.result ?? "").trim(),
-        };
-      } else {
-        const detail = message.result?.trim() || describeSdkErrors(message.errors) || message.subtype || "unknown error";
-        bridgeLog("error", `sdk turn result ${message.subtype ?? "?"}: ${detail}`);
-        yield { type: "error", sessionId, jobId, message: `Claude SDK turn ended: ${detail}` };
-      }
-      continue;
-    }
-
-    // rate_limit_event, status, hook events, partial messages, etc. — not part
-    // of the provider event contract; ignored deliberately.
+  } finally {
+    inputController?.close();
+    query.close?.();
   }
 
   if (!sawResult) {
@@ -163,6 +241,20 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
 async function loadSdkQuery(): Promise<NonNullable<ClaudeSdkTurnOptions["queryFn"]>> {
   const sdk = await import("@anthropic-ai/claude-agent-sdk");
   return sdk.query as unknown as NonNullable<ClaudeSdkTurnOptions["queryFn"]>;
+}
+
+function sdkUserMessage(text: string, priority: SdkUserMessageLike["priority"]): SdkUserMessageLike {
+  return {
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "text", text }],
+    },
+    parent_tool_use_id: null,
+    priority,
+    shouldQuery: true,
+    timestamp: new Date().toISOString(),
+  };
 }
 
 function scrubbedEnv(): Record<string, string | undefined> {
