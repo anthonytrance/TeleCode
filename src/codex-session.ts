@@ -9,6 +9,7 @@ import {
   type UserInput,
 } from "@openai/codex-sdk";
 
+import { buildCodexMcpOverrideConfig } from "./codex-mcp-toggle.js";
 import type { TeleCodexConfig } from "./config.js";
 import {
   getThread,
@@ -458,6 +459,18 @@ export class CodexSessionService {
     return this.currentLaunchProfile;
   }
 
+  /** Rebuild the Codex client so config overrides (e.g. the /mcp toggle) apply from the next turn. */
+  resetBackendClient(): void {
+    this.ensureIdle("apply the MCP toggle");
+    this.resetCodexClient();
+    if (this.currentThreadId) {
+      this.thread = this.getCodex().resumeThread(
+        this.currentThreadId,
+        this.buildThreadOptions(this.currentWorkspace, this.currentModel),
+      );
+    }
+  }
+
   getSelectedLaunchProfile(): CodexLaunchProfile {
     return this.currentLaunchProfile;
   }
@@ -579,6 +592,7 @@ export class CodexSessionService {
       apiKey: this.config.codexApiKey,
       config: {
         approval_policy: this.currentLaunchProfile.approvalPolicy,
+        ...buildCodexMcpOverrideConfig(),
       },
       env: buildCodexEnv(this.config.codexApiKey),
     });

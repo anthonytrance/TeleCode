@@ -134,7 +134,7 @@ export async function locateActiveTranscript(options: {
   projectDir?: string;
 }): Promise<ActiveTranscript | null> {
   const deadline = Date.now() + options.timeoutMs;
-  const pollIntervalMs = options.pollIntervalMs ?? 400;
+  const pollIntervalMs = options.pollIntervalMs ?? 250;
   const before = normalizeTranscriptSnapshot(options.before);
   while (Date.now() <= deadline) {
     const now = await snapshotTranscriptSizes(options.configDir);
@@ -195,7 +195,7 @@ export async function locateActiveTranscriptTurnByPrompt(options: {
   projectDir?: string;
 }): Promise<ActiveTranscript | null> {
   const deadline = Date.now() + options.timeoutMs;
-  const pollIntervalMs = options.pollIntervalMs ?? 400;
+  const pollIntervalMs = options.pollIntervalMs ?? 250;
   const before = normalizeTranscriptSnapshot(options.before);
   const normalizedPrompt = normalizePromptText(options.promptText);
   if (!normalizedPrompt) {

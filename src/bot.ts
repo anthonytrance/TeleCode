@@ -11,6 +11,7 @@ import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import * as pty from "node-pty";
 
 import { bridgeLog, initBridgeLog } from "./bridge-log.js";
+import { listConfiguredCodexMcpServers } from "./codex-mcp-toggle.js";
 import { ClaudeBackendPrefs, claudeBackendPrefsPath, type ClaudeBackendChoice } from "./claude-backend-prefs.js";
 import {
   probeCodexAppServer,
@@ -91,8 +92,8 @@ import { normalizePersistedWorkspace } from "./workspace-normalization.js";
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const FIRST_INTERMEDIATE_UPDATE_MS = 2500;
-const INTERMEDIATE_UPDATE_MIN_MS = 30000;
-const SUMMARY_PROGRESS_UPDATE_MIN_MS = 30000;
+const INTERMEDIATE_UPDATE_MIN_MS = 10000;
+const SUMMARY_PROGRESS_UPDATE_MIN_MS = 10000;
 const SUMMARY_PROGRESS_RECENT_LIMIT = 5;
 // Budget for the rolling edit-mode progress message. Kept under Telegram's 4096-char
 // edit limit so the header and HTML escaping never push a full-content render over it.
@@ -156,6 +157,7 @@ const TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "velocity",
   "progress",
   "voice",
+  "mcp",
 ]);
 const NEW_FROM_SUMMARY_PROMPT = [
   "Create a compact handoff summary for continuing this Codex session in a fresh thread.",
@@ -4818,6 +4820,41 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
   });
 
+  bot.command("mcp", async (ctx) => {
+    const arg = getCommandArgument(ctx).trim().toLowerCase();
+    const servers = listConfiguredCodexMcpServers();
+    const serverList = servers.length > 0 ? servers.join(", ") : "none found in config.toml";
+
+    if (arg !== "on" && arg !== "off") {
+      const state = registry.getCodexMcpEnabled() ? "ON" : "OFF";
+      const plain = [
+        `Codex MCP tools are ${state}.`,
+        `Configured servers: ${serverList}.`,
+        "Use /mcp on to enable them (browser and computer-use tools; the next thread start pays their cold start) or /mcp off to keep Codex fast.",
+      ].join("\n");
+      await safeReply(ctx, escapeHTML(plain), { fallbackText: plain });
+      return;
+    }
+
+    const enable = arg === "on";
+    const { resetSessions, busySessions } = registry.setCodexMcpEnabled(enable);
+    bridgeLog("mcp", `toggle ${enable ? "on" : "off"} servers=${serverList} reset=${resetSessions} busy=${busySessions}`);
+    const lines = enable
+      ? [
+          `Codex MCP tools ON: ${serverList}.`,
+          "They load at the next thread start or resume; the first turn can take up to a minute while they cold-start.",
+        ]
+      : [
+          `Codex MCP tools OFF: ${serverList} stay disabled.`,
+          "New and resumed Codex threads skip them, so turns start fast.",
+        ];
+    if (busySessions > 0) {
+      lines.push(`${busySessions} busy session(s) will pick this up after their current turn.`);
+    }
+    const plain = lines.join("\n");
+    await safeReply(ctx, escapeHTML(plain), { fallbackText: plain });
+  });
+
   bot.command(["appserver", "appserverstatus", "appserver_status"], async (ctx) => {
     const result = await probeCodexAppServer(config);
     const plain = renderAppServerProbePlain(result);
@@ -6893,6 +6930,33 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
   queueMicrotask(recoverPersistedClaudeQueue);
 
+  // Warm persisted Claude PTYs in the background so the first message after a
+  // bridge restart does not pay claude.exe --resume interactively (a bare
+  // /model right after a restart was measured at 30s+ because of this).
+  queueMicrotask(() => {
+    if (!claudeAdapter || !claudeState) {
+      return;
+    }
+    for (const record of claudeState.list()) {
+      const contextKey = record.telegramContextKey;
+      if (!isClaudeActive(contextKey)) {
+        continue;
+      }
+      if (getClaudeBackend(contextKey) === "sdk") {
+        // The SDK engine spawns per turn; there is no PTY to warm.
+        continue;
+      }
+      void ensureClaudeSession(contextKey)
+        .then(() => bridgeLog("warmup", `claude pty warmed lane=${contextKey}`))
+        .catch((error) => {
+          bridgeLog(
+            "warmup",
+            `claude pty warm failed lane=${contextKey}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+    }
+  });
+
   return bot;
 }
 
@@ -6916,6 +6980,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "session", description: "Current thread details" },
     { command: "status", description: "Current thread details" },
     { command: "usage", description: "Codex limits & reset times" },
+    { command: "mcp", description: "Toggle Codex MCP tools (browser/computer use)" },
     { command: "backend", description: "Show or reset backend" },
     { command: "verbosity", description: "Set progress delivery" },
     { command: "appserver", description: "Probe Codex app-server" },

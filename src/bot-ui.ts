@@ -26,6 +26,8 @@ export function renderHelpMessage(): DualText {
         ["/session", "Current thread details"],
         ["/status", "Alias for /session"],
         ["/usage", "Codex limits & reset times"],
+        ["/mcp", "Show Codex MCP tools state"],
+        ["/mcp on|off", "Toggle browser/computer-use tools"],
         ["/backend", "Show or switch backend"],
         ["/backend appserver", "Switch to app-server backend"],
         ["/backend sdk", "Switch back to SDK backend"],

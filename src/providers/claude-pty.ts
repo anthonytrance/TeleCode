@@ -159,7 +159,7 @@ export class ClaudePty extends EventEmitter {
     const paste = /\r|\n/.test(text) || text.length > LONG_PROMPT_PASTE_THRESHOLD;
     if (paste) {
       this.requireProc().write(`\x1b[200~${text}\x1b[201~`);
-      await this.waitForInputSettled(text.length, 800);
+      await this.waitForInputSettled(text.length, 400);
     } else {
       this.requireProc().write(text);
       await this.waitForInputSettled(text.length, 150);

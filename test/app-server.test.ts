@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   CodexAppServerClient,
@@ -98,6 +98,21 @@ class FakeAppServerProcess extends EventEmitter implements AppServerProcess {
 }
 
 describe("CodexAppServerClient", () => {
+  // The spawn args gain `-c mcp_servers.<name>.enabled=false` overrides from the
+  // machine's real config.toml unless CODEX_HOME points somewhere empty.
+  let savedCodexHome: string | undefined;
+  beforeEach(() => {
+    savedCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = path.join(os.tmpdir(), `telecodex-test-empty-codex-home-${process.pid}`);
+  });
+  afterEach(() => {
+    if (savedCodexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = savedCodexHome;
+    }
+  });
+
   it("sends JSON-line requests and records notifications", async () => {
     const requests: any[] = [];
     const spawnProcess: SpawnAppServerProcess = (command, args) => {

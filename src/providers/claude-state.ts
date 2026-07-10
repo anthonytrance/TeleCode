@@ -69,6 +69,10 @@ export class ClaudeSessionStateIndex {
     return this.state.sessions.find((session) => session.telegramContextKey === contextKey);
   }
 
+  list(): ClaudeSessionStateRecord[] {
+    return [...this.state.sessions];
+  }
+
   upsert(record: ClaudeSessionStateRecord): void {
     const index = this.state.sessions.findIndex(
       (session) => session.telegramContextKey === record.telegramContextKey,

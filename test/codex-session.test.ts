@@ -1,3 +1,6 @@
+import os from "node:os";
+import path from "node:path";
+
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile, createLaunchProfile } from "../src/codex-launch.js";
@@ -148,7 +151,21 @@ describe("CodexSessionService", () => {
   beforeEach(() => {
     mockState.reset();
     mockCodexState.reset();
+    // Keep the Codex client's config assertion free of machine-dependent
+    // `mcp_servers.*.enabled=false` overrides read from the real config.toml.
+    savedCodexHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = path.join(os.tmpdir(), `telecodex-test-empty-codex-home-${process.pid}`);
   });
+
+  afterEach(() => {
+    if (savedCodexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = savedCodexHome;
+    }
+  });
+
+  let savedCodexHome: string | undefined;
 
   it("creates the service and starts an initial thread", async () => {
     const service = await CodexSessionService.create(createConfig());

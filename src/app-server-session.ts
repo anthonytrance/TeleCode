@@ -668,6 +668,18 @@ export class AppServerSessionService {
     return this.currentLaunchProfile;
   }
 
+  /**
+   * Close the app-server child so the next request respawns it with fresh CLI
+   * config overrides (the /mcp toggle). The thread id survives; the next turn
+   * re-attaches via thread/resume.
+   */
+  resetBackendClient(): void {
+    this.ensureIdle("apply the MCP toggle");
+    void this.client?.close();
+    this.client = null;
+    this.appServerAttachedThreadId = null;
+  }
+
   getSelectedLaunchProfile(): CodexLaunchProfile {
     return this.currentLaunchProfile;
   }

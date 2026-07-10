@@ -7,6 +7,7 @@ import path from "node:path";
 import readline from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
+import { buildCodexMcpOverrideArgs } from "./codex-mcp-toggle.js";
 import type { TeleCodexConfig } from "./config.js";
 
 const REQUEST_TIMEOUT_MS = 15000;
@@ -211,7 +212,9 @@ export class CodexAppServerClient {
     const codexPath = this.options.codexPath ?? resolveBundledCodexPath();
     const env = this.options.env ?? buildAppServerEnv();
     const spawnProcess = this.options.spawnProcess ?? defaultSpawnAppServerProcess;
-    const child = spawnProcess(codexPath, ["app-server", "--listen", "stdio://"], {
+    // MCP override args go before the subcommand; /mcp off keeps configured MCP
+    // servers (Hermes, cua-driver) from cold-starting on every thread lifecycle.
+    const child = spawnProcess(codexPath, [...buildCodexMcpOverrideArgs(), "app-server", "--listen", "stdio://"], {
       cwd: this.options.cwd,
       env,
     });

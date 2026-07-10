@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { createCodexSession, type CodexSessionRuntime } from "./codex-backend.js";
+import { isCodexMcpEnabled, setCodexMcpEnabled } from "./codex-mcp-toggle.js";
 import { findLaunchProfile } from "./codex-launch.js";
 import type { CodexBackend, ProgressDelivery, TeleCodexConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
@@ -24,6 +25,7 @@ export interface ContextMetadata {
 
 interface TeleCodexPreferences {
   selectedCodexModel?: string;
+  codexMcpEnabled?: boolean;
 }
 
 export class SessionRegistry {
@@ -96,6 +98,39 @@ export class SessionRegistry {
   setDefaultModel(model: string): void {
     this.selectedCodexModel = model;
     this.persistPreferences();
+  }
+
+  getCodexMcpEnabled(): boolean {
+    return isCodexMcpEnabled();
+  }
+
+  /**
+   * Flip the /mcp toggle, persist it, and reset every idle Codex backend client
+   * so the change applies from each session's next turn. Busy sessions are left
+   * alone; they pick the toggle up on their next backend spawn.
+   */
+  setCodexMcpEnabled(enabled: boolean): { resetSessions: number; busySessions: number } {
+    setCodexMcpEnabled(enabled);
+    this.persistPreferences();
+
+    let resetSessions = 0;
+    let busySessions = 0;
+    for (const session of this.sessions.values()) {
+      if (!session.resetBackendClient) {
+        continue;
+      }
+      if (session.isProcessing()) {
+        busySessions += 1;
+        continue;
+      }
+      try {
+        session.resetBackendClient();
+        resetSessions += 1;
+      } catch {
+        busySessions += 1;
+      }
+    }
+    return { resetSessions, busySessions };
   }
 
   setActiveProvider(contextKey: TelegramContextKey, provider: AgentProviderKind): void {
@@ -247,7 +282,10 @@ export class SessionRegistry {
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
       }
-      const data: TeleCodexPreferences = { selectedCodexModel: this.selectedCodexModel };
+      const data: TeleCodexPreferences = {
+        selectedCodexModel: this.selectedCodexModel,
+        codexMcpEnabled: isCodexMcpEnabled(),
+      };
       writeFileSync(this.preferencesPath, JSON.stringify(data, null, 2), "utf8");
     } catch (error) {
       console.warn(
@@ -265,6 +303,7 @@ export class SessionRegistry {
       const raw = readFileSync(this.preferencesPath, "utf8");
       const preferences = parseJsonFileText<TeleCodexPreferences>(raw);
       this.selectedCodexModel = preferences.selectedCodexModel;
+      setCodexMcpEnabled(preferences.codexMcpEnabled === true);
     } catch {
       // Silently ignore load errors.
     }
