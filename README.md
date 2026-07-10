@@ -123,7 +123,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | Mode | What you see |
 |---|---|
 | `all` | Every tool start, streaming output, and result |
-| `summary` *(default)* | A short grouped footer such as `Tools used: 3x bash, 2x subagents, web_fetch` |
+| `summary` *(default)* | Tool calls stay quiet during the turn; assistant progress and the final answer still follow the selected progress-delivery mode |
 | `errors-only` | Only failed tool calls |
 | `none` | Silent |
 

@@ -176,6 +176,27 @@ describe("SessionRegistry", () => {
     expect(mockSessionState.create).toHaveBeenCalledTimes(1);
   });
 
+  it("can replace a persisted thread without resuming it first", async () => {
+    const firstRegistry = new SessionRegistry(createConfig());
+    const firstSession = await firstRegistry.getOrCreate("123");
+    firstSession.setInfo({ threadId: "thread-old" });
+    firstRegistry.updateMetadata("123", firstSession as never);
+
+    const replacementRegistry = new SessionRegistry(createConfig());
+    await replacementRegistry.getOrCreate("123", {
+      deferThreadStart: true,
+      skipThreadResume: true,
+    });
+
+    expect(mockSessionState.create).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        deferThreadStart: true,
+        resumeThreadId: undefined,
+      }),
+    );
+  });
+
   it("returns different session instances for different context keys", async () => {
     const registry = new SessionRegistry(createConfig());
 
@@ -524,6 +545,25 @@ describe("SessionRegistry", () => {
         updatedAt: expect.any(Number),
       },
     ]);
+  });
+
+  it("persists the selected model and applies it to new contexts", async () => {
+    const config = createConfig();
+    const preferencesPath = path.join(config.workspace, ".telecodex", "preferences.json");
+    const registry = new SessionRegistry(config);
+
+    registry.setDefaultModel("gpt-5.6-terra");
+    expect(registry.getDefaultModel()).toBe("gpt-5.6-terra");
+    expect(mockFsState.files.get(preferencesPath)).toContain("gpt-5.6-terra");
+
+    await registry.getOrCreate("new-context");
+    expect(mockSessionState.create).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ model: "gpt-5.6-terra" }),
+    );
+
+    const reloaded = new SessionRegistry(config);
+    expect(reloaded.getDefaultModel()).toBe("gpt-5.6-terra");
   });
 
   it("disposeAll disposes all sessions and clears the map", async () => {

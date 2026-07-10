@@ -10,7 +10,7 @@ import { createDefaultLaunchProfile } from "../src/codex-launch.js";
 import type { TeleCodexConfig } from "../src/config.js";
 
 class FakeAppServerClient implements AppServerClientLike {
-  readonly requests: Array<{ method: string; params: JsonValue | undefined }> = [];
+  readonly requests: Array<{ method: string; params: JsonValue | undefined; requestTimeoutMs?: number }> = [];
   readonly closed = vi.fn(async () => undefined);
   readonly initialized = vi.fn(async () => ({
     userAgent: "codex-test",
@@ -50,8 +50,12 @@ class FakeAppServerClient implements AppServerClientLike {
     return await this.initialized();
   }
 
-  async request<T = unknown>(method: string, params: JsonValue | undefined): Promise<T> {
-    this.requests.push({ method, params });
+  async request<T = unknown>(
+    method: string,
+    params: JsonValue | undefined,
+    requestTimeoutMs?: number,
+  ): Promise<T> {
+    this.requests.push({ method, params, requestTimeoutMs });
     return this.responder(method, params, this) as T;
   }
 
@@ -69,6 +73,29 @@ class FakeAppServerClient implements AppServerClientLike {
 }
 
 describe("AppServerSessionService", () => {
+  it("prepares a fresh thread without waiting for app-server thread/start", async () => {
+    const client = new FakeAppServerClient((method) => {
+      if (method === "thread/start") {
+        return { thread: { id: "thread-1", cwd: "/workspace/project" } };
+      }
+      throw new Error(`unexpected request ${method}`);
+    });
+    const service = await AppServerSessionService.create(createConfig(), {
+      appServerClientFactory: () => client,
+    });
+    const requestCount = client.requests.length;
+
+    const prepared = service.prepareNewThread("/workspace/next", "gpt-next");
+
+    expect(prepared).toMatchObject({
+      threadId: null,
+      workspace: "/workspace/next",
+      model: "gpt-next",
+    });
+    expect(service.hasActiveThread()).toBe(false);
+    expect(client.requests).toHaveLength(requestCount);
+  });
+
   it("starts a thread and maps prompt notifications to session callbacks", async () => {
     let client: FakeAppServerClient | null = null;
     client = new FakeAppServerClient((method, _params, activeClient) => {
@@ -753,9 +780,11 @@ describe("AppServerSessionService", () => {
       "thread/resume",
       "turn/start",
     ]);
-    expect(client2.requests.find((request) => request.method === "thread/resume")?.params).toMatchObject({
+    const resumeRequest = client2.requests.find((request) => request.method === "thread/resume");
+    expect(resumeRequest?.params).toMatchObject({
       threadId: "thread-1",
     });
+    expect(resumeRequest?.requestTimeoutMs).toBe(60_000);
   });
 
   it("keeps an idle active goal monitor attached until the goal is paused", async () => {

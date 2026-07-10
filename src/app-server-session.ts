@@ -77,7 +77,7 @@ export interface AppServerClientLike {
   start(): Promise<void>;
   initialize(optOutNotificationMethods?: string[]): Promise<AppServerInitializeResponse>;
   notifyInitialized(): void;
-  request<T = unknown>(method: string, params: JsonValue | undefined): Promise<T>;
+  request<T = unknown>(method: string, params: JsonValue | undefined, requestTimeoutMs?: number): Promise<T>;
   close(): Promise<void>;
   onExit?(handler: (error: Error) => void): void;
 }
@@ -91,6 +91,10 @@ type AppServerCreateOptions = CreateOptions & {
 const ABORT_SETTLE_GRACE_MS = 750;
 const ABORT_INTERRUPT_TIMEOUT_MS = 3_000;
 const GOAL_IDLE_PROGRESS_MS = 5 * 60_000;
+// Starting or resuming a thread can initialize configured MCP servers. The
+// normal 15-second RPC timeout is too short when external servers such as the
+// Hermes browser bridge and cua-driver are starting cold.
+const THREAD_LIFECYCLE_TIMEOUT_MS = 60_000;
 
 type ActiveRunKind = "prompt" | "goal";
 
@@ -545,6 +549,19 @@ export class AppServerSessionService {
     }));
   }
 
+  prepareNewThread(workspace?: string, model?: string): CodexSessionInfo {
+    this.ensureIdle("prepare a new thread");
+    this.currentThreadId = null;
+    this.appServerAttachedThreadId = null;
+    this.activeThreadLaunchProfile = null;
+    this.currentWorkspace = workspace ?? this.currentWorkspace;
+    if (model) {
+      this.currentModel = model;
+    }
+    this.resetSessionTokens();
+    return this.getInfo();
+  }
+
   async newThread(workspace?: string, model?: string): Promise<CodexSessionInfo> {
     this.ensureIdle("start a new thread");
 
@@ -559,6 +576,7 @@ export class AppServerSessionService {
         approvalPolicy: this.currentLaunchProfile.approvalPolicy,
         sandbox: this.currentLaunchProfile.sandboxMode,
       },
+      THREAD_LIFECYCLE_TIMEOUT_MS,
     );
 
     this.resetSessionTokens();
@@ -579,6 +597,7 @@ export class AppServerSessionService {
     const response = await client.request<{ thread: AppServerThread; model?: string; cwd?: string }>(
       "thread/resume",
       this.buildThreadResumeRequest(threadId),
+      THREAD_LIFECYCLE_TIMEOUT_MS,
     );
 
     this.resetSessionTokens();
@@ -723,6 +742,7 @@ export class AppServerSessionService {
     const response = await client.request<{ thread: AppServerThread; model?: string; cwd?: string }>(
       "thread/resume",
       this.buildThreadResumeRequest(threadId),
+      THREAD_LIFECYCLE_TIMEOUT_MS,
     );
 
     this.resetSessionTokens();

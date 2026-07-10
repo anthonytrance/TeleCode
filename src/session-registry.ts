@@ -22,20 +22,28 @@ export interface ContextMetadata {
   updatedAt: number;
 }
 
+interface TeleCodexPreferences {
+  selectedCodexModel?: string;
+}
+
 export class SessionRegistry {
   private readonly sessions = new Map<TelegramContextKey, CodexSessionRuntime>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
+  private readonly preferencesPath: string;
+  private selectedCodexModel?: string;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
 
   constructor(private readonly config: TeleCodexConfig) {
     this.persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    this.preferencesPath = path.join(config.workspace, ".telecodex", "preferences.json");
     this.loadPersistedMetadata();
+    this.loadPreferences();
   }
 
   async getOrCreate(
     contextKey: TelegramContextKey,
-    options?: { deferThreadStart?: boolean },
+    options?: { deferThreadStart?: boolean; skipThreadResume?: boolean },
   ): Promise<CodexSessionRuntime> {
     let session = this.sessions.get(contextKey);
     if (session) {
@@ -50,11 +58,11 @@ export class SessionRegistry {
     };
     session = await createCodexSession(effectiveConfig, {
       workspace: meta?.workspace,
-      model: meta?.model,
+      model: meta?.model ?? this.selectedCodexModel,
       reasoningEffort: meta?.reasoningEffort,
       launchProfileId,
-      deferThreadStart: options?.deferThreadStart && !meta?.threadId,
-      resumeThreadId: meta?.threadId ?? undefined,
+      deferThreadStart: options?.skipThreadResume || (options?.deferThreadStart && !meta?.threadId),
+      resumeThreadId: options?.skipThreadResume ? undefined : meta?.threadId ?? undefined,
     });
 
     this.sessions.set(contextKey, session);
@@ -81,13 +89,22 @@ export class SessionRegistry {
     return this.metadata.get(contextKey)?.activeProvider ?? "codex";
   }
 
+  getDefaultModel(): string | undefined {
+    return this.selectedCodexModel ?? this.config.codexModel;
+  }
+
+  setDefaultModel(model: string): void {
+    this.selectedCodexModel = model;
+    this.persistPreferences();
+  }
+
   setActiveProvider(contextKey: TelegramContextKey, provider: AgentProviderKind): void {
     const previous = this.metadata.get(contextKey);
     this.metadata.set(contextKey, {
       contextKey,
       threadId: previous?.threadId ?? null,
       workspace: previous?.workspace ?? this.config.workspace,
-      model: previous?.model ?? this.config.codexModel,
+      model: previous?.model ?? this.getDefaultModel(),
       reasoningEffort: previous?.reasoningEffort,
       launchProfileId: previous?.launchProfileId ?? this.config.defaultLaunchProfileId,
       backend: previous?.backend ?? this.config.codexBackend,
@@ -108,7 +125,7 @@ export class SessionRegistry {
       contextKey,
       threadId: previous?.threadId ?? null,
       workspace: previous?.workspace ?? this.config.workspace,
-      model: previous?.model ?? this.config.codexModel,
+      model: previous?.model ?? this.getDefaultModel(),
       reasoningEffort: previous?.reasoningEffort,
       launchProfileId: previous?.launchProfileId ?? this.config.defaultLaunchProfileId,
       backend: previous?.backend ?? this.config.codexBackend,
@@ -129,7 +146,7 @@ export class SessionRegistry {
       contextKey,
       threadId: previous?.threadId ?? null,
       workspace: previous?.workspace ?? this.config.workspace,
-      model: previous?.model ?? this.config.codexModel,
+      model: previous?.model ?? this.getDefaultModel(),
       reasoningEffort: previous?.reasoningEffort,
       launchProfileId: previous?.launchProfileId ?? this.config.defaultLaunchProfileId,
       backend,
@@ -219,6 +236,35 @@ export class SessionRegistry {
           });
         }
       }
+    } catch {
+      // Silently ignore load errors.
+    }
+  }
+
+  private persistPreferences(): void {
+    try {
+      const dir = path.dirname(this.preferencesPath);
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+      const data: TeleCodexPreferences = { selectedCodexModel: this.selectedCodexModel };
+      writeFileSync(this.preferencesPath, JSON.stringify(data, null, 2), "utf8");
+    } catch (error) {
+      console.warn(
+        "Failed to persist TeleCodex preferences:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  private loadPreferences(): void {
+    try {
+      if (!existsSync(this.preferencesPath)) {
+        return;
+      }
+      const raw = readFileSync(this.preferencesPath, "utf8");
+      const preferences = parseJsonFileText<TeleCodexPreferences>(raw);
+      this.selectedCodexModel = preferences.selectedCodexModel;
     } catch {
       // Silently ignore load errors.
     }

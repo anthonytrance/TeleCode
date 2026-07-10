@@ -264,14 +264,18 @@ export class CodexAppServerClient {
     this.notify("initialized");
   }
 
-  async request<T = unknown>(method: string, params: JsonValue | undefined): Promise<T> {
+  async request<T = unknown>(
+    method: string,
+    params: JsonValue | undefined,
+    requestTimeoutMs?: number,
+  ): Promise<T> {
     const child = this.child;
     if (!child) {
       throw new Error("Codex app-server is not started");
     }
 
     const id = this.nextRequestId++;
-    const timeoutMs = this.options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+    const timeoutMs = requestTimeoutMs ?? this.options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
     const payload = { method, id, params };
     const line = `${JSON.stringify(payload)}\n`;
 
@@ -550,6 +554,27 @@ export async function probeCodexAppServer(
       notifications: client.getNotificationMethods(),
       optOutNotificationMethods,
     };
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+export async function readCodexAppServerRateLimits(
+  config: TeleCodexConfig,
+  options: AppServerClientOptions = {},
+): Promise<unknown> {
+  const client = new CodexAppServerClient({
+    codexPath: config.codexAppServerPath,
+    env: buildAppServerEnv(config.codexApiKey),
+    cwd: config.workspace,
+    ...options,
+  });
+
+  try {
+    await client.start();
+    await client.initialize(DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS);
+    client.notifyInitialized();
+    return await client.request("account/rateLimits/read", {});
   } finally {
     await client.close().catch(() => undefined);
   }

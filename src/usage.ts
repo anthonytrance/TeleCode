@@ -18,6 +18,12 @@ type RateLimitWindow = {
 
 type CreditsInfo = unknown;
 
+type RateLimitResetCredit = {
+  status?: string;
+  expiresAt?: number;
+  title?: string;
+};
+
 export type CodexUsageSnapshot = {
   sessionFile: string;
   timestamp?: string;
@@ -28,7 +34,47 @@ export type CodexUsageSnapshot = {
   secondary?: RateLimitWindow;
   planType?: string;
   credits?: CreditsInfo;
+  availableResetCredits?: number;
+  resetCredits?: RateLimitResetCredit[];
+  rateLimitsSource?: "live-app-server" | "cached-session";
 };
+
+export function mergeLiveAppServerRateLimits(
+  snapshot: CodexUsageSnapshot | null,
+  response: unknown,
+): CodexUsageSnapshot | null {
+  const root = asRecord(response);
+  const limits = asRecord(root?.rateLimits);
+  if (!limits) {
+    return snapshot;
+  }
+
+  const resetCredits = asRecord(root?.rateLimitResetCredits);
+  const credits = Array.isArray(resetCredits?.credits)
+    ? resetCredits.credits.map((credit) => asRecord(credit) ?? {})
+    : [];
+  const availableCount = asNumber(resetCredits?.availableCount)
+    ?? credits.filter((credit) => credit.status === "available").length;
+
+  return {
+    sessionFile: snapshot?.sessionFile ?? "app-server",
+    timestamp: new Date().toISOString(),
+    totalTokenUsage: snapshot?.totalTokenUsage,
+    lastTokenUsage: snapshot?.lastTokenUsage,
+    modelContextWindow: snapshot?.modelContextWindow,
+    primary: normalizeLiveWindow(limits.primary),
+    secondary: normalizeLiveWindow(limits.secondary),
+    planType: asString(limits.planType),
+    credits: limits.credits,
+    availableResetCredits: availableCount,
+    resetCredits: credits.map((credit) => ({
+      status: asString(credit.status),
+      expiresAt: asNumber(credit.expiresAt),
+      title: asString(credit.title),
+    })),
+    rateLimitsSource: "live-app-server",
+  };
+}
 
 export async function readLatestCodexUsage(): Promise<CodexUsageSnapshot | null> {
   const codexHome = process.env.CODEX_HOME || path.join(homedir(), ".codex");
@@ -59,7 +105,13 @@ export function renderUsagePlain(snapshot: CodexUsageSnapshot | null): string {
     lines.push(`Plan: ${snapshot.planType}`);
   }
 
-  lines.push(`Credits: ${formatCredits(snapshot.credits)}`);
+  lines.push(`Purchased credits: ${formatCredits(snapshot.credits)}`);
+  if (typeof snapshot.availableResetCredits === "number") {
+    lines.push(`Full limit resets available: ${snapshot.availableResetCredits}`);
+  }
+  if (snapshot.rateLimitsSource === "live-app-server") {
+    lines.push("Source: a fresh account/rateLimits/read request. If a prompt reports a different reset, Codex's app-server or upstream rate-limit state is inconsistent.");
+  }
 
   const contextLine = formatContextLine(snapshot.lastTokenUsage, snapshot.modelContextWindow);
   if (contextLine) {
@@ -68,7 +120,8 @@ export function renderUsagePlain(snapshot: CodexUsageSnapshot | null): string {
   }
 
   if (snapshot.timestamp) {
-    lines.push(`Updated: ${formatTimestamp(snapshot.timestamp)}`);
+    const source = snapshot.rateLimitsSource === "live-app-server" ? "live app-server" : "cached session log";
+    lines.push(`Updated: ${formatTimestamp(snapshot.timestamp)} (${source})`);
   }
 
   return lines.join("\n");
@@ -127,6 +180,7 @@ async function readLatestUsageFromFile(filePath: string): Promise<CodexUsageSnap
         secondary: payload.rate_limits?.secondary,
         planType: payload.rate_limits?.plan_type,
         credits: payload.rate_limits?.credits,
+        rateLimitsSource: "cached-session",
       };
     } catch {
       continue;
@@ -164,6 +218,20 @@ function formatCredits(credits: CreditsInfo): string {
     return String(credits);
   }
 
+  const record = asRecord(credits);
+  if (record) {
+    if (record.unlimited === true) {
+      return "unlimited";
+    }
+    const balance = asString(record.balance);
+    if (balance !== undefined) {
+      return balance === "0" ? "none" : balance;
+    }
+    if (record.hasCredits === false || record.has_credits === false) {
+      return "none";
+    }
+  }
+
   try {
     return JSON.stringify(credits);
   } catch {
@@ -186,4 +254,30 @@ function formatTimestamp(timestamp: string): string {
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
+}
+
+function normalizeLiveWindow(value: unknown): RateLimitWindow | undefined {
+  const window = asRecord(value);
+  if (!window) {
+    return undefined;
+  }
+  return {
+    used_percent: asNumber(window.usedPercent),
+    window_minutes: asNumber(window.windowDurationMins),
+    resets_at: asNumber(window.resetsAt),
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }

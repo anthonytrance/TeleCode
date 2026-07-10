@@ -60,6 +60,9 @@ Remove-StaleTeleCodexWrappers
 
 $env:Path = "$env:APPDATA\npm;C:\Program Files\nodejs;$env:Path"
 $env:HOME = $env:USERPROFILE
+# The bridge loads its configured default from .env. Do not let a model value
+# inherited from an older bridge process override it after a restart.
+Remove-Item Env:CODEX_MODEL -ErrorAction SilentlyContinue
 if (-not $env:CODEX_HOME) {
   $env:CODEX_HOME = Join-Path $env:USERPROFILE ".codex"
 }

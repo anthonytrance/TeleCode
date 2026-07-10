@@ -330,6 +330,19 @@ export class CodexSessionService {
     this.abortController?.abort();
   }
 
+  prepareNewThread(workspace?: string, model?: string): CodexSessionInfo {
+    this.ensureIdle("prepare a new thread");
+    this.thread = null;
+    this.currentThreadId = null;
+    this.activeThreadLaunchProfile = null;
+    this.currentWorkspace = workspace ?? this.currentWorkspace;
+    if (model) {
+      this.currentModel = model;
+    }
+    this.resetSessionTokens();
+    return this.getInfo();
+  }
+
   async newThread(workspace?: string, model?: string): Promise<CodexSessionInfo> {
     this.ensureIdle("start a new thread");
 

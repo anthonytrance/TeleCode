@@ -14,6 +14,7 @@ import { bridgeLog, initBridgeLog } from "./bridge-log.js";
 import { ClaudeBackendPrefs, claudeBackendPrefsPath, type ClaudeBackendChoice } from "./claude-backend-prefs.js";
 import {
   probeCodexAppServer,
+  readCodexAppServerRateLimits,
   runCodexAppServerSteeredTurn,
   runCodexAppServerTurn,
   type AppServerProbeResult,
@@ -83,7 +84,7 @@ import { findTranscript } from "./providers/claude-transcript.js";
 import type { AgentProviderEvent, AgentProviderKind, AgentSessionDescriptor } from "./providers/types.js";
 import { SessionRegistry } from "./session-registry.js";
 import { findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
-import { readLatestCodexUsage, renderUsagePlain } from "./usage.js";
+import { mergeLiveAppServerRateLimits, readLatestCodexUsage, renderUsagePlain } from "./usage.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
 import { normalizePersistedWorkspace } from "./workspace-normalization.js";
 
@@ -1106,7 +1107,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
   const getContextSession = async (
     ctx: Context,
-    options?: { deferThreadStart?: boolean },
+    options?: { deferThreadStart?: boolean; skipThreadResume?: boolean },
   ): Promise<{ contextKey: TelegramContextKey; session: CodexSessionRuntime } | null> => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
@@ -2009,11 +2010,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         recordProgressLine(`Started ${toolName}`);
 
         if (toolVerbosity === "summary") {
-          void sendProgressUpdate(renderSummaryProgressMessage(toolName, toolCounts, recentProgressLines)).catch(
-            (error) => {
-              console.error(`Failed to send summary progress for ${toolName}`, error);
-            },
-          );
+          // Summary mode is deliberately quiet during the turn. It records tool
+          // activity for internal accounting without sending "Working: bash"
+          // chatter as separate Telegram messages.
           return;
         }
 
@@ -4071,7 +4070,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
-    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    const contextSession = await getContextSession(ctx, {
+      deferThreadStart: true,
+      skipThreadResume: true,
+    });
     if (!contextSession) {
       return;
     }
@@ -4100,22 +4102,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     try {
-      const info = await session.newThread(session.getCurrentWorkspace());
+      const info = session.prepareNewThread(session.getCurrentWorkspace());
       updateSessionMetadata(contextKey, session);
       registry.setActiveProvider(contextKey, "codex");
-      ensureAgentSessionRecord(contextKey, "codex", {
-        workspace: info.workspace,
-        displayName: resolveCodexSessionDisplayName(info.threadId, "Codex"),
-        providerSessionId: info.threadId ?? undefined,
-        select: true,
-        metadata: {
-          model: info.model,
-          reasoningEffort: info.reasoningEffort,
-          backend: registry.getBackend(contextKey),
-        },
-      });
       clearSessionSelectionState(contextKey);
-      const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
+      const label = isTopicContext(contextKey)
+        ? "New Codex session ready for this topic. The thread will initialize with your next message."
+        : "New Codex session ready. The thread will initialize with your next message.";
       const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
       await safeReply(ctx, html, { fallbackText: plainText });
@@ -4809,7 +4802,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     try {
-      const plain = renderUsagePlain(await readLatestCodexUsage());
+      const cached = await readLatestCodexUsage();
+      let snapshot = cached;
+      try {
+        const liveResponse = await readCodexAppServerRateLimits(config);
+        snapshot = mergeLiveAppServerRateLimits(cached, liveResponse);
+      } catch (error) {
+        console.warn("Fresh app-server usage read failed; using cached session data", error);
+      }
+      const plain = renderUsagePlain(snapshot);
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
     } catch (error) {
       const message = `Failed to read usage: ${friendlyErrorText(error)}`;
@@ -5891,8 +5892,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
       try {
         session.setModel(slug);
+        registry.setDefaultModel(slug);
         updateSessionMetadata(contextKey, session);
-        const text = `Model set to ${slug}. It applies from the next turn in this context.`;
+        const text = `Model set to ${slug}. Future new Codex sessions will use it too.`;
         await safeReply(ctx, escapeHTML(text), { fallbackText: text });
       } catch (error) {
         await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
@@ -5965,8 +5967,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
     try {
       session.setModel(slug);
+      registry.setDefaultModel(slug);
       updateSessionMetadata(contextKey, session);
-      const text = `Model set to ${slug}. It applies from the next turn in this context.`;
+      const text = `Model set to ${slug}. Future new Codex sessions will use it too.`;
       await safeReply(ctx, escapeHTML(text), { fallbackText: text });
     } catch (error) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
@@ -6525,6 +6528,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
 
     try {
       const model = session.setModel(slug);
+      registry.setDefaultModel(model);
       updateSessionMetadata(contextKey, session);
       const html = `<b>Model set to</b> <code>${escapeHTML(model)}</code> — applies to new threads.`;
       const plainText = `Model set to ${model} — applies to new threads.`;
@@ -7755,6 +7759,24 @@ function formatModelButtonLabel(displayName: string): string {
 function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName: string }>): string | null {
   const value = raw.trim();
   const normalized = normalizeModelName(value);
+  const aliases: Record<string, string> = {
+    codexterra: "gpt-5.6-terra",
+    codextera: "gpt-5.6-terra",
+    codex56terra: "gpt-5.6-terra",
+    codex56tera: "gpt-5.6-terra",
+    terra: "gpt-5.6-terra",
+    tera: "gpt-5.6-terra",
+    codexluna: "gpt-5.6-luna",
+    codex56luna: "gpt-5.6-luna",
+    luna: "gpt-5.6-luna",
+    codexsol: "gpt-5.6-sol",
+    codex56sol: "gpt-5.6-sol",
+    sol: "gpt-5.6-sol",
+  };
+  const aliased = aliases[normalized];
+  if (aliased && models.some((model) => model.slug === aliased)) {
+    return aliased;
+  }
 
   const direct = models.find(
     (model) =>

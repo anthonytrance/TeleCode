@@ -33,6 +33,7 @@ export interface CodexSessionRuntime {
   renameThread?(name: string): Promise<void>;
   rollbackThread?(turnCount: number): Promise<void>;
   abort(): Promise<void>;
+  prepareNewThread(workspace?: string, model?: string): CodexSessionInfo;
   newThread(workspace?: string, model?: string): Promise<CodexSessionInfo>;
   resumeThread(threadId: string): Promise<CodexSessionInfo>;
   switchSession(threadId: string): Promise<CodexSessionInfo>;

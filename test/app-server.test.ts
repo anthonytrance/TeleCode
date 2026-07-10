@@ -10,6 +10,7 @@ import {
   CodexAppServerClient,
   DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS,
   probeCodexAppServer,
+  readCodexAppServerRateLimits,
   resolveCodexBinaryPath,
   runCodexAppServerSteeredTurn,
   runCodexAppServerTurn,
@@ -221,6 +222,41 @@ describe("probeCodexAppServer", () => {
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected failed probe");
     expect(result.error).toContain("model/list failed (-1): models unavailable");
+  });
+});
+
+describe("readCodexAppServerRateLimits", () => {
+  it("reads limits from a fresh short-lived app-server", async () => {
+    const requests: any[] = [];
+    const spawnProcess: SpawnAppServerProcess = () =>
+      new FakeAppServerProcess((message, process) => {
+        requests.push(message);
+        if (message.method === "initialize") {
+          process.send({
+            id: message.id,
+            result: {
+              userAgent: "codex-test",
+              codexHome: "/home/test/.codex",
+              platformFamily: "windows",
+              platformOs: "windows",
+            },
+          });
+        } else if (message.method === "account/rateLimits/read") {
+          process.send({
+            id: message.id,
+            result: { rateLimits: { planType: "plus", primary: { usedPercent: 62 } } },
+          });
+        }
+      });
+
+    await expect(readCodexAppServerRateLimits(createConfig(), {
+      codexPath: "fake-codex",
+      spawnProcess,
+      requestTimeoutMs: 1000,
+    })).resolves.toEqual({
+      rateLimits: { planType: "plus", primary: { usedPercent: 62 } },
+    });
+    expect(requests.some((request) => request.method === "account/rateLimits/read")).toBe(true);
   });
 });
 
