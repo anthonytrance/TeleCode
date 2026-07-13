@@ -298,7 +298,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   const agentSessions = new AgentSessionManager({ state: agentSessionState });
   applyAgentSessionRepairs(
     agentSessions,
-    path.join(config.workspace, ".telecodex", "provider-state", "agent-session-repair.json"),
+    path.join(config.workspace, ".telecode", "provider-state", "agent-session-repair.json"),
   );
   agentSessions.abortPersistedJobs();
   const outputBuffer = new OutputBuffer();
@@ -3852,7 +3852,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       `Busy lanes: ${busyContexts.size}`,
       `Backend: ${config.codexBackend}`,
       `Workspace: ${config.workspace}`,
-      `State file: ${path.join(config.workspace, ".telecodex", "contexts.json")}`,
+      `State file: ${path.join(config.workspace, ".telecode", "contexts.json")}`,
     ];
     await safeReply(ctx, lines.map((line) => escapeHTML(line)).join("\n"), {
       fallbackText: lines.join("\n"),

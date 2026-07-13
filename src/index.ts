@@ -1,9 +1,15 @@
+import { homedir } from "node:os";
+
 import { createBot, registerCommands } from "./bot.js";
 import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
 import { loadConfig } from "./config.js";
 import { cleanupRegisteredClaudeProcesses } from "./providers/claude-process-registry.js";
 import { SessionRegistry } from "./session-registry.js";
+import {
+  migrateLegacyClaudeConfigDirectory,
+  migrateLegacyStateDirectory,
+} from "./state-paths.js";
 import { assertTelegramPollingSafety, findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
 
 let registry: SessionRegistry | undefined;
@@ -11,6 +17,16 @@ let bot: ReturnType<typeof createBot> | undefined;
 
 try {
   const config = loadConfig();
+  const stateMigration = migrateLegacyStateDirectory(config.workspace);
+  if (stateMigration === "migrated") {
+    console.log("Migrated runtime state from .telecodex to .telecode.");
+  } else if (stateMigration === "legacy-left-because-new-exists") {
+    console.warn("Both .telecode and legacy .telecodex state directories exist; using .telecode.");
+  }
+  const claudeConfigMigration = migrateLegacyClaudeConfigDirectory(homedir());
+  if (claudeConfigMigration === "migrated") {
+    console.log("Migrated the isolated Claude config directory to .telecode.");
+  }
   if (config.enableClaudeProvider) {
     const cleanedClaudeProcesses = await cleanupRegisteredClaudeProcesses(config.workspace);
     if (cleanedClaudeProcesses > 0) {

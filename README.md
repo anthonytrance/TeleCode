@@ -192,9 +192,9 @@ The `SessionRegistry` maps context keys to `CodexSessionService` instances:
 - **`/sessions`** → lists all Codex threads from `~/.codex`, lets you switch within the current context
 - **`/attach <id>`** → resumes a specific Codex CLI thread (useful for picking up work started in the terminal)
 
-Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecodex/contexts.json` and restored on restart so threads survive bot reboots.
+Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecode/contexts.json` and restored on restart so threads survive bot reboots.
 
-The `.telecodex` state directory is intentionally retained as a compatibility path after the TeleCode rename. Existing sessions and settings therefore need no migration. New `TELECODE_*` safety variables are canonical, while their legacy `TELECODEX_*` equivalents remain accepted.
+TeleCode stores runtime state in `.telecode`. On first startup after upgrading, it automatically moves a legacy `.telecodex` state directory when the new path does not yet exist. New `TELECODE_*` safety variables are canonical, while their legacy `TELECODEX_*` equivalents remain accepted temporarily.
 
 `/newsummary` follows the same active-thread replacement rule as `/new`, but it first captures a handoff summary from the previous active thread and sends that summary into the newly created thread.
 
@@ -230,8 +230,8 @@ Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
                 ├── CodexStateReader  ──→  ~/.codex/state_*.sqlite  (threads)
                 │                    ──→  ~/.codex/models_cache.json (models)
                 ├── CodexAuth        ──→  codex login/logout subprocess
-                ├── Attachments      ──→  .telecodex/inbox/<turnId>/ (staged files)
-                ├── Artifacts        ──→  .telecodex/outbox/<turnId>/ (generated files)
+                ├── Attachments      ──→  .telecode/inbox/<turnId>/ (staged files)
+                ├── Artifacts        ──→  .telecode/outbox/<turnId>/ (generated files)
                 └── VoiceTranscriber  ──→  parakeet-coreml (local)
                                      ──→  OpenAI Whisper (cloud fallback)
 ```

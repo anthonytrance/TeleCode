@@ -21,7 +21,7 @@ let sessionId;
 let releaseLock;
 
 function assertPidRegistryEmpty(label) {
-  const registryPath = path.join(config.workspace, ".telecodex", "provider-state", "claude-pids.json");
+  const registryPath = path.join(config.workspace, ".telecode", "provider-state", "claude-pids.json");
   if (!existsSync(registryPath)) {
     return;
   }

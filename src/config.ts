@@ -97,7 +97,7 @@ export function loadConfig(): TeleCodeConfig {
   // at a folder that does NOT contain the user-scoped telegram plugin keeps the child
   // from starting a competing getUpdates poller and 409ing the live Telegram bridge.
   const claudeConfigDir = path.resolve(
-    optionalString(process.env.CLAUDE_CONFIG_DIR_OVERRIDE) ?? path.join(homedir(), ".telecodex", "claude-config"),
+    optionalString(process.env.CLAUDE_CONFIG_DIR_OVERRIDE) ?? path.join(homedir(), ".telecode", "claude-config"),
   );
   // When true the child launches against the real ~/.claude with --strict-mcp-config,
   // which keeps the user-scoped telegram plugin from starting a competing getUpdates

@@ -13,7 +13,7 @@ interface ClaudeBackendPrefsState {
 }
 
 export function claudeBackendPrefsPath(workspace: string): string {
-  return path.join(workspace, ".telecodex", "provider-state", "claude-backend.json");
+  return path.join(workspace, ".telecode", "provider-state", "claude-backend.json");
 }
 
 /** Per-Telegram-context Claude engine choice; survives restarts (no-BOM JSON). */

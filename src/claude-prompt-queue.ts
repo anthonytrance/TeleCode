@@ -23,7 +23,7 @@ interface ClaudePromptQueueState {
 }
 
 export function claudePromptQueuePath(workspace: string): string {
-  return path.join(workspace, ".telecodex", "provider-state", "claude-queue.json");
+  return path.join(workspace, ".telecode", "provider-state", "claude-queue.json");
 }
 
 export class ClaudePromptQueue {

@@ -20,7 +20,7 @@ describe("bridge log", () => {
     bridgeLog("intake", "message received lane=123 chars=42");
     bridgeLog("turn", "end lane=123 ok=true\nwith newline");
 
-    const logDir = path.join(workspace, ".telecodex", "logs");
+    const logDir = path.join(workspace, ".telecode", "logs");
     const files = readdirSync(logDir);
     expect(files).toHaveLength(1);
     expect(files[0]).toMatch(/^bridge-\d{8}\.log$/);
@@ -32,7 +32,7 @@ describe("bridge log", () => {
   });
 
   it("prunes log files older than the retention window on init", () => {
-    const logDir = path.join(workspace, ".telecodex", "logs");
+    const logDir = path.join(workspace, ".telecode", "logs");
     mkdirSync(logDir, { recursive: true });
     writeFileSync(path.join(logDir, "bridge-20200101.log"), "old\n", "utf8");
     writeFileSync(path.join(logDir, "unrelated.txt"), "keep\n", "utf8");

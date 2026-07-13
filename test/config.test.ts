@@ -120,7 +120,7 @@ describe("loadConfig", () => {
       enableTelegramReactions: false,
       enableClaudeProvider: false,
       claudeBin: "C:\\Users\\Anthony\\.local\\bin\\claude.exe",
-      claudeConfigDir: path.join(homedir(), ".telecodex", "claude-config"),
+      claudeConfigDir: path.join(homedir(), ".telecode", "claude-config"),
       claudeStrictMcpConfig: true,
       claudeDefaultModel: "claude-sonnet-5",
       claudeWorkspace: process.cwd(),

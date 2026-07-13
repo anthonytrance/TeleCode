@@ -7,7 +7,7 @@ const LOCK_WAIT_MS = 10 * 60 * 1000;
 const LOCK_POLL_MS = 1000;
 
 export async function acquireClaudeLiveLock(workspace, label) {
-  const lockParentDir = path.join(workspace, ".telecodex", "locks");
+  const lockParentDir = path.join(workspace, ".telecode", "locks");
   const lockDir = path.join(lockParentDir, "claude-live-smoke.lock");
   const ownerPath = path.join(lockDir, "owner.json");
   const startedAt = Date.now();

@@ -40,7 +40,7 @@ File: `src/bot.ts`, `handleClaudePrompt` and its call sites (`startClaudePrompt`
 
 Files: `src/bot.ts` (queue use), new `src/claude-prompt-queue.ts` + `test/claude-prompt-queue.test.ts`.
 
-- Replace the raw `queuedClaudePrompts` Map with a small class persisting to `<workspace>/.telecodex/provider-state/claude-queue.json` (UTF-8 WITHOUT BOM — PowerShell-written BOMs have crashed this bot before; write with `fs.writeFileSync(path, JSON.stringify(...), "utf8")` from node only).
+- Replace the raw `queuedClaudePrompts` Map with a small class persisting to `<workspace>/.telecode/provider-state/claude-queue.json` (UTF-8 WITHOUT BOM — PowerShell-written BOMs have crashed this bot before; write with `fs.writeFileSync(path, JSON.stringify(...), "utf8")` from node only).
 - Entry shape: `{ contextKey, chatId, messageThreadId, text, queuedAt }`. Note the current queue keeps only ONE pending prompt per lane (last wins) — upgrade to an ordered ARRAY per lane, dispatched FIFO, because Anthony often sends several messages during one long turn.
 - On startup (`createBot`), load the file; if entries exist, deliver a notice to the lane ("N queued messages from before the restart will be sent to Claude now") and dispatch FIFO once the lane is idle.
 - The Telegram `ctx` cannot be persisted; for restart-recovered entries send via `bot.api` using the stored chatId/threadId (mirror how `sendTextMessage` is called elsewhere), and skip reaction calls (no live ctx).
@@ -65,7 +65,7 @@ Claude Code natively supports steering: text typed while a turn runs is queued b
 
 ### A5. Bridge logging
 
-New file `src/bridge-log.ts`: append-only daily log `<workspace>/.telecodex/logs/bridge-YYYYMMDD.log`, plain lines `ISO timestamp | area | message`, 7-day retention (delete older on boot). No dependency; ~40 lines.
+New file `src/bridge-log.ts`: append-only daily log `<workspace>/.telecode/logs/bridge-YYYYMMDD.log`, plain lines `ISO timestamp | area | message`, 7-day retention (delete older on boot). No dependency; ~40 lines.
 
 Log at minimum: message received (lane, chars), gate decision (dispatched/queued/steered + queue depth), prompt echo located (file basename, offset), turn end (duration, usage), adapter failures verbatim, PTY spawn/dispose with reason, queue persistence load/save, startup/shutdown. Wire into `handleClaudePrompt`, the adapter callbacks (`onEvent` or around the event loop), and `claude-pty.ts` spawn/dispose.
 
@@ -188,7 +188,7 @@ Phase C exit: suite + both smokes green, committed, pushed, and a short summary 
   - Note for Phase C/D: Telegram splits user messages over 4096 chars into separate updates; the bridge runs them as separate turns. If Anthony's cut prompts exceed that, an intake stitcher (hold a ~4096-char message briefly and join the continuation) is the fix; not built yet.
 
 - 2026-07-08 Codex partial Phase A/B bugfix slice:
-  - Implemented persistent FIFO Claude prompt queue at `.telecodex/provider-state/claude-queue.json`, with restart recovery and no-BOM JSON writes.
+  - Implemented persistent FIFO Claude prompt queue at `.telecode/provider-state/claude-queue.json`, with restart recovery and no-BOM JSON writes.
   - Added atomic Claude intake gate so same-tick Telegram messages cannot both enter `sendPrompt`; queued prompts now run FIFO instead of last-wins replacement.
   - Added `PromptNotDeliveredError`; missed transcript echo on a live PTY now requeues the prompt and keeps Claude alive instead of force-killing the process.
   - Fixed Claude `/usage` leakage by cropping the screen scrape to the latest usage panel and routing top-level Telegram `/usage` through the same Claude usage-report path.

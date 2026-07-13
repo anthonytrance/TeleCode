@@ -58,7 +58,7 @@ That test builds TeleCode, spawns Claude through the same provider adapter, make
 
 The bot-flow smoke test builds TeleCode, creates a local in-process bot with mocked Telegram sends, simulates `/claude <prompt>`, sends a second normal message to the active Claude session, verifies `/sessions` exposes a useful title, runs `/exit`, verifies the Claude PID registry is empty, starts Claude again and verifies a post-exit reply, then checks `/new claude opus` with a real response. It does not poll Telegram and does not send messages to Anthony.
 
-Run the live Claude smoke tests serially. They both drive real interactive Claude processes and scan Claude's transcript directory, so running them in parallel can create false failures. The individual smoke scripts also share a lock under `.telecodex/locks` to prevent accidental parallel runs from colliding.
+Run the live Claude smoke tests serially. They both drive real interactive Claude processes and scan Claude's transcript directory, so running them in parallel can create false failures. The individual smoke scripts also share a lock under `.telecode/locks` to prevent accidental parallel runs from colliding.
 
 2. Standalone Claude Code on the TeleCode repo
 

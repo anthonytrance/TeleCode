@@ -94,7 +94,7 @@ describe("bot-ui", () => {
       const label = formatSessionLabel({
         workspace: "/project",
         title:
-          "Output files: write any files the user should receive to C:\\Users\\Anthony\\.telecodex\\turns\\abc\\out\n\nI would like you to help me install Hermes agent",
+          "Output files: write any files the user should receive to C:\\Users\\Anthony\\.telecode\\turns\\abc\\out\n\nI would like you to help me install Hermes agent",
         relativeTime: "1m ago",
         isActive: false,
       });
@@ -197,7 +197,7 @@ describe("bot-ui", () => {
     it("removes output-file preamble", () => {
       expect(
         cleanSessionTitle(
-          "Output files: write any files the user should receive to C:\\Users\\Anthony\\.telecodex\\turns\\x\\out\n\nInstall Hermes agent",
+          "Output files: write any files the user should receive to C:\\Users\\Anthony\\.telecode\\turns\\x\\out\n\nInstall Hermes agent",
         ),
       ).toBe("Install Hermes agent");
     });

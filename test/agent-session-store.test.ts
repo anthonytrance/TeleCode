@@ -21,7 +21,7 @@ describe("JsonAgentSessionStore", () => {
   });
 
   it("uses a separate agent session state path", () => {
-    expect(agentSessionStatePath(tempDir)).toBe(path.join(tempDir, ".telecodex", "agent-sessions.json"));
+    expect(agentSessionStatePath(tempDir)).toBe(path.join(tempDir, ".telecode", "agent-sessions.json"));
   });
 
   it("returns empty state when no file exists", () => {
@@ -31,7 +31,7 @@ describe("JsonAgentSessionStore", () => {
   });
 
   it("saves and loads agent session state without touching legacy contexts", () => {
-    const telecodeDir = path.join(tempDir, ".telecodex");
+    const telecodeDir = path.join(tempDir, ".telecode");
     const legacyPath = path.join(telecodeDir, "contexts.json");
     const storePath = agentSessionStatePath(tempDir);
     const manager = new AgentSessionManager({ idGenerator: (prefix) => `${prefix}-1`, now: () => 1000 });

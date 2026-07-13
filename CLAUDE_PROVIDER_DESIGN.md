@@ -15,7 +15,7 @@ This document designs BOTH projects end to end. Build order is TeleCode first, t
 ## 0. Ground truth and non-negotiables
 
 - **Billing reality (corrected):** Anthropic PAUSED the change that would move Agent SDK / `claude -p` usage off the Claude subscription into a separate credit bucket. So the Agent SDK is usable on subscription today but is policy-sensitive. Keep the provider backend-neutral. PTY (interactive TUI) is the guaranteed-subscription backend; Agent SDK is an optional backend; direct Anthropic Messages API with the subscription OAuth token stays REJECTED (account-ban risk).
-- **Telegram is Anthony's lifeline.** Never run a second poller on the production token. Canary on a separate token + state dir. Warn before any production restart. Keep a one-command rollback to the Codex-only build. Store new state in new files; never mutate `.telecodex/contexts.json` in place during migration.
+- **Telegram is Anthony's lifeline.** Never run a second poller on the production token. Canary on a separate token + state dir. Warn before any production restart. Keep a one-command rollback to the Codex-only build. Store new state in new files; never mutate `.telecode/contexts.json` in place during migration.
 - **Subscription-safe mechanism (spike-verified 2026-06-12):** drive interactive `claude.exe` in a hidden ConPTY, read structured output from the transcript JSONL at `~/.claude/projects/*/<uuid>.jsonl`. Never the Agent SDK / `claude -p` / stream-json for the subscription path.
 
 ---
@@ -115,7 +115,7 @@ Set `slashCommands: true`. Add `commandClassFor(name)` to the adapter, plus `per
 1. Build the command table + handler classes + the CI "every-command-classified" test.
 2. Wire progress narration delivery (Section 2) into the existing `PROGRESS_DELIVERY` path; add `/verbosity`.
 3. Re-run build + full test suite.
-4. Canary on a separate token + `.telecodex-canary` state dir: a real Claude turn, the progress-narration stream at `progress` level, a sample from each handler class (DISPATCH, ARG, EMULATE, SURFACE, NA, BLOCK), resume after restart, photo/doc-while-Claude-active fails cleanly.
+4. Canary on a separate token + `.telecode-canary` state dir: a real Claude turn, the progress-narration stream at `progress` level, a sample from each handler class (DISPATCH, ARG, EMULATE, SURFACE, NA, BLOCK), resume after restart, photo/doc-while-Claude-active fails cleanly.
 5. Restart production with Claude gated behind `ENABLE_CLAUDE_PROVIDER` (default off); Anthony flips it on.
 
 ---

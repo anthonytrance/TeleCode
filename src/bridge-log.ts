@@ -8,12 +8,12 @@ let logDir: string | undefined;
 /**
  * Append-only operational log for the bridge (D6: kills, queueing, dispatch, and echo
  * events previously left no trace). One file per day under
- * `<workspace>/.telecodex/logs/bridge-YYYYMMDD.log`, plain `ISO | area | message` lines.
+ * `<workspace>/.telecode/logs/bridge-YYYYMMDD.log`, plain `ISO | area | message` lines.
  * Never throws: logging must not take the bridge down.
  */
 export function initBridgeLog(workspace: string): void {
   try {
-    logDir = path.join(workspace, ".telecodex", "logs");
+    logDir = path.join(workspace, ".telecode", "logs");
     mkdirSync(logDir, { recursive: true });
     pruneOldLogs(logDir);
   } catch {

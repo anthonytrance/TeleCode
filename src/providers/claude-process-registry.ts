@@ -25,7 +25,7 @@ interface ProcessInfo {
 }
 
 export function claudeProcessRegistryPath(workspace: string): string {
-  return path.join(workspace, ".telecodex", "provider-state", "claude-pids.json");
+  return path.join(workspace, ".telecode", "provider-state", "claude-pids.json");
 }
 
 export class ClaudeProcessRegistry {

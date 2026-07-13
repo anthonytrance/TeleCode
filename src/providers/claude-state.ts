@@ -23,7 +23,7 @@ export interface ClaudeProviderState {
 }
 
 export function claudeProviderStatePath(workspace: string): string {
-  return path.join(workspace, ".telecodex", "provider-state", "claude.json");
+  return path.join(workspace, ".telecode", "provider-state", "claude.json");
 }
 
 export class ClaudeStateStore {

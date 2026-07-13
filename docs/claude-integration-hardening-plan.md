@@ -130,7 +130,7 @@ REMAINING VERIFY (do live before trusting): F1 needs a per-command matrix (which
 
 ### F8 — Claude narration now matches Codex in both edit and messages modes (2026-07-01, built + unit-tested, NOT yet live)
 
-Diagnosis (corrected after two wrong guesses): the progress-delivery setting IS unified per Telegram context and Anthony's is `edit` (confirmed live from `codetest/.telecodex/contexts.json`, mtime today, `activeProvider=claude`; the `home/.telecodex/contexts.json` is a stale May-17 file, not in use — there is NO workspace regression). The real defect: Claude never used Codex's narration pipeline. Codex renders the rolling last-5 narration lines into ONE edited message in `edit` mode via `renderAssistantProgressMessage` + a `recentProgress` buffer. Claude had its own path that only delivered in `messages` mode, gated its `edit` path behind `STREAM_ASSISTANT_TEXT` (off), and otherwise only leaked narration as accidental separate messages when a following tool call force-flushed the held block — which also made the first line arrive late.
+Diagnosis (corrected after two wrong guesses): the progress-delivery setting IS unified per Telegram context and Anthony's is `edit` (confirmed live from `codetest/.telecode/contexts.json`, mtime today, `activeProvider=claude`; the `home/.telecode/contexts.json` is a stale May-17 file, not in use — there is NO workspace regression). The real defect: Claude never used Codex's narration pipeline. Codex renders the rolling last-5 narration lines into ONE edited message in `edit` mode via `renderAssistantProgressMessage` + a `recentProgress` buffer. Claude had its own path that only delivered in `messages` mode, gated its `edit` path behind `STREAM_ASSISTANT_TEXT` (off), and otherwise only leaked narration as accidental separate messages when a following tool call force-flushed the held block — which also made the first line arrive late.
 
 Fix (`src/bot.ts` `handleClaudePrompt`, `src/providers/claude-adapter.ts`):
 - Claude narration now flows through the same shared renderer. `edit` mode keeps ONE message and edits it in place with the rolling last-`SUMMARY_PROGRESS_RECENT_LIMIT` (5) lines; `messages` mode sends each line as its own message. `none` suppresses. The held last block is still delivered as the final answer (not as a progress line), so no duplication.
@@ -145,7 +145,7 @@ Not covered by a unit test yet: the edit-mode rolling-window rendering. Adding i
 Observed after the F8 restart: TeleCode restarted cleanly and resumed the saved Claude session id, but the next Claude turn failed with `Claude did not record the prompt in its transcript`. The latest transcript did in fact contain Anthony's prompt as the final user entry, and the live log showed the bridge killed the Claude PTY after failing to locate that echo. The saved Claude state only stored `sessionId`; after a restart the adapter had to rediscover the transcript path by scanning, which is an avoidable fragile step in the exact failure path.
 
 Fix:
-- Persist `transcriptPath` in `.telecodex/provider-state/claude.json`.
+- Persist `transcriptPath` in `.telecode/provider-state/claude.json`.
 - Propagate it through the Claude descriptor metadata.
 - Restore it into the adapter runtime on resume, so the next turn starts with the exact known transcript file instead of relying only on rediscovery.
 - Added a regression test for the related `\r/exit` input shape, confirming embedded Claude commands separated by carriage returns are rejected before paste just like newline-separated commands.
@@ -191,7 +191,7 @@ Verification: `npm run build` clean; `npm test` clean with 32 files and 320 test
 
 ## F9 — Deep pass 2026-07-01 (post-F8 restart): usage limits, narration latency, worklist
 
-Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no errors). State integrity: progress=`edit` survived in `codetest/.telecodex/contexts.json` (live); `home/.telecodex/contexts.json` is stale (May 17). NOTE: `logs/telecode.out.log` / `.err.log` are frozen at 2026-05-16 — current runs are NOT being captured to any log. The "Workspace: C:\Users\Anthony" banner people see is from that stale log, not the live process (the live process correctly uses codetest). Fixing live stdout/stderr logging is a real ops gap.
+Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no errors). State integrity: progress=`edit` survived in `codetest/.telecode/contexts.json` (live); `home/.telecode/contexts.json` is stale (May 17). NOTE: `logs/telecode.out.log` / `.err.log` are frozen at 2026-05-16 — current runs are NOT being captured to any log. The "Workspace: C:\Users\Anthony" banner people see is from that stale log, not the live process (the live process correctly uses codetest). Fixing live stdout/stderr logging is a real ops gap.
 
 ### Done this pass (built + unit-tested, deployed via restart)
 - `/usage` (and `/cost`) now report the LIVE subscription limits. The rolling 5-hour/weekly/reset picture is not in the transcript or any local file — only Claude Code's own `/usage` panel has it. New `ClaudeProviderAdapter.getUsageReport()` dispatches `/usage` into the PTY, scrapes the rendered panel (`cleanUsagePanel`), then presses Esc and waits for the ready marker to confirm the panel dismissed so the session can't get stuck. The bot's `/usage` appends the session context-token line. `/context` and `/stats` keep the token snapshot. VERIFY LIVE: exact panel wording/format on Claude 2.1.197 — `cleanUsagePanel` is generic (strips chrome, dedupes) and may need tuning once the real panel text is seen.
@@ -250,4 +250,4 @@ After runtime restarts:
 
 - verify exactly one TeleCode `node.exe`
 - verify no unexpected live `claude.exe`
-- verify `C:\Users\Anthony\codetest\.telecodex\provider-state\claude-pids.json` is empty unless a Claude turn is actively running
+- verify `C:\Users\Anthony\codetest\.telecode\provider-state\claude-pids.json` is empty unless a Claude turn is actively running

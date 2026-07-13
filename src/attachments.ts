@@ -30,11 +30,11 @@ export function sanitizeFilename(name: string): string {
 }
 
 export function inboxPath(workspace: string, turnId: string): string {
-  return path.join(workspace, ".telecodex", "inbox", turnId);
+  return path.join(workspace, ".telecode", "inbox", turnId);
 }
 
 export function outboxPath(workspace: string, turnId: string): string {
-  return path.join(workspace, ".telecodex", "turns", turnId, "out");
+  return path.join(workspace, ".telecode", "turns", turnId, "out");
 }
 
 export async function stageFile(

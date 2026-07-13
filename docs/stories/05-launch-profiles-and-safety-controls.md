@@ -8,7 +8,7 @@ TeleCode already has most of the plumbing needed for this feature. The implement
 
 - `src/config.ts` already parses `CODEX_SANDBOX_MODE` and `CODEX_APPROVAL_POLICY` and should remain the backward-compatible bootstrap source for the default launch behavior.
 - `src/codex-session.ts` already centralizes Codex thread creation in `buildThreadOptions()`. Keep launch-option assembly there. Do not add a new CLI backend or bypass the SDK just to support launch variants.
-- `src/session-registry.ts` already persists per-context session metadata in `.telecodex/contexts.json` with workspace, model, and reasoning effort. Persist launch selection in the same metadata object.
+- `src/session-registry.ts` already persists per-context session metadata in `.telecode/contexts.json` with workspace, model, and reasoning effort. Persist launch selection in the same metadata object.
 - `src/bot.ts` already has the right UI patterns for this feature:
   - inline picker flows for `/model` and `/effort`
   - context-scoped pending callback maps
@@ -79,7 +79,7 @@ Security pass requirements:
 - `src/codex-launch.ts`: new shared module for launch profile types, parsing, validation, formatting, and unsafe-profile checks.
 - `src/config.ts`: parse optional profile config, synthesize the backward-compatible default profile, and expose launch-profile settings on `TeleCodeConfig`.
 - `src/codex-session.ts`: track current launch selection, include it in `CodexSessionInfo`, and apply effective launch settings in `buildThreadOptions()`.
-- `src/session-registry.ts`: persist and restore per-context launch selection in `.telecodex/contexts.json`.
+- `src/session-registry.ts`: persist and restore per-context launch selection in `.telecode/contexts.json`.
 - `src/bot.ts`: add `/launch` command, picker and confirmation callbacks, stale-callback handling, and launch info in `/start`, `/session`, and `/new`.
 - `src/bot-ui.ts`: add `/launch` to help output and update welcome copy if command totals or sections need adjustment.
 - `src/index.ts`: log default launch profile at startup and warn when the default is unsafe.

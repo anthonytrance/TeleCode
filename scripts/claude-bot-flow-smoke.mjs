@@ -220,7 +220,7 @@ function findModelCommandResult(sent, startIndex) {
 }
 
 function assertPidRegistryEmpty(workspace, label) {
-  const registryPath = path.join(workspace, ".telecodex", "provider-state", "claude-pids.json");
+  const registryPath = path.join(workspace, ".telecode", "provider-state", "claude-pids.json");
   if (!existsSync(registryPath)) {
     return;
   }

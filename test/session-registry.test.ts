@@ -276,7 +276,7 @@ describe("SessionRegistry", () => {
   });
 
   it("restores distinct per-context workspace, model, reasoning effort, and thread ids", async () => {
-    const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");
+    const persistPath = path.join("/workspace/base", ".telecode", "contexts.json");
     mockFsState.files.set(
       persistPath,
       JSON.stringify([
@@ -347,7 +347,7 @@ describe("SessionRegistry", () => {
   });
 
   it("loads persisted context metadata with a leading UTF-8 BOM", async () => {
-    const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");
+    const persistPath = path.join("/workspace/base", ".telecode", "contexts.json");
     mockFsState.files.set(
       persistPath,
       `\uFEFF${JSON.stringify([
@@ -376,7 +376,7 @@ describe("SessionRegistry", () => {
 
   it("falls back to the default launch profile when persisted metadata references a missing profile", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const persistPath = path.join("/workspace/base", ".telecodex", "contexts.json");
+    const persistPath = path.join("/workspace/base", ".telecode", "contexts.json");
     mockFsState.files.set(
       persistPath,
       JSON.stringify([
@@ -512,7 +512,7 @@ describe("SessionRegistry", () => {
 
   it("persists metadata and reloads it in a new registry", async () => {
     const config = createConfig();
-    const persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    const persistPath = path.join(config.workspace, ".telecode", "contexts.json");
     const registry = new SessionRegistry(config);
     const session = (await registry.getOrCreate("123")) as any;
 
@@ -549,7 +549,7 @@ describe("SessionRegistry", () => {
 
   it("persists the selected model and applies it to new contexts", async () => {
     const config = createConfig();
-    const preferencesPath = path.join(config.workspace, ".telecodex", "preferences.json");
+    const preferencesPath = path.join(config.workspace, ".telecode", "preferences.json");
     const registry = new SessionRegistry(config);
 
     registry.setDefaultModel("gpt-5.6-terra");

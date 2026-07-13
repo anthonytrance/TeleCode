@@ -99,25 +99,25 @@ describe("buildFileInstructions", () => {
       {
         originalName: "log.txt",
         safeName: "log.txt",
-        localPath: "/workspace/.telecodex/inbox/t1/log.txt",
+        localPath: "/workspace/.telecode/inbox/t1/log.txt",
         mimeType: "text/plain",
         sizeBytes: 1234,
       },
     ];
 
-    const result = buildFileInstructions(files, "/workspace/.telecodex/turns/t1/out");
+    const result = buildFileInstructions(files, "/workspace/.telecode/turns/t1/out");
 
     expect(result).toContain("log.txt");
     expect(result).toContain("text/plain");
-    expect(result).toContain("/workspace/.telecodex/turns/t1/out");
+    expect(result).toContain("/workspace/.telecode/turns/t1/out");
     expect(result).toContain("staged on disk");
   });
 });
 
 describe("inboxPath / outboxPath", () => {
   it("returns deterministic paths", () => {
-    expect(inboxPath("/workspace", "turn-1")).toBe(path.join("/workspace", ".telecodex", "inbox", "turn-1"));
-    expect(outboxPath("/workspace", "turn-1")).toBe(path.join("/workspace", ".telecodex", "turns", "turn-1", "out"));
+    expect(inboxPath("/workspace", "turn-1")).toBe(path.join("/workspace", ".telecode", "inbox", "turn-1"));
+    expect(outboxPath("/workspace", "turn-1")).toBe(path.join("/workspace", ".telecode", "turns", "turn-1", "out"));
   });
 });
 

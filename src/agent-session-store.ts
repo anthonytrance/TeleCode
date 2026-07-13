@@ -14,7 +14,7 @@ export function createEmptyAgentSessionState(): PersistedAgentSessionState {
 }
 
 export function agentSessionStatePath(workspace: string): string {
-  return path.join(workspace, ".telecodex", "agent-sessions.json");
+  return path.join(workspace, ".telecode", "agent-sessions.json");
 }
 
 export class JsonAgentSessionStore {

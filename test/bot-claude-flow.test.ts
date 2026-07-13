@@ -305,7 +305,7 @@ describe("Claude bot flow", () => {
   });
 
   it("repairs a stale Claude session index from authoritative provider state on startup", async () => {
-    const stateDir = path.join(tempDir, ".telecodex");
+    const stateDir = path.join(tempDir, ".telecode");
     const providerStateDir = path.join(stateDir, "provider-state");
     mkdirSync(providerStateDir, { recursive: true });
     writeFileSync(path.join(providerStateDir, "claude.json"), `${JSON.stringify({
@@ -378,7 +378,7 @@ describe("Claude bot flow", () => {
   });
 
   it("honors a persisted SDK backend when creating the Claude runtime", async () => {
-    const providerStateDir = path.join(tempDir, ".telecodex", "provider-state");
+    const providerStateDir = path.join(tempDir, ".telecode", "provider-state");
     mkdirSync(providerStateDir, { recursive: true });
     writeFileSync(path.join(providerStateDir, "claude-backend.json"), `${JSON.stringify({
       version: 1,
@@ -609,7 +609,7 @@ describe("Claude bot flow", () => {
 
   it("does not resume a persisted Claude session with stale permission mode", async () => {
     const staleSessionId = "11111111-1111-4111-8111-111111111111";
-    const providerStateDir = path.join(tempDir, ".telecodex", "provider-state");
+    const providerStateDir = path.join(tempDir, ".telecode", "provider-state");
     const transcriptDir = path.join(tempDir, ".claude-config", "projects", "project");
     mkdirSync(providerStateDir, { recursive: true });
     mkdirSync(transcriptDir, { recursive: true });

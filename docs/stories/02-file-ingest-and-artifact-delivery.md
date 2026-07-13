@@ -22,14 +22,14 @@ OpenAI constraint to respect:
 - Stage inbound files into a deterministic per-turn workspace folder, for example:
 
 ```text
-<workspace>/.telecodex/inbox/<turn-id>/
+<workspace>/.telecode/inbox/<turn-id>/
 ```
 
 - For images, continue using `local_image` input. For all other files, prepend a structured text note telling Codex where the files were staged and what Telegram metadata was received.
 - Add an artifact collection convention so Codex can write files to:
 
 ```text
-<workspace>/.telecodex/turns/<turn-id>/out/
+<workspace>/.telecode/turns/<turn-id>/out/
 ```
 
 - After the turn completes, upload produced files back to Telegram with a short summary.
