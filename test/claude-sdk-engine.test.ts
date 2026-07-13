@@ -160,6 +160,69 @@ describe("claude sdk engine", () => {
     expect(events.some((event) => event.type === "assistant_message_complete")).toBe(true);
   });
 
+  it("retries an empty successful result once and resumes the real session id", async () => {
+    const calls: Array<{
+      prompt: string | AsyncIterable<SdkUserMessageLike>;
+      options: Record<string, unknown>;
+    }> = [];
+    const queryFn = (input: {
+      prompt: string | AsyncIterable<SdkUserMessageLike>;
+      options: Record<string, unknown>;
+    }) => {
+      calls.push(input);
+      const callNumber = calls.length;
+      return (async function* () {
+        yield { type: "system", subtype: "init", session_id: "real-resumed-session" } satisfies SdkMessageLike;
+        if (callNumber === 1) {
+          yield { type: "result", subtype: "success", result: "", usage: {} } satisfies SdkMessageLike;
+          return;
+        }
+        yield {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "Recovered answer" }] },
+        } satisfies SdkMessageLike;
+        yield { type: "result", subtype: "success", result: "Recovered answer", usage: {} } satisfies SdkMessageLike;
+      })();
+    };
+
+    const events = await collect(runClaudeSdkTurn({
+      ...baseOptions,
+      resume: "old-session",
+      inputController: new ClaudeSdkInputController(baseOptions.promptText),
+      queryFn,
+    }));
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.options.resume).toBe("real-resumed-session");
+    expect(calls[1]?.prompt).toEqual(expect.stringContaining("previous turn ended successfully"));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "status_message",
+      text: expect.stringContaining("Retrying once"),
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "assistant_message_complete",
+      text: "Recovered answer",
+    }));
+  });
+
+  it("reports an error instead of an empty completion when both attempts are empty", async () => {
+    const queryFn = () => (async function* () {
+      yield { type: "system", subtype: "init", session_id: "s" } satisfies SdkMessageLike;
+      yield { type: "result", subtype: "success", result: "", usage: {} } satisfies SdkMessageLike;
+    })();
+
+    const events = await collect(runClaudeSdkTurn({ ...baseOptions, queryFn }));
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "error",
+      message: expect.stringContaining("without assistant text twice"),
+    }));
+    expect(events).not.toContainEqual(expect.objectContaining({
+      type: "assistant_message_complete",
+      text: "",
+    }));
+  });
+
   it("maps a non-success result to an error event", async () => {
     const { queryFn } = fakeQuery([
       { type: "system", subtype: "init", session_id: "s" },

@@ -124,7 +124,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   const queryFn = options.queryFn ?? (await loadSdkQuery());
   const { sessionId, jobId } = options;
 
-  const sdkOptions: Record<string, unknown> = {
+  const baseSdkOptions: Record<string, unknown> = {
     cwd: options.cwd,
     model: options.model,
     permissionMode: options.permissionMode,
@@ -145,96 +145,141 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   };
 
   let lastModel: string | undefined;
-  let sawResult = false;
+  let activeProviderSessionId = options.resume;
   const inputController = options.inputController;
-  const query = queryFn({ prompt: inputController ?? options.promptText, options: sdkOptions });
 
   try {
-    for await (const message of query) {
-      if (message.type === "system" && message.subtype === "init") {
-        if (message.session_id) {
-          options.onProviderSessionId?.(message.session_id);
-        }
-        continue;
-      }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const retryPrompt = attempt === 0
+        ? options.promptText
+        : "The previous turn ended successfully but produced no written response. Answer the user's most recent request now. Do not repeat completed tool actions; summarize them if any occurred.";
+      const sdkOptions = {
+        ...baseSdkOptions,
+        ...(activeProviderSessionId ? { resume: activeProviderSessionId } : {}),
+        ...(attempt > 0 ? { forkSession: false } : {}),
+      };
+      const query = queryFn({
+        prompt: attempt === 0 && inputController ? inputController : retryPrompt,
+        options: sdkOptions,
+      });
+      let sawResult = false;
+      let sawAssistantText = false;
+      let retryEmptySuccess = false;
 
-      if (message.type === "assistant") {
-        const model = message.message?.model;
-        if (model && model !== "<synthetic>" && model !== lastModel) {
-          lastModel = model;
-          yield { type: "model_updated", sessionId, jobId, model };
-        }
-        for (const block of message.message?.content ?? []) {
-          const blockType = typeof block.type === "string" ? block.type : "";
-          if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
-            yield { type: "assistant_text_delta", sessionId, jobId, text: block.text };
-          } else if (blockType === "tool_use") {
-            yield {
-              type: "tool_started",
-              sessionId,
-              jobId,
-              toolName: typeof block.name === "string" && block.name ? block.name : "tool",
-              text: summarizeSdkToolInput(block.input),
-            };
-          }
-        }
-        continue;
-      }
-
-      if (message.type === "user") {
-        for (const block of message.message?.content ?? []) {
-          if (block.type !== "tool_result") {
+      try {
+        for await (const message of query) {
+          if (message.type === "system" && message.subtype === "init") {
+            if (message.session_id) {
+              activeProviderSessionId = message.session_id;
+              options.onProviderSessionId?.(message.session_id);
+            }
             continue;
           }
-          yield {
-            type: block.is_error === true ? "tool_failed" : "tool_completed",
-            sessionId,
-            jobId,
-            toolName: "tool",
-          };
+
+          if (message.type === "assistant") {
+            const model = message.message?.model;
+            if (model && model !== "<synthetic>" && model !== lastModel) {
+              lastModel = model;
+              yield { type: "model_updated", sessionId, jobId, model };
+            }
+            for (const block of message.message?.content ?? []) {
+              const blockType = typeof block.type === "string" ? block.type : "";
+              if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
+                sawAssistantText = true;
+                yield { type: "assistant_text_delta", sessionId, jobId, text: block.text };
+              } else if (blockType === "tool_use") {
+                yield {
+                  type: "tool_started",
+                  sessionId,
+                  jobId,
+                  toolName: typeof block.name === "string" && block.name ? block.name : "tool",
+                  text: summarizeSdkToolInput(block.input),
+                };
+              }
+            }
+            continue;
+          }
+
+          if (message.type === "user") {
+            for (const block of message.message?.content ?? []) {
+              if (block.type !== "tool_result") {
+                continue;
+              }
+              yield {
+                type: block.is_error === true ? "tool_failed" : "tool_completed",
+                sessionId,
+                jobId,
+                toolName: "tool",
+              };
+            }
+            continue;
+          }
+
+          if (message.type === "result") {
+            sawResult = true;
+            const usage = message.usage ?? {};
+            const inputTokens = asNumber(usage.input_tokens) ?? 0;
+            const cachedInputTokens = (asNumber(usage.cache_read_input_tokens) ?? 0) +
+              (asNumber(usage.cache_creation_input_tokens) ?? 0);
+            const outputTokens = asNumber(usage.output_tokens) ?? 0;
+            yield { type: "usage_updated", sessionId, jobId, inputTokens, cachedInputTokens, outputTokens };
+
+            if (message.subtype === "success") {
+              const resultText = (message.result ?? "").trim();
+              if (resultText || sawAssistantText) {
+                yield {
+                  type: "assistant_message_complete",
+                  sessionId,
+                  jobId,
+                  text: resultText,
+                };
+              } else if (attempt === 0) {
+                retryEmptySuccess = true;
+                bridgeLog("retry", `sdk turn returned empty success; retrying session=${activeProviderSessionId ?? sessionId}`);
+                yield {
+                  type: "status_message",
+                  sessionId,
+                  jobId,
+                  text: "Claude returned no written response. Retrying once automatically.",
+                };
+              } else {
+                yield {
+                  type: "error",
+                  sessionId,
+                  jobId,
+                  message: "Claude SDK returned a successful result without assistant text twice.",
+                };
+              }
+            } else {
+              const detail = message.result?.trim() || describeSdkErrors(message.errors) || message.subtype || "unknown error";
+              bridgeLog("error", `sdk turn result ${message.subtype ?? "?"}: ${detail}`);
+              yield { type: "error", sessionId, jobId, message: `Claude SDK turn ended: ${detail}` };
+            }
+            break;
+          }
+
+          // rate_limit_event, status, hook events, partial messages, etc. - not part
+          // of the provider event contract; ignored deliberately.
         }
-        continue;
+      } finally {
+        query.close?.();
       }
 
-      if (message.type === "result") {
-        sawResult = true;
-        const usage = message.usage ?? {};
-        const inputTokens = asNumber(usage.input_tokens) ?? 0;
-        const cachedInputTokens = (asNumber(usage.cache_read_input_tokens) ?? 0) +
-          (asNumber(usage.cache_creation_input_tokens) ?? 0);
-        const outputTokens = asNumber(usage.output_tokens) ?? 0;
-        yield { type: "usage_updated", sessionId, jobId, inputTokens, cachedInputTokens, outputTokens };
-
-        if (message.subtype === "success") {
-          yield {
-            type: "assistant_message_complete",
-            sessionId,
-            jobId,
-            text: (message.result ?? "").trim(),
-          };
-        } else {
-          const detail = message.result?.trim() || describeSdkErrors(message.errors) || message.subtype || "unknown error";
-          bridgeLog("error", `sdk turn result ${message.subtype ?? "?"}: ${detail}`);
-          yield { type: "error", sessionId, jobId, message: `Claude SDK turn ended: ${detail}` };
-        }
-        break;
+      if (!sawResult) {
+        yield {
+          type: "error",
+          sessionId,
+          jobId,
+          message: "Claude SDK stream ended without a result message (aborted or crashed).",
+        };
+        return;
       }
-
-      // rate_limit_event, status, hook events, partial messages, etc. - not part
-      // of the provider event contract; ignored deliberately.
+      if (!retryEmptySuccess) {
+        return;
+      }
     }
   } finally {
     inputController?.close();
-    query.close?.();
-  }
-
-  if (!sawResult) {
-    yield {
-      type: "error",
-      sessionId,
-      jobId,
-      message: "Claude SDK stream ended without a result message (aborted or crashed).",
-    };
   }
 }
 

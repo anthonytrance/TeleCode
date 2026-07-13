@@ -3556,10 +3556,28 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   ): ProviderSessionPick[] => {
     const selectedSessionId = agentSessions.getLane(contextKey)?.selectedSessionId;
     const picksByKey = new Map<string, ProviderSessionPick>();
+    const claudeTranscripts = config.enableClaudeProvider
+      ? listClaudeTranscriptSessions(MAX_PROVIDER_SESSION_LIST_LIMIT)
+      : [];
+    const claudeTranscriptsBySessionId = new Map(
+      claudeTranscripts.map((transcript) => [transcript.sessionId, transcript]),
+    );
+    let repairedClaudeTitle = false;
 
     for (const session of agentSessions.listLaneSessions(contextKey)) {
-      const pick = providerSessionPickFromAgentSession(session);
+      let sessionForPick = session;
+      if (session.provider === "claude" && session.providerSessionId) {
+        const transcript = claudeTranscriptsBySessionId.get(session.providerSessionId);
+        if (transcript && shouldPreferClaudeTranscriptTitle(session.displayName, transcript.title)) {
+          sessionForPick = agentSessions.updateDisplayName(session.id, transcript.title);
+          repairedClaudeTitle = true;
+        }
+      }
+      const pick = providerSessionPickFromAgentSession(sessionForPick);
       picksByKey.set(providerSessionPickKey(pick), pick);
+    }
+    if (repairedClaudeTitle) {
+      persistAgentSessionState();
     }
 
     for (const thread of listThreads(MAX_PROVIDER_SESSION_LIST_LIMIT)) {
@@ -3570,7 +3588,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
 
     if (config.enableClaudeProvider) {
-      for (const transcript of listClaudeTranscriptSessions(MAX_PROVIDER_SESSION_LIST_LIMIT)) {
+      for (const transcript of claudeTranscripts) {
         const pick = providerSessionPickFromClaudeTranscript(transcript, {
           model: config.claudeDefaultModel,
           permissionMode: config.claudePermissionMode,
@@ -8510,8 +8528,9 @@ function formatProviderDisplayName(provider: AgentProviderKind): string {
   }
 }
 
-function provisionalClaudeTitle(promptText: string): string {
-  return trimLine(cleanProviderSessionTitle(promptText), 160);
+export function provisionalClaudeTitle(promptText: string): string {
+  const cleaned = cleanProviderSessionTitle(promptText);
+  return isUsefulClaudeSessionTitle(cleaned) ? trimLine(cleaned, 160) : "";
 }
 
 function isGenericClaudeDisplayName(displayName: string | undefined, contextKey: TelegramContextKey): boolean {
@@ -8608,8 +8627,9 @@ function readClaudeTranscriptSummary(file: { path: string; sessionId: string; up
     }
 
     if (!title && entry.type === "user") {
-      const candidate = cleanProviderSessionTitle(extractClaudeUserText(entry));
-      if (candidate && !isClaudeTranscriptCaveat(candidate)) {
+      const rawCandidate = extractClaudeUserText(entry);
+      const candidate = cleanProviderSessionTitle(rawCandidate);
+      if (isUsefulClaudeSessionTitle(candidate, rawCandidate)) {
         title = candidate;
       }
     }
@@ -8652,9 +8672,36 @@ function extractClaudeUserText(entry: Record<string, unknown>): string {
     .join(" ");
 }
 
-function isClaudeTranscriptCaveat(text: string): boolean {
+export function isUsefulClaudeSessionTitle(text: string, rawText = text): boolean {
   const lower = text.toLowerCase();
-  return lower.includes("local-command-caveat") || lower.includes("do not respond to these messages");
+  const rawLower = rawText.toLowerCase();
+  if (!text || text === "(untitled)" || text.startsWith("/")) {
+    return false;
+  }
+  if (
+    rawLower.includes("local-command-caveat") ||
+    rawLower.includes("do not respond to these messages") ||
+    rawLower.includes("command-name") ||
+    rawLower.includes("local-command-stdout") ||
+    rawLower.includes("task-notification") ||
+    lower.startsWith("base directory for this skill:")
+  ) {
+    return false;
+  }
+  if (/^\d+$/u.test(text)) {
+    return false;
+  }
+  return !/^(?:hi|hello|hey|yes|no|ok|okay|continue|go ahead)[.!?]*$/iu.test(text);
+}
+
+function shouldPreferClaudeTranscriptTitle(current: string | undefined, transcriptTitle: string): boolean {
+  if (!isUsefulClaudeSessionTitle(transcriptTitle)) {
+    return false;
+  }
+  const cleanedCurrent = cleanProviderSessionTitle(current || "");
+  return !isUsefulClaudeSessionTitle(cleanedCurrent) ||
+    cleanedCurrent.toLowerCase() === "claude code" ||
+    cleanedCurrent.toLowerCase().startsWith("telecode ");
 }
 
 function cleanProviderSessionTitle(title: string): string {
