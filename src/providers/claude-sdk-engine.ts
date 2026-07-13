@@ -30,13 +30,16 @@ export interface ClaudeSdkTurnOptions {
   abortController?: AbortController;
   /** Called as soon as the init message reveals the real Claude session id. */
   onProviderSessionId?: (providerSessionId: string) => void;
-  /** Optional streaming input controller. When present, promptText is sent as the first user message. */
+  /** Optional controller for live steering after promptText starts the turn. */
   inputController?: ClaudeSdkInputController;
   /** Injectable for tests; defaults to the real SDK query(). */
   queryFn?: (input: {
     prompt: string | AsyncIterable<SdkUserMessageLike>;
     options: Record<string, unknown>;
-  }) => AsyncIterable<SdkMessageLike> & { close?: () => void };
+  }) => AsyncIterable<SdkMessageLike> & {
+    close?: () => void;
+    streamInput?: (stream: AsyncIterable<SdkUserMessageLike>) => Promise<void>;
+  };
 }
 
 /** Structural view of the SDK messages this engine consumes. */
@@ -70,10 +73,6 @@ export class ClaudeSdkInputController implements AsyncIterable<SdkUserMessageLik
   private readonly queue: SdkUserMessageLike[] = [];
   private readonly waiters: Array<(result: IteratorResult<SdkUserMessageLike>) => void> = [];
   private closed = false;
-
-  constructor(initialText: string) {
-    this.push(initialText);
-  }
 
   push(text: string, priority: SdkUserMessageLike["priority"] = "now"): void {
     const trimmed = text.trim();
@@ -158,10 +157,16 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         ...(activeProviderSessionId ? { resume: activeProviderSessionId } : {}),
         ...(attempt > 0 ? { forkSession: false } : {}),
       };
-      const query = queryFn({
-        prompt: attempt === 0 && inputController ? inputController : retryPrompt,
-        options: sdkOptions,
-      });
+      // Always send the turn's initial request as the primary SDK prompt. Using the
+      // AsyncIterable as the primary prompt can let a pending task notification finish
+      // the resumed query before the queued user message is consumed. Reserve the
+      // streaming input channel for genuine mid-turn steering instead.
+      const query = queryFn({ prompt: retryPrompt, options: sdkOptions });
+      const steerStream = attempt === 0 && inputController && query.streamInput
+        ? query.streamInput(inputController).catch((error: unknown) => {
+            bridgeLog("error", `sdk live input stream failed: ${error instanceof Error ? error.message : String(error)}`);
+          })
+        : undefined;
       let sawResult = false;
       let sawAssistantText = false;
       let retryEmptySuccess = false;
@@ -236,12 +241,6 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
               } else if (attempt === 0) {
                 retryEmptySuccess = true;
                 bridgeLog("retry", `sdk turn returned empty success; retrying session=${activeProviderSessionId ?? sessionId}`);
-                yield {
-                  type: "status_message",
-                  sessionId,
-                  jobId,
-                  text: "Claude returned no written response. Retrying once automatically.",
-                };
               } else {
                 yield {
                   type: "error",
@@ -262,7 +261,11 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
           // of the provider event contract; ignored deliberately.
         }
       } finally {
+        if (attempt === 0) {
+          inputController?.close();
+        }
         query.close?.();
+        await steerStream;
       }
 
       if (!sawResult) {

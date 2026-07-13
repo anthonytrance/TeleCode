@@ -449,7 +449,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
 
     const abortController = new AbortController();
-    const inputController = new ClaudeSdkInputController(promptText);
+    const inputController = new ClaudeSdkInputController();
     runtime.sdkAbortController = abortController;
     runtime.sdkInputController = inputController;
     let partialText = "";
