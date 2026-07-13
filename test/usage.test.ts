@@ -51,15 +51,9 @@ describe("usage rendering", () => {
     expect(text).toContain("fresh OpenAI account/rateLimits/read request");
   });
 
-  it("flags a live response that drops a recently observed five-hour window", () => {
+  it("treats an omitted five-hour window as the current OpenAI limit shape", () => {
     const snapshot = mergeLiveAppServerRateLimits({
       sessionFile: "session.jsonl",
-      lastKnownFiveHour: {
-        used_percent: 100,
-        window_minutes: 300,
-        resets_at: 1783884960,
-        observed_at: "2026-07-12T16:13:04.215Z",
-      },
     }, {
       rateLimits: {
         limitId: "codex",
@@ -78,10 +72,10 @@ describe("usage rendering", () => {
     });
 
     const text = renderUsagePlain(snapshot);
-    expect(text).toContain("5-hour limit: unavailable, OpenAI omitted this window");
-    expect(text).toContain("Last 5-hour report (stale): 100.0% used");
+    expect(text).toContain("5-hour limit: not currently reported by OpenAI");
     expect(text).toContain("Weekly limit: 19.0% used");
-    expect(text).toContain("live response is incomplete");
+    expect(text).not.toContain("stale");
+    expect(text).not.toContain("incomplete");
   });
 
   it("classifies both provided windows by their reported duration", () => {
