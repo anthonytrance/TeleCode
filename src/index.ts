@@ -14,7 +14,7 @@ try {
   if (config.enableClaudeProvider) {
     const cleanedClaudeProcesses = await cleanupRegisteredClaudeProcesses(config.workspace);
     if (cleanedClaudeProcesses > 0) {
-      console.warn(`Cleaned up ${cleanedClaudeProcesses} stale TeleCodex Claude process(es).`);
+      console.warn(`Cleaned up ${cleanedClaudeProcesses} stale TeleCode Claude process(es).`);
     }
   }
   const pollingSafety = assertTelegramPollingSafety({ token: config.telegramBotToken });
@@ -22,7 +22,7 @@ try {
   bot = createBot(config, registry);
   await registerCommands(bot);
 
-  console.log("TeleCodex running");
+  console.log("TeleCode running");
   console.log(
     `Telegram polling profile: role=${pollingSafety.tokenRole}, canary=${pollingSafety.canaryMode}, token=${pollingSafety.tokenFingerprint}`,
   );
@@ -50,13 +50,13 @@ try {
   if (competingClaudeProcesses.length > 0) {
     console.warn(
       `Notice: found ${competingClaudeProcesses.length} Claude Telegram plugin process(es). ` +
-        "This is fine if they use a different bot token than TeleCodex; sharing a token would cause polling conflicts.",
+        "This is fine if they use a different bot token than TeleCode; sharing a token would cause polling conflicts.",
     );
     console.warn("Use /doctor for Claude plugin process details.");
   }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
-  console.error(`Failed to start TeleCodex: ${message}`);
+  console.error(`Failed to start TeleCode: ${message}`);
   await bot?.disposeProviders().catch((disposeError) => {
     console.warn("Failed to dispose provider sessions during startup failure", disposeError);
   });
@@ -71,7 +71,7 @@ const shutdown = (signal: NodeJS.Signals) => {
   }
   shuttingDown = true;
 
-  console.log(`Received ${signal}, shutting down TeleCodex...`);
+  console.log(`Received ${signal}, shutting down TeleCode...`);
   if (bot) bot.stop();
 
   setTimeout(() => {
@@ -82,7 +82,7 @@ const shutdown = (signal: NodeJS.Signals) => {
         console.warn("Failed to dispose provider sessions during shutdown", error);
       }
       registry?.disposeAll();
-      console.log("TeleCodex stopped.");
+      console.log("TeleCode stopped.");
       process.exit(0);
     })();
   }, 500);

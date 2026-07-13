@@ -43,7 +43,7 @@ describe("sanitizeFilename", () => {
 });
 
 describe("stageFile", () => {
-  const testDir = path.join(tmpdir(), `telecodex-test-${randomUUID()}`);
+  const testDir = path.join(tmpdir(), `telecode-test-${randomUUID()}`);
 
   afterEach(async () => {
     await rm(testDir, { recursive: true, force: true }).catch(() => {});
@@ -123,7 +123,7 @@ describe("inboxPath / outboxPath", () => {
 
 describe("cleanupInbox", () => {
   it("removes the inbox directory without throwing", async () => {
-    const dir = path.join(tmpdir(), `telecodex-cleanup-${randomUUID()}`);
+    const dir = path.join(tmpdir(), `telecode-cleanup-${randomUUID()}`);
     const inDir = inboxPath(dir, "turn-clean");
 
     mkdirSync(inDir, { recursive: true });
@@ -135,7 +135,7 @@ describe("cleanupInbox", () => {
   });
 
   it("does not throw when the directory does not exist", async () => {
-    const dir = path.join(tmpdir(), `telecodex-missing-${randomUUID()}`);
+    const dir = path.join(tmpdir(), `telecode-missing-${randomUUID()}`);
 
     await expect(cleanupInbox(dir, "turn-x")).resolves.toBeUndefined();
   });

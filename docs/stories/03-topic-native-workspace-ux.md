@@ -1,6 +1,6 @@
 # Story 03: Topic-Native Workspace UX
 
-Once story 01 exists, TeleCodex needs a Telegram UX that treats topics and chats as real workspaces rather than as one shared session with manual switching. This story upgrades the user experience so Telegram topics become the primary way to organize tasks, while private chat remains a clean single-stream fallback.
+Once story 01 exists, TeleCode needs a Telegram UX that treats topics and chats as real workspaces rather than as one shared session with manual switching. This story upgrades the user experience so Telegram topics become the primary way to organize tasks, while private chat remains a clean single-stream fallback.
 
 ## Architecture Context And Reuse Guidance
 
@@ -9,10 +9,10 @@ This story builds on story 01. Do not attempt it on top of the current singleton
 Patterns to borrow:
 
 - `Ev3rlasting/tg-codex`: topic maps to thread, with explicit `/attach`-style control.
-- `Headcrab/telecodex`: context-aware commands and environment import UX.
+- `Headcrab/telecode`: context-aware commands and environment import UX.
 - `yschaub/codex-telegram`: project-aware session routing and persistent per-project behavior.
 
-TeleCodex should remain simpler than those products. Focus on the minimum UX needed to make many tasks manageable.
+TeleCode should remain simpler than those products. Focus on the minimum UX needed to make many tasks manageable.
 
 ## Proposed Changes And Architecture Improvements
 

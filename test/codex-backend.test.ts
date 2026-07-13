@@ -1,7 +1,7 @@
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
-import type { TeleCodexConfig } from "../src/config.js";
+import type { TeleCodeConfig } from "../src/config.js";
 
 const mockState = vi.hoisted(() => ({
   sdkCreate: vi.fn(),
@@ -49,7 +49,7 @@ describe("createCodexSession", () => {
   });
 });
 
-function createConfig(overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig {
+function createConfig(overrides: Partial<TeleCodeConfig> = {}): TeleCodeConfig {
   return {
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],

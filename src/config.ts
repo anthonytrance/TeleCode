@@ -20,7 +20,7 @@ export type CodexBackend = "sdk" | "app-server";
 export type ClaudePermissionMode = "default" | "acceptEdits" | "plan" | "bypassPermissions";
 export type ClaudeLargeSessionResumePolicy = "summary" | "full" | "manual";
 
-export interface TeleCodexConfig {
+export interface TeleCodeConfig {
   telegramBotToken: string;
   telegramAllowedUserIds: number[];
   telegramAllowedUserIdSet: Set<number>;
@@ -55,7 +55,7 @@ export interface TeleCodexConfig {
   claudeBackend: "pty" | "sdk";
 }
 
-export function loadConfig(): TeleCodexConfig {
+export function loadConfig(): TeleCodeConfig {
   loadEnvFile(path.resolve(process.cwd(), ".env"));
 
   const telegramBotToken = requireEnv("TELEGRAM_BOT_TOKEN");
@@ -93,7 +93,7 @@ export function loadConfig(): TeleCodexConfig {
   );
   const enableClaudeProvider = parseBooleanEnv(optionalString(process.env.ENABLE_CLAUDE_PROVIDER), false);
   const claudeBin = optionalString(process.env.CLAUDE_BIN) ?? "C:\\Users\\Anthony\\.local\\bin\\claude.exe";
-  // Isolated config dir for TeleCodex-spawned claude.exe. Pointing CLAUDE_CONFIG_DIR
+  // Isolated config dir for TeleCode-spawned claude.exe. Pointing CLAUDE_CONFIG_DIR
   // at a folder that does NOT contain the user-scoped telegram plugin keeps the child
   // from starting a competing getUpdates poller and 409ing the live Telegram bridge.
   const claudeConfigDir = path.resolve(

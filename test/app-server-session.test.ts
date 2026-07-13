@@ -7,7 +7,7 @@ import {
 } from "../src/app-server-session.js";
 import { DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS, type AppServerServerRequest, type JsonValue } from "../src/app-server.js";
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
-import type { TeleCodexConfig } from "../src/config.js";
+import type { TeleCodeConfig } from "../src/config.js";
 
 class FakeAppServerClient implements AppServerClientLike {
   readonly requests: Array<{ method: string; params: JsonValue | undefined; requestTimeoutMs?: number }> = [];
@@ -861,7 +861,7 @@ describe("AppServerSessionService", () => {
   });
 });
 
-function createConfig(overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig {
+function createConfig(overrides: Partial<TeleCodeConfig> = {}): TeleCodeConfig {
   return {
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],

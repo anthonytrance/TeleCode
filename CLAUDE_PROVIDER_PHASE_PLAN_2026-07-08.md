@@ -3,10 +3,10 @@
 Executor: OpenAI Codex CLI. Written by Claude (Fable 5) after live-failure forensics on 2026-07-07/08.
 Read this whole file before touching code. All paths are ABSOLUTE because Codex's cwd is `C:\Users\Anthony`, not the repo.
 
-Repo: `C:\Users\Anthony\codetest\tools\telecodex`
-Branch: `anthony/local-telecodex` — commit after every completed sub-step, push to remote `anthony` (github.com/anthonytrance/telecodex). Never commit to `origin`.
+Repo: `C:\Users\Anthony\codetest\tools\telecode`
+Historical branch: `anthony/local-telecodex`. Push current work to remote `anthony` (github.com/anthonytrance/TeleCode), never to upstream `origin`.
 Build/test: `npm run build` then `npm test` (vitest; 327 tests green at plan time, baseline commit `f475b40`).
-Design context: `C:\Users\Anthony\codetest\tools\telecodex\CLAUDE_PROVIDER_DESIGN.md` (Sections 2, 3, 3B, 6) and `C:\Users\Anthony\codetest\CLAUDE_PROVIDER_HANDOFF.md` (backend-neutral rule). This plan operationalizes them; where they conflict, this plan wins.
+Design context: `C:\Users\Anthony\codetest\tools\telecode\CLAUDE_PROVIDER_DESIGN.md` (Sections 2, 3, 3B, 6) and `C:\Users\Anthony\codetest\CLAUDE_PROVIDER_HANDOFF.md` (backend-neutral rule). This plan operationalizes them; where they conflict, this plan wins.
 
 ## Hard operational rules (violating these has bitten us before)
 
@@ -110,7 +110,7 @@ Goal: same provider surface, same commands, same session UX — different engine
   - Built-in slash commands as input (`/compact`, `/clear`, `/model`): verify which are accepted through SDK input (streaming input mode) vs must stay EMULATE/SURFACE in the registry; update the C2 registry overrides with the verified list.
   - `forkSession: true` alongside `resume` — the SDK-native session fork (needed for C5).
   - `includePartialMessages` — optional finer-grained streaming deltas; if stable, narration can stream even within one text block.
-  - Hooks (PreToolUse/PostToolUse) and `canUseTool` — not needed for TeleCodex V1 (bypassPermissions), just confirm availability for later.
+  - Hooks (PreToolUse/PostToolUse) and `canUseTool` — not needed for TeleCode V1 (bypassPermissions), just confirm availability for later.
   - Known interactive-ONLY features that will NOT work on the SDK backend and stay PTY/EMULATE: the TUI checkpoint/rewind system (`/rewind`), interactive pickers, `#` memory shortcut. Record the verified list in this file's Execution log.
 
 ### C1. Engine
@@ -124,7 +124,7 @@ New file `src/providers/claude-sdk-engine.ts`. It implements the SAME internal r
 
 ### C2. Backend switch — LIVE COMMAND, no restart (Anthony's requirement)
 
-- TeleCodex already has a per-context, persisted, restart-free backend switch for Codex: `bot.command("backend", ...)` at `src/bot.ts:4523` (`/backend sdk|appserver`). EXTEND that same command for the Claude provider instead of inventing a new one: when the lane's active provider is Claude, `/backend` shows the current Claude engine, and `/backend sdk` / `/backend pty` switches it. Per-context, persisted in the same state store the Codex backend choice uses, effective from the NEXT turn (dispose the lane's current PTY runtime lazily on switch so the next prompt starts on the new engine; never dispose mid-turn — if busy, reply "will switch when the current turn ends" and apply at turn end).
+- TeleCode already has a per-context, persisted, restart-free backend switch for Codex: `bot.command("backend", ...)` at `src/bot.ts:4523` (`/backend sdk|appserver`). EXTEND that same command for the Claude provider instead of inventing a new one: when the lane's active provider is Claude, `/backend` shows the current Claude engine, and `/backend sdk` / `/backend pty` switches it. Per-context, persisted in the same state store the Codex backend choice uses, effective from the NEXT turn (dispose the lane's current PTY runtime lazily on switch so the next prompt starts on the new engine; never dispose mid-turn — if busy, reply "will switch when the current turn ends" and apply at turn end).
 - `CLAUDE_BACKEND=pty|sdk` env var remains as the DEFAULT for contexts that never ran `/backend` (`src/config.ts` + `.env.example`). Register the command name in the Claude command registry as EMULATE so it is never typed into the PTY.
 - Session continuity across the switch: both engines speak the same session-id space (the SDK stores sessions in the same `~/.claude/projects` transcript format), so `resume` after a backend switch continues the SAME conversation. C3 must include a test/smoke step proving: turn on pty → `/backend sdk` → next turn resumes the same session, and back.
 - The adapter's Telegram-facing behavior (events, descriptors, reactions, queue from Phase A) is IDENTICAL on both engines — the A2 queue and A1 gate sit ABOVE the engine and apply to both.
@@ -180,7 +180,7 @@ Phase C exit: suite + both smokes green, committed, pushed, and a short summary 
 
 - 2026-07-08 Claude (Fable 5) continuation slice, commits 1d822cb..046af70:
   - Finished Codex's uncommitted quiet-warning work: idle transcript no longer errors/kills the turn; the tailer emits a periodic status warning instead. Per Anthony's accessibility feedback the warning is plain text instructing /stop (inline buttons removed, he does not use them).
-  - Fixed /sessions, /switch, /use while Claude is the active provider (they were intercepted by the Claude command filter and replied "not classified yet"); added them to TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE.
+  - Fixed /sessions, /switch, /use while Claude is the active provider (they were intercepted by the Claude command filter and replied "not classified yet"); added them to TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE.
   - C5 partial: Claude /resume now renders the unified session list when bare and selects via the unified machinery with an argument ("not implemented yet" removed). /fork and forkSession remain open for Phase C.
   - B2 DONE: narration content is never truncated in edit mode on either provider. Budgeted rolling message (3500 chars on HTML-escaped text), oldest blocks roll off whole, oversized blocks are delivered in full as their own chunked messages and the rolling message restarts below. trimProgressText removed; tool-line 120-char trim kept.
   - NEW Anthony-reported (2026-07-08): long inbound prompts were submitted mid-paste because ClaudePty.sendPrompt pressed Enter on a fixed delay. Now bracketed paste for >200 chars and Enter held until PTY output settles (length-scaled deadline). This also explains prior "prompt echo not found" turn kills.

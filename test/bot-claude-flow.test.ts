@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
-import type { TeleCodexConfig } from "../src/config.js";
+import type { TeleCodeConfig } from "../src/config.js";
 import { SessionRegistry } from "../src/session-registry.js";
 
 const mockClaude = vi.hoisted(() => {
@@ -17,6 +17,7 @@ const mockClaude = vi.hoisted(() => {
   const dispose = vi.fn();
   let createCount = 0;
   let activeModel = "sonnet";
+  let activeBackend = "pty";
   let promptGate: Promise<void> | undefined;
   let releasePromptGate: (() => void) | undefined;
   let nextEvents: Array<Record<string, unknown>> | undefined;
@@ -36,6 +37,10 @@ const mockClaude = vi.hoisted(() => {
       activeModel = model;
     },
     getActiveModel: () => activeModel,
+    setActiveBackend: (backend: string) => {
+      activeBackend = backend;
+    },
+    getActiveBackend: () => activeBackend,
     setNextEvents: (events: Array<Record<string, unknown>>) => {
       nextEvents = events;
     },
@@ -63,6 +68,7 @@ const mockClaude = vi.hoisted(() => {
       steers.length = 0;
       createCount = 0;
       activeModel = "sonnet";
+      activeBackend = "pty";
       releasePromptGate?.();
       promptGate = undefined;
       releasePromptGate = undefined;
@@ -106,6 +112,9 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
       if (typeof options.metadata?.model === "string") {
         mockClaude.setActiveModel(options.metadata.model);
       }
+      if (typeof options.metadata?.backend === "string") {
+        mockClaude.setActiveBackend(options.metadata.backend);
+      }
       const descriptor = {
         id: `claude-provider-${createCount}`,
         provider: "claude",
@@ -123,8 +132,20 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
     }
 
     async resumeSession(session: unknown) {
+      const backend = (session as { metadata?: { backend?: string } }).metadata?.backend;
+      if (backend) {
+        mockClaude.setActiveBackend(backend);
+      }
       mockClaude.resumeSession(session);
       return session;
+    }
+
+    getBackend() {
+      return mockClaude.getActiveBackend();
+    }
+
+    async setBackend(_sessionId: string, backend: string) {
+      mockClaude.setActiveBackend(backend);
     }
 
     async forkSession(sourceSessionId: string, displayName?: string) {
@@ -154,7 +175,11 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
         capabilities: this.capabilities,
         createdAt: 1000,
         updatedAt: 2000,
-        metadata: { model: mockClaude.getActiveModel(), permissionMode: "acceptEdits" },
+        metadata: {
+          model: mockClaude.getActiveModel(),
+          permissionMode: "acceptEdits",
+          backend: mockClaude.getActiveBackend(),
+        },
       };
       mockClaude.getSessionInfo();
       return descriptor;
@@ -252,7 +277,7 @@ describe("Claude bot flow", () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(path.join(tmpdir(), "telecodex-bot-claude-"));
+    tempDir = mkdtempSync(path.join(tmpdir(), "telecode-bot-claude-"));
     mockClaude.reset();
   });
 
@@ -279,6 +304,67 @@ describe("Claude bot flow", () => {
     expect(sent.map((entry) => entry.text)).toContain("mock reply to hello");
   });
 
+  it("repairs a stale Claude session index from authoritative provider state on startup", async () => {
+    const stateDir = path.join(tempDir, ".telecodex");
+    const providerStateDir = path.join(stateDir, "provider-state");
+    mkdirSync(providerStateDir, { recursive: true });
+    writeFileSync(path.join(providerStateDir, "claude.json"), `${JSON.stringify({
+      version: 1,
+      sessions: [{
+        telegramContextKey: "123",
+        sessionId: "live-session",
+        workspace: tempDir,
+        displayName: "Current Claude",
+        model: "claude-fable-5",
+        permissionMode: "acceptEdits",
+        transcriptPath: "C:\\transcripts\\live-session.jsonl",
+        createdAt: 100,
+        lastUsedAt: 300,
+      }],
+    }, null, 2)}\n`, "utf8");
+    writeFileSync(path.join(providerStateDir, "claude-backend.json"), `${JSON.stringify({
+      version: 1,
+      backends: { "123": "sdk" },
+    }, null, 2)}\n`, "utf8");
+    writeFileSync(path.join(stateDir, "agent-sessions.json"), `${JSON.stringify({
+      version: 1,
+      lanes: [{
+        laneKey: "123",
+        defaultProvider: "codex",
+        sessionIds: ["claude-current"],
+        deliveryMode: "buffer-background",
+        notifyOnBackgroundCompletion: true,
+        createdAt: 100,
+        updatedAt: 200,
+      }],
+      sessions: [{
+        id: "claude-current",
+        laneKey: "123",
+        provider: "claude",
+        workspace: tempDir,
+        displayName: "Current Claude",
+        providerSessionId: "stale-canary",
+        status: "completed",
+        createdAt: 100,
+        updatedAt: 200,
+        metadata: { model: "claude-opus-4-8", transcriptPath: "C:\\transcripts\\stale-canary.jsonl" },
+      }],
+      jobs: [],
+    }, null, 2)}\n`, "utf8");
+
+    await createTestBot(tempDir);
+
+    const repaired = JSON.parse(readFileSync(path.join(stateDir, "agent-sessions.json"), "utf8")) as {
+      sessions: Array<{ providerSessionId?: string; metadata?: Record<string, unknown> }>;
+    };
+    expect(repaired.sessions[0]?.providerSessionId).toBe("live-session");
+    expect(repaired.sessions[0]?.metadata).toMatchObject({
+      model: "claude-fable-5",
+      transcriptPath: "C:\\transcripts\\live-session.jsonl",
+      backend: "sdk",
+    });
+  });
+
   it("treats /claude with trailing text as an inline Claude prompt", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
@@ -289,6 +375,24 @@ describe("Claude bot flow", () => {
     expect(mockClaude.createSession).toHaveBeenCalledTimes(1);
     expect(mockClaude.prompts).toEqual(["say CANARY_OK only"]);
     expect(sent.map((entry) => entry.text)).toContain("mock reply to say CANARY_OK only");
+  });
+
+  it("honors a persisted SDK backend when creating the Claude runtime", async () => {
+    const providerStateDir = path.join(tempDir, ".telecodex", "provider-state");
+    mkdirSync(providerStateDir, { recursive: true });
+    writeFileSync(path.join(providerStateDir, "claude-backend.json"), `${JSON.stringify({
+      version: 1,
+      backends: { "123": "sdk" },
+    }, null, 2)}\n`, "utf8");
+    const { bot } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello through sdk"));
+    await waitFor(() => mockClaude.prompts.includes("hello through sdk"));
+
+    expect(mockClaude.createSession).toHaveBeenCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ backend: "sdk" }),
+    }));
+    expect(mockClaude.getActiveBackend()).toBe("sdk");
   });
 
   it("delivers the Claude final answer even if Claude is backgrounded before completion", async () => {
@@ -305,6 +409,70 @@ describe("Claude bot flow", () => {
     expect(sent.map((entry) => entry.text)).toContain(
       "Claude Code finished in background: long answer\n\nmock reply to long answer",
     );
+  });
+
+  it("keeps background commentary quiet, delivers the full final, and replays commentary only on command", async () => {
+    const { bot, sent, registry } = await createTestBot(tempDir);
+    const finalText = `FULL_FINAL ${"x".repeat(900)}`;
+    mockClaude.blockNextPrompt();
+    mockClaude.setNextEvents([
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "COMMENTARY_ONE" },
+      { type: "tool_failed", sessionId: "claude-provider-1", jobId: "job-1", toolName: "Read", text: "RECOVERED_FAILURE" },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "COMMENTARY_TWO" },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: finalText },
+      { type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "job-1", text: finalText },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude background buffers"));
+    await waitFor(() => mockClaude.prompts.includes("background buffers"));
+    registry.setActiveProvider("123", "codex");
+    mockClaude.releaseBlockedPrompt();
+
+    await waitFor(() => sent.some((entry) => entry.text?.includes("FULL_FINAL")));
+    const beforeReplay = sent.map((entry) => entry.text ?? "");
+    expect(beforeReplay.some((text) => text.includes("Claude Code finished in background: background buffers"))).toBe(true);
+    expect(beforeReplay.join("\n")).toContain(finalText);
+    expect(beforeReplay.join("\n")).not.toContain("COMMENTARY_ONE");
+    expect(beforeReplay.join("\n")).not.toContain("COMMENTARY_TWO");
+    expect(beforeReplay.join("\n")).not.toContain("RECOVERED_FAILURE");
+
+    await bot.handleUpdate(textUpdate(2, "/claude"));
+    await bot.handleUpdate(textUpdate(3, "/replay all"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("COMMENTARY_ONE")));
+
+    const replay = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Buffered Claude output"));
+    expect(replay.join("\n")).toContain("COMMENTARY_ONE");
+    expect(replay.join("\n")).toContain("COMMENTARY_TWO");
+    expect(replay.join("\n")).not.toContain("FULL_FINAL");
+    expect(replay.join("\n")).not.toContain("RECOVERED_FAILURE");
+  });
+
+  it("suppresses recoverable Claude tool failures at the default summary verbosity", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.setNextEvents([
+      { type: "tool_failed", sessionId: "claude-provider-1", jobId: "job-1", toolName: "Read", text: "temporary miss" },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "RECOVERED_FINAL" },
+      { type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "job-1", text: "RECOVERED_FINAL" },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude recover"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("RECOVERED_FINAL")));
+
+    expect(sent.map((entry) => entry.text ?? "").join("\n")).not.toContain("temporary miss");
+  });
+
+  it("shows Claude tool failures when errors-only verbosity is explicitly selected", async () => {
+    const { bot, sent } = await createTestBot(tempDir, { toolVerbosity: "errors-only" });
+    mockClaude.setNextEvents([
+      { type: "tool_failed", sessionId: "claude-provider-1", jobId: "job-1", toolName: "Read", text: "explicit failure" },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "FINAL_AFTER_FAILURE" },
+      { type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "job-1", text: "FINAL_AFTER_FAILURE" },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/claude show failures"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("FINAL_AFTER_FAILURE")));
+
+    expect(sent.map((entry) => entry.text)).toContain("Claude tool failed: Read: explicit failure");
   });
 
   it("delivers a timeout completion warning after prior Claude progress was flushed", async () => {
@@ -709,7 +877,7 @@ describe("Claude bot flow", () => {
   });
 });
 
-async function createTestBot(workspace: string, overrides: Partial<TeleCodexConfig> = {}) {
+async function createTestBot(workspace: string, overrides: Partial<TeleCodeConfig> = {}) {
   const config = { ...createConfig(workspace), ...overrides };
   const registry = new SessionRegistry(config);
   const bot = createBot(config, registry);
@@ -735,8 +903,8 @@ async function createTestBot(workspace: string, overrides: Partial<TeleCodexConf
   bot.botInfo = {
     id: 999,
     is_bot: true,
-    first_name: "TeleCodex",
-    username: "TeleCodexBot",
+    first_name: "TeleCode",
+    username: "TeleCodeBot",
     can_join_groups: true,
     can_read_all_group_messages: false,
     supports_inline_queries: false,
@@ -746,7 +914,7 @@ async function createTestBot(workspace: string, overrides: Partial<TeleCodexConf
   return { bot, sent, registry };
 }
 
-function createConfig(workspace: string): TeleCodexConfig {
+function createConfig(workspace: string): TeleCodeConfig {
   const launchProfile = createDefaultLaunchProfile("danger-full-access", "never");
   return {
     telegramBotToken: "123:abc",

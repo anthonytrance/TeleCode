@@ -38,7 +38,9 @@ describe("bot-ui", () => {
       expect(plain).toContain("/compact");
       expect(plain).toContain("/history");
       expect(plain).toContain("/clear");
+      expect(plain).toContain("/last");
       expect(plain).toContain("/copy");
+      expect(plain).toContain("/repeat");
     });
 
     it("returns valid HTML with bold tags", () => {
@@ -51,7 +53,7 @@ describe("bot-ui", () => {
   describe("renderWelcomeFirstTime", () => {
     it("shows welcome without auth warning", () => {
       const { html, plain } = renderWelcomeFirstTime();
-      expect(html).toContain("TeleCodex is ready");
+      expect(html).toContain("TeleCode is ready");
       expect(plain).toContain("/help");
       expect(html).not.toContain("⚠️");
     });
@@ -70,7 +72,7 @@ describe("bot-ui", () => {
         "Thread: abc123",
         false,
       );
-      expect(html).toContain("TeleCodex");
+      expect(html).toContain("TeleCode");
       expect(html).toContain("abc123");
       expect(plain).toContain("abc123");
     });
@@ -88,7 +90,7 @@ describe("bot-ui", () => {
   });
 
   describe("formatSessionLabel", () => {
-    it("strips TeleCodex output-file preamble from session labels", () => {
+    it("strips TeleCode output-file preamble from session labels", () => {
       const label = formatSessionLabel({
         workspace: "/project",
         title:
@@ -209,10 +211,10 @@ describe("bot-ui", () => {
             "Do not redo work unless asked. Reply only: Summary loaded.",
             "",
             "Current goal:",
-            "Continue TeleCodex app-server progress cleanup.",
+            "Continue TeleCode app-server progress cleanup.",
           ].join("\n"),
         ),
-      ).toBe("Continue TeleCodex app-server progress cleanup.");
+      ).toBe("Continue TeleCode app-server progress cleanup.");
     });
   });
 });

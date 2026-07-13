@@ -10,7 +10,7 @@ import { acquireClaudeLiveLock } from "./claude-live-lock.mjs";
 process.env.ENABLE_CLAUDE_PROVIDER = "true";
 
 const baseConfig = loadConfig();
-const tempWorkspace = mkdtempSync(path.join(tmpdir(), "telecodex-provider-claude-smoke-"));
+const tempWorkspace = mkdtempSync(path.join(tmpdir(), "telecode-provider-claude-smoke-"));
 const config = {
   ...baseConfig,
   workspace: tempWorkspace,
@@ -76,7 +76,7 @@ try {
   console.log("[claude-smoke] strictMcp:", config.claudeStrictMcpConfig);
 
   const descriptor = await adapter.createSession({
-    displayName: "TeleCodex provider smoke",
+    displayName: "TeleCode provider smoke",
     workspace: config.claudeWorkspace,
     metadata: {
       model: config.claudeDefaultModel,

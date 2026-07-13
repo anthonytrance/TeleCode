@@ -6,7 +6,7 @@ Last updated: 2026-07-01 02:24 Europe/Brussels.
 
 ## Goal
 
-Make Claude Code usable from TeleCodex with the same reliability expectations as Codex:
+Make Claude Code usable from TeleCode with the same reliability expectations as Codex:
 
 - predictable session discovery and titles
 - no stale Claude child processes
@@ -15,26 +15,26 @@ Make Claude Code usable from TeleCodex with the same reliability expectations as
 - useful foreground progress and background completion notices
 - repeatable local tests that do not require Anthony to manually drive Telegram
 
-This plan is scoped to TeleCodex first. Hermes reuse remains later work.
+This plan is scoped to TeleCode first. Hermes reuse remains later work.
 
 ## Current Green Baseline
 
 - Claude provider is enabled and uses interactive `claude.exe` through PTY.
-- TeleCodex strips inherited Claude/Codex harness environment variables before spawning Claude.
+- TeleCode strips inherited Claude/Codex harness environment variables before spawning Claude.
 - Transcript discovery uses known transcript growth, expected session IDs, and new transcript fallback.
 - Transcript discovery has a prompt-text recovery fallback for missed file-growth detection.
-- If Claude answers on screen but no transcript appears, TeleCodex captures a sanitized screen fallback or reports a screen tail instead of a bare "transcript was not created" error.
+- If Claude answers on screen but no transcript appears, TeleCode captures a sanitized screen fallback or reports a screen tail instead of a bare "transcript was not created" error.
 - Claude session titles update from transcript `ai-title`, with provisional prompt titles as fallback.
 - Codex session titles resolve from Codex thread state instead of showing UUIDs.
 - `/claude <prompt>` and `/claude`, then normal text, both route to Claude.
-- Claude final answers are delivered from `assistant_message_complete` as the authoritative full answer. If the user switches providers while Claude is working, TeleCodex sends the final answer directly with a background header instead of only buffering a notice.
+- Claude final answers are delivered from `assistant_message_complete` as the authoritative full answer. If the user switches providers while Claude is working, TeleCode sends the final answer directly with a background header instead of only buffering a notice.
 - Normal messages sent while Claude is busy are queued as the next Claude turn, replacing the previous queued Claude message.
-- `/steer` while Claude is busy is live steering now. PTY sessions type the instruction into the active Claude Code TUI; SDK sessions use streaming input mode and push a priority `now` user message into the active query. If the turn is still starting and no live input channel is available yet, TeleCodex falls back to queueing the steer as a Claude follow-up.
+- `/steer` while Claude is busy is live steering now. PTY sessions type the instruction into the active Claude Code TUI; SDK sessions use streaming input mode and push a priority `now` user message into the active query. If the turn is still starting and no live input channel is available yet, TeleCode falls back to queueing the steer as a Claude follow-up.
 - `/exit`, `/clear`, replacement, context removal, shutdown, and fatal polling cleanup dispose Claude PTYs.
-- TeleCodex-owned Claude PIDs are tracked and stale registered processes are cleaned on startup.
+- TeleCode-owned Claude PIDs are tracked and stale registered processes are cleaned on startup.
 - Startup safety ignores old `cmd.exe` launcher wrappers and only treats actual `claude.exe` processes with the Telegram plugin as legacy Claude Telegram plugin processes.
 - Claude Code fullscreen renderer prompt is dismissed automatically.
-- TeleCodex launches integrated Claude with Telegram channel/plugin settings disabled and an appended system prompt that forbids self-sending Telegram messages.
+- TeleCode launches integrated Claude with Telegram channel/plugin settings disabled and an appended system prompt that forbids self-sending Telegram messages.
 - Default integrated Claude model is now `claude-sonnet-5`. The local installed Claude Code is `2.1.197`.
 - Live checks exist:
   - `npm run test:claude-live`, serial provider plus bot-flow smoke
@@ -43,11 +43,11 @@ This plan is scoped to TeleCodex first. Hermes reuse remains later work.
 
 ## Current Runtime Status
 
-- The correct TeleCodex restart was run with `C:\Users\Anthony\codetest\restart_telecodex.bat`.
-- The old TeleCodex node process PID 39960 was killed.
-- A new TeleCodex node process started at 2026-07-01 02:20:11 as PID 16684.
+- The correct TeleCode restart was run with `C:\Users\Anthony\codetest\restart_telecode.bat`.
+- The old TeleCode node process PID 39960 was killed.
+- A new TeleCode node process started at 2026-07-01 02:20:11 as PID 16684.
 - The old integrated Claude child PID 7904 was stopped before restart.
-- No unexpected TeleCodex-owned `claude.exe` was visible after restart checks.
+- No unexpected TeleCode-owned `claude.exe` was visible after restart checks.
 
 ## Verified On 2026-07-01
 
@@ -55,7 +55,7 @@ This plan is scoped to TeleCodex first. Hermes reuse remains later work.
 - `npm test`: passed, 32 files, 316 tests.
 - `npm run test:claude-tool-smoke`: passed with model `claude-sonnet-5`.
 - The Sonnet 5 smoke transcript confirmed `claude-sonnet-5` in the assistant model field.
-- A no-model smoke proved local Claude Code default currently resolved to `claude-opus-4-8`, so TeleCodex now explicitly defaults to `claude-sonnet-5` instead of relying on the local Claude default.
+- A no-model smoke proved local Claude Code default currently resolved to `claude-opus-4-8`, so TeleCode now explicitly defaults to `claude-sonnet-5` instead of relying on the local Claude default.
 
 ## Priority Work
 
@@ -106,7 +106,7 @@ Anthony should test from Telegram after this commit:
 - `/claude hello`
 - a tool-use prompt, for example ask Claude to run a harmless PowerShell `Write-Output` command
 - while Claude is working, send a normal follow-up message and confirm it is queued and then run
-- while Claude is working, send `/steer <instruction>` and confirm TeleCodex replies `Steer sent to the active Claude turn.`
+- while Claude is working, send `/steer <instruction>` and confirm TeleCode replies `Steer sent to the active Claude turn.`
 - switch to Codex while Claude works and confirm Claude's final answer still arrives
 - run `/sessions` and confirm titles are useful for both Codex and Claude
 
@@ -142,20 +142,20 @@ Not covered by a unit test yet: the edit-mode rolling-window rendering. Adding i
 
 ### F9 — Restart resume now persists Claude's exact transcript path (2026-07-01, built + unit-tested, NOT yet live)
 
-Observed after the F8 restart: TeleCodex restarted cleanly and resumed the saved Claude session id, but the next Claude turn failed with `Claude did not record the prompt in its transcript`. The latest transcript did in fact contain Anthony's prompt as the final user entry, and the live log showed the bridge killed the Claude PTY after failing to locate that echo. The saved Claude state only stored `sessionId`; after a restart the adapter had to rediscover the transcript path by scanning, which is an avoidable fragile step in the exact failure path.
+Observed after the F8 restart: TeleCode restarted cleanly and resumed the saved Claude session id, but the next Claude turn failed with `Claude did not record the prompt in its transcript`. The latest transcript did in fact contain Anthony's prompt as the final user entry, and the live log showed the bridge killed the Claude PTY after failing to locate that echo. The saved Claude state only stored `sessionId`; after a restart the adapter had to rediscover the transcript path by scanning, which is an avoidable fragile step in the exact failure path.
 
 Fix:
 - Persist `transcriptPath` in `.telecodex/provider-state/claude.json`.
 - Propagate it through the Claude descriptor metadata.
 - Restore it into the adapter runtime on resume, so the next turn starts with the exact known transcript file instead of relying only on rediscovery.
 - Added a regression test for the related `\r/exit` input shape, confirming embedded Claude commands separated by carriage returns are rejected before paste just like newline-separated commands.
-- Follow-up diagnosis: Anthony did not intentionally embed `/exit`. The likely injector was TeleCodex cleanup itself: `stopRuntimePty` used graceful dispose, and graceful dispose writes `/exit` then Enter. If Claude still has the prompt sitting in the input box after transcript-location failure, that cleanup can append `/exit` to Anthony's prompt and submit it. Fix: transcript-location failure paths now hard-dispose the PTY with `graceful: false`; explicit user `/exit` can still use graceful disposal.
+- Follow-up diagnosis: Anthony did not intentionally embed `/exit`. The likely injector was TeleCode cleanup itself: `stopRuntimePty` used graceful dispose, and graceful dispose writes `/exit` then Enter. If Claude still has the prompt sitting in the input box after transcript-location failure, that cleanup can append `/exit` to Anthony's prompt and submit it. Fix: transcript-location failure paths now hard-dispose the PTY with `graceful: false`; explicit user `/exit` can still use graceful disposal.
 
 Verification: `npm run build` clean; `npm test` clean with 32 files and 320 tests. Remaining live check: after restart, send a normal multi-step Claude prompt and verify it resumes the known transcript, rejects embedded `/exit` lines, and shows F8's rolling edit-mode narration.
 
 ### F1 (HIGH, VERIFY) — DISPATCH slash commands can time out and KILL the Claude PTY
 - Where: `src/providers/claude-adapter.ts` `sendPrompt` sends every non-`/model` prompt through `locateTurnTranscript(..., { requirePromptEcho: true })` (lines ~146-151). On failure it throws AND calls `stopRuntimePty` (lines ~520-522), disposing the Claude process.
-- Problem: DISPATCH commands (`/diff`, `/memory`, `/init`, `/recap`, `/pr-comments`, `/review`, `/security-review`, etc.) are typed into the PTY as if they were prompts, then TeleCodex waits for the exact command text to reappear as a `user` transcript entry. But Claude Code records slash-command invocations as user entries that begin with `<command-name>` / `<command-message>` — the projector itself explicitly skips those (`src/providers/claude-transcript.ts` lines ~330-332). So `findLastPromptOffset` normalizes `/diff` and never matches `<command-name>/diff...`. After the 30s locate timeout plus recovery failure, the adapter throws and kills the PTY.
+- Problem: DISPATCH commands (`/diff`, `/memory`, `/init`, `/recap`, `/pr-comments`, `/review`, `/security-review`, etc.) are typed into the PTY as if they were prompts, then TeleCode waits for the exact command text to reappear as a `user` transcript entry. But Claude Code records slash-command invocations as user entries that begin with `<command-name>` / `<command-message>` — the projector itself explicitly skips those (`src/providers/claude-transcript.ts` lines ~330-332). So `findLastPromptOffset` normalizes `/diff` and never matches `<command-name>/diff...`. After the 30s locate timeout plus recovery failure, the adapter throws and kills the PTY.
 - Evidence the authors already knew some commands do not echo: `/compact` is the ONE dispatch command routed through `requirePromptEcho: false` (adapter line ~230). Every other DISPATCH command still uses the echo path.
 - Fix direction: give DISPATCH real Claude slash commands the same non-echo treatment as `/compact` (detect turn by file growth / turn_duration, not prompt echo), OR match the `<command-name>` form, OR at minimum make the locate-failure path NOT dispose the PTY. Needs a per-command test matrix (which dispatch commands actually write a matching user entry).
 
@@ -167,12 +167,12 @@ Verification: `npm run build` clean; `npm test` clean with 32 files and 320 test
 
 ### F3 (MEDIUM, VERIFY) — `/model` (and other confirm-dialog commands) can silently no-op after a Claude version bump
 - Where: `src/providers/claude-adapter.ts` `applyModelCommand` (lines ~386-410). It waits for `[/switchmodel/, /yes,switchto/]` against the whitespace-stripped screen; if the marker is not seen it skips the confirm keypress but still reports "model command applied".
-- Problem: the confirm-dialog wording is version-sensitive (local Claude is 2.1.197). If wording drifts, the model never actually switches but TeleCodex says it did. Same brittleness class as the trust/fullscreen markers in `claude-pty.ts` (`CLAUDE_TRUST_MARKERS`, `CLAUDE_FULLSCREEN_PROMPT_MARKERS`).
+- Problem: the confirm-dialog wording is version-sensitive (local Claude is 2.1.197). If wording drifts, the model never actually switches but TeleCode says it did. Same brittleness class as the trust/fullscreen markers in `claude-pty.ts` (`CLAUDE_TRUST_MARKERS`, `CLAUDE_FULLSCREEN_PROMPT_MARKERS`).
 - Fix direction: verify the switch from the transcript/model field rather than trusting the screen marker; report failure honestly if unconfirmed.
 
 ### F4 (MEDIUM, VERIFY) — transcript locate can grab another session's transcript under concurrency
 - Where: `src/providers/claude-transcript.ts` `locateActiveTranscript` fallback picks the newest fresh/grown file globally (lines ~149-155); the non-echo path (`/compact`) uses this directly.
-- Problem: Anthony sometimes runs standalone Claude (`start-claude-telecodex.bat`) or a canary alongside TeleCodex. A fresh transcript from a DIFFERENT Claude process can be selected as this turn's transcript. The prompt-echo variant mitigates for normal prompts but not for the non-echo path.
+- Problem: Anthony sometimes runs standalone Claude (`start-claude-telecode.bat`) or a canary alongside TeleCode. A fresh transcript from a DIFFERENT Claude process can be selected as this turn's transcript. The prompt-echo variant mitigates for normal prompts but not for the non-echo path.
 - Fix direction: constrain candidate transcripts to the expected project dir / session id, or verify the located file actually contains this turn's prompt before tailing.
 
 ### F5 (MEDIUM) — `/abort` desyncs busy state and then stalls until idle timeout
@@ -191,7 +191,7 @@ Verification: `npm run build` clean; `npm test` clean with 32 files and 320 test
 
 ## F9 — Deep pass 2026-07-01 (post-F8 restart): usage limits, narration latency, worklist
 
-Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no errors). State integrity: progress=`edit` survived in `codetest/.telecodex/contexts.json` (live); `home/.telecodex/contexts.json` is stale (May 17). NOTE: `logs/telecodex.out.log` / `.err.log` are frozen at 2026-05-16 — current runs are NOT being captured to any log. The "Workspace: C:\Users\Anthony" banner people see is from that stale log, not the live process (the live process correctly uses codetest). Fixing live stdout/stderr logging is a real ops gap.
+Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no errors). State integrity: progress=`edit` survived in `codetest/.telecodex/contexts.json` (live); `home/.telecodex/contexts.json` is stale (May 17). NOTE: `logs/telecode.out.log` / `.err.log` are frozen at 2026-05-16 — current runs are NOT being captured to any log. The "Workspace: C:\Users\Anthony" banner people see is from that stale log, not the live process (the live process correctly uses codetest). Fixing live stdout/stderr logging is a real ops gap.
 
 ### Done this pass (built + unit-tested, deployed via restart)
 - `/usage` (and `/cost`) now report the LIVE subscription limits. The rolling 5-hour/weekly/reset picture is not in the transcript or any local file — only Claude Code's own `/usage` panel has it. New `ClaudeProviderAdapter.getUsageReport()` dispatches `/usage` into the PTY, scrapes the rendered panel (`cleanUsagePanel`), then presses Esc and waits for the ready marker to confirm the panel dismissed so the session can't get stuck. The bot's `/usage` appends the session context-token line. `/context` and `/stats` keep the token snapshot. VERIFY LIVE: exact panel wording/format on Claude 2.1.197 — `cleanUsagePanel` is generic (strips chrome, dedupes) and may need tuning once the real panel text is seen.
@@ -217,15 +217,15 @@ Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no er
 
 2026-07-01 follow-up after first F9 restart: Anthony hit `Claude did not reach a ready prompt` on resume. This was a startup readiness problem before any prompt/transcript tailing began. The failure message was too opaque, so startup now includes the PTY screen tail in that error. Resume startup also waits 90s instead of 30s, because the active session is now large, and ready detection accepts footer variants such as `bypass permissions on`, `accept edits on`, `esc to interrupt`, and `← for agents`, not only `shift+tab` / `? for shortcuts`.
 
-2026-07-01 follow-up after seeing the new screen tail: Claude showed its large-session warning menu: "This session is 4h 8m old and 340.3k tokens. Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary." TeleCodex now detects that menu and handles it according to `CLAUDE_LARGE_SESSION_RESUME`: `summary` (default, Claude's recommendation, fast/lower usage), `full` (types 2 and resumes the full session), or `manual` (stops with an explicit config message instead of choosing).
+2026-07-01 follow-up after seeing the new screen tail: Claude showed its large-session warning menu: "This session is 4h 8m old and 340.3k tokens. Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary." TeleCode now detects that menu and handles it according to `CLAUDE_LARGE_SESSION_RESUME`: `summary` (default, Claude's recommendation, fast/lower usage), `full` (types 2 and resumes the full session), or `manual` (stops with an explicit config message instead of choosing).
 
-2026-07-01 follow-up after repeated `Claude did not record the prompt` with screen tail `Compacting conversation`: ready detection still accepted footer text while Claude was actively compacting. `esc to interrupt` is now a BUSY marker, not a ready marker, and post-menu waits use `waitForReadyPrompt`, which requires the newest ready marker to appear after the newest busy marker before TeleCodex may send a prompt. Large-session resume also emits Telegram status messages when Claude starts summary/full resume and when it reaches a ready prompt again, so the user is not left with silence during compaction.
+2026-07-01 follow-up after repeated `Claude did not record the prompt` with screen tail `Compacting conversation`: ready detection still accepted footer text while Claude was actively compacting. `esc to interrupt` is now a BUSY marker, not a ready marker, and post-menu waits use `waitForReadyPrompt`, which requires the newest ready marker to appear after the newest busy marker before TeleCode may send a prompt. Large-session resume also emits Telegram status messages when Claude starts summary/full resume and when it reaches a ready prompt again, so the user is not left with silence during compaction.
 
 2026-07-01 correction: the marker-order check was still too weak because Claude can redraw a normal footer under the active `Compacting conversation` screen, making the footer newer than the busy text in the raw PTY stream. `waitForReadyPrompt` now tracks newly received PTY output: every new compaction/interruption chunk resets readiness, and a ready marker only counts after a later clean ready chunk plus a quiet period. Added `test/claude-pty.test.ts` to cover this exact failure mode.
 
-2026-07-01 Fable follow-up: Claude Code docs list `fable` and `best` as model aliases, and Fable 5 was redeployed globally on July 1 with subscription access included only up to 50% of weekly limits through July 7, then requiring usage credits. TeleCodex help text now includes Fable aliases, and model startup or `/model` command failures are surfaced from the Claude CLI screen instead of reporting a successful model change blindly.
+2026-07-01 Fable follow-up: Claude Code docs list `fable` and `best` as model aliases, and Fable 5 was redeployed globally on July 1 with subscription access included only up to 50% of weekly limits through July 7, then requiring usage credits. TeleCode help text now includes Fable aliases, and model startup or `/model` command failures are surfaced from the Claude CLI screen instead of reporting a successful model change blindly.
 
-2026-07-01 transcript follow-up: Claude can write unavailable-model failures as synthetic assistant entries with `isApiErrorMessage: true` and `error: "rate_limit"` rather than ordinary CLI stderr. `projectClaudeTranscriptEntry` now maps those entries to provider `error` events so TeleCodex reports the failure path instead of treating it like a normal assistant answer.
+2026-07-01 transcript follow-up: Claude can write unavailable-model failures as synthetic assistant entries with `isApiErrorMessage: true` and `error: "rate_limit"` rather than ordinary CLI stderr. `projectClaudeTranscriptEntry` now maps those entries to provider `error` events so TeleCode reports the failure path instead of treating it like a normal assistant answer.
 
 2026-07-01 regression fix: the first model-failure hardening scanned the whole startup screen for unavailable-model text. That is unsafe on resumed Claude sessions because the screen can contain historical transcript text from an earlier failed `/model fable` command, so later Sonnet/default resumes were incorrectly killed. Removed the startup-screen failure scan, cleaned failed adapter runtimes on create/resume failure, and restored Telegram `/model <alias>` to Claude Code's in-session `/model` command path.
 
@@ -234,7 +234,7 @@ Restart health confirmed clean (two cycles, live relay PID 38764 at 08:47, no er
 - Full interactive menu navigation for Claude TUI commands.
 - Agent SDK backend.
 - Hermes plugin extraction and shared engine work.
-- A single shared local bridge for both TeleCodex and Hermes.
+- A single shared local bridge for both TeleCode and Hermes.
 
 ## Verification Policy
 
@@ -248,6 +248,6 @@ npm run test:claude-tool-smoke
 
 After runtime restarts:
 
-- verify exactly one TeleCodex `node.exe`
+- verify exactly one TeleCode `node.exe`
 - verify no unexpected live `claude.exe`
 - verify `C:\Users\Anthony\codetest\.telecodex\provider-state\claude-pids.json` is empty unless a Claude turn is actively running

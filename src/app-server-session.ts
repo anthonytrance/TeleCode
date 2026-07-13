@@ -32,7 +32,7 @@ import {
   type CodexModelRecord,
   type CodexThreadRecord,
 } from "./codex-state.js";
-import type { TeleCodexConfig } from "./config.js";
+import type { TeleCodeConfig } from "./config.js";
 
 type AppServerThread = {
   id: string;
@@ -120,7 +120,7 @@ export class AppServerSessionService {
   private sessionTokens = { input: 0, cached: 0, output: 0 };
 
   private constructor(
-    private readonly config: TeleCodexConfig,
+    private readonly config: TeleCodeConfig,
     private readonly createClient: AppServerClientFactory = (options) => new CodexAppServerClient(options),
   ) {
     this.currentWorkspace = config.workspace;
@@ -128,7 +128,7 @@ export class AppServerSessionService {
     this.currentLaunchProfile = getLaunchProfile(config, config.defaultLaunchProfileId);
   }
 
-  static async create(config: TeleCodexConfig, options?: AppServerCreateOptions): Promise<AppServerSessionService> {
+  static async create(config: TeleCodeConfig, options?: AppServerCreateOptions): Promise<AppServerSessionService> {
     const service = new AppServerSessionService(config, options?.appServerClientFactory);
     service.currentWorkspace = options?.workspace ?? config.workspace;
     service.currentModel = options?.model ?? config.codexModel;
@@ -1163,7 +1163,7 @@ export class AppServerSessionService {
   }
 }
 
-function getLaunchProfile(config: TeleCodexConfig, profileId: string): CodexLaunchProfile {
+function getLaunchProfile(config: TeleCodeConfig, profileId: string): CodexLaunchProfile {
   const profile = findLaunchProfile(config.launchProfiles, profileId);
   if (!profile) {
     throw new Error(`Unknown launch profile: ${profileId}`);

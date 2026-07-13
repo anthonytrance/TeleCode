@@ -16,7 +16,7 @@ import type { AgentProviderEvent } from "./types.js";
  */
 
 export interface ClaudeSdkTurnOptions {
-  /** TeleCodex descriptor id — stamped on every emitted event. */
+  /** TeleCode descriptor id — stamped on every emitted event. */
   sessionId: string;
   jobId: string;
   promptText: string;
@@ -261,7 +261,12 @@ function scrubbedEnv(): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...process.env };
   delete env.TELEGRAM_BOT_TOKEN;
   for (const key of Object.keys(env)) {
-    if (key === "CLAUDECODE" || key.startsWith("CLAUDE_CODE_") || key.startsWith("TELECODEX_")) {
+    if (
+      key === "CLAUDECODE" ||
+      key.startsWith("CLAUDE_CODE_") ||
+      key.startsWith("TELECODE_") ||
+      key.startsWith("TELECODEX_")
+    ) {
       delete env[key];
     }
   }

@@ -9,6 +9,7 @@ dist/
 
 # Runtime state
 .telecodex/
+telecode.log
 telecodex.log
 logs/
 

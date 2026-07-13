@@ -35,10 +35,12 @@ export class OutputBuffer {
   private readonly eventsBySession = new Map<string, BufferedOutputEvent[]>();
   private readonly idGenerator: IdGenerator;
   private readonly now: Clock;
+  private readonly maxEventsPerSession: number;
 
-  constructor(options: { idGenerator?: IdGenerator; now?: Clock } = {}) {
+  constructor(options: { idGenerator?: IdGenerator; now?: Clock; maxEventsPerSession?: number } = {}) {
     this.idGenerator = options.idGenerator ?? (() => randomUUID());
     this.now = options.now ?? (() => Date.now());
+    this.maxEventsPerSession = Math.max(1, options.maxEventsPerSession ?? 100);
   }
 
   append(
@@ -62,6 +64,10 @@ export class OutputBuffer {
 
     const events = this.eventsBySession.get(sessionId) ?? [];
     events.push(buffered);
+    while (events.length > this.maxEventsPerSession) {
+      const oldestNonPriority = events.findIndex((entry) => !entry.priority);
+      events.splice(oldestNonPriority >= 0 ? oldestNonPriority : 0, 1);
+    }
     this.eventsBySession.set(sessionId, events);
     return buffered;
   }

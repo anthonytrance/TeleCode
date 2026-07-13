@@ -4,7 +4,7 @@ import path from "node:path";
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile, createLaunchProfile } from "../src/codex-launch.js";
-import type { TeleCodexConfig } from "../src/config.js";
+import type { TeleCodeConfig } from "../src/config.js";
 
 const mockCodexState = vi.hoisted(() => {
   const getThread = vi.fn();
@@ -99,7 +99,7 @@ describe("CodexSessionService", () => {
     output_tokens: 1,
   };
 
-  const createConfig = (overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig => ({
+  const createConfig = (overrides: Partial<TeleCodeConfig> = {}): TeleCodeConfig => ({
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],
     telegramAllowedUserIdSet: new Set([123]),
@@ -154,7 +154,7 @@ describe("CodexSessionService", () => {
     // Keep the Codex client's config assertion free of machine-dependent
     // `mcp_servers.*.enabled=false` overrides read from the real config.toml.
     savedCodexHome = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = path.join(os.tmpdir(), `telecodex-test-empty-codex-home-${process.pid}`);
+    process.env.CODEX_HOME = path.join(os.tmpdir(), `telecode-test-empty-codex-home-${process.pid}`);
   });
 
   afterEach(() => {

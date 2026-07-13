@@ -38,6 +38,7 @@ export function renderHelpMessage(): DualText {
         ["/appbackendtest", "Smoke-test app-server backend"],
         ["/artifacttest", "Send a generated test file"],
         ["/sessions", "Browse & switch threads"],
+        ["/replay [n|all]", "Release buffered background commentary"],
         ["/use <number>", "Switch after /sessions"],
         ["/use previous", "Switch to previous thread"],
         ["/use latest", "Switch to latest thread"],
@@ -59,7 +60,7 @@ export function renderHelpMessage(): DualText {
         ["/goal clear", "Clear thread goal"],
         ["/goal no-agents <task>", "Goal mode without child sessions"],
         ["/clear", "Forget this Telegram context"],
-        ["/copy", "Re-send last assistant reply"],
+        ["/last", "Repeat latest completed reply (/copy and /repeat aliases)"],
       ],
     },
     {
@@ -140,7 +141,7 @@ export function renderHelpMessage(): DualText {
  */
 export function renderWelcomeFirstTime(authWarning?: string): DualText {
   const htmlLines = [
-    "<b>👋 TeleCodex is ready.</b>",
+    "<b>👋 TeleCode is ready.</b>",
     "",
     "Send a message to start chatting with Codex.",
     "You can also send voice notes, photos, or documents.",
@@ -148,7 +149,7 @@ export function renderWelcomeFirstTime(authWarning?: string): DualText {
     "Type /help for all commands.",
   ];
   const plainLines = [
-    "👋 TeleCodex is ready.",
+    "👋 TeleCode is ready.",
     "",
     "Send a message to start chatting with Codex.",
     "You can also send voice notes, photos, or documents.",
@@ -173,7 +174,7 @@ export function renderWelcomeReturning(
   isTopicSession: boolean,
   authWarning?: string,
 ): DualText {
-  const label = isTopicSession ? "TeleCodex (topic session)" : "TeleCodex";
+  const label = isTopicSession ? "TeleCode (topic session)" : "TeleCode";
 
   const htmlLines = [`<b>👋 ${escapeHTML(label)}</b>`, "", sessionHtml];
   const plainLines = [`👋 ${label}`, "", sessionPlain];

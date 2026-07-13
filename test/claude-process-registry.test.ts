@@ -11,8 +11,8 @@ import {
 } from "../src/providers/claude-process-registry.js";
 
 describe("ClaudeProcessRegistry", () => {
-  it("stores and removes TeleCodex Claude process records", () => {
-    const workspace = mkdtempSync(path.join(tmpdir(), "telecodex-claude-pids-"));
+  it("stores and removes TeleCode Claude process records", () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), "telecode-claude-pids-"));
     try {
       const registry = new ClaudeProcessRegistry(claudeProcessRegistryPath(workspace));
 
@@ -70,7 +70,7 @@ describe("ClaudeProcessRegistry", () => {
   });
 
   it("treats corrupt registry files as empty operational state", () => {
-    const workspace = mkdtempSync(path.join(tmpdir(), "telecodex-claude-pids-"));
+    const workspace = mkdtempSync(path.join(tmpdir(), "telecode-claude-pids-"));
     try {
       const registryPath = claudeProcessRegistryPath(workspace);
       mkdirSync(path.dirname(registryPath), { recursive: true });
@@ -93,7 +93,7 @@ describe("ClaudeProcessRegistry", () => {
   });
 
   it("ignores invalid registry entries", () => {
-    const workspace = mkdtempSync(path.join(tmpdir(), "telecodex-claude-pids-"));
+    const workspace = mkdtempSync(path.join(tmpdir(), "telecode-claude-pids-"));
     try {
       const registryPath = claudeProcessRegistryPath(workspace);
       mkdirSync(path.dirname(registryPath), { recursive: true });

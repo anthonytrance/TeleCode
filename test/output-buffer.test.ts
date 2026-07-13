@@ -51,4 +51,23 @@ describe("OutputBuffer", () => {
     expect(priority.map((event) => event.text)).toEqual(["Done"]);
     expect(buffer.list("session-a").map((event) => event.text)).toEqual(["Working", "Read file"]);
   });
+
+  it("bounds retained events while preserving priority output when possible", () => {
+    let id = 0;
+    const buffer = new OutputBuffer({
+      idGenerator: () => `event-${++id}`,
+      now: () => 1000 + id,
+      maxEventsPerSession: 3,
+    });
+    buffer.append("session-a", { kind: "question", text: "Choose one" });
+    buffer.append("session-a", { kind: "assistant", text: "First" });
+    buffer.append("session-a", { kind: "assistant", text: "Second" });
+    buffer.append("session-a", { kind: "assistant", text: "Third" });
+
+    expect(buffer.list("session-a").map((event) => event.text)).toEqual([
+      "Choose one",
+      "Second",
+      "Third",
+    ]);
+  });
 });

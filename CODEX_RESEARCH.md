@@ -1,4 +1,4 @@
-# Research: Building TelePi for OpenAI Codex ("TeleCodex")
+# Research: Building TelePi for OpenAI Codex ("TeleCode")
 
 ## TL;DR
 
@@ -63,18 +63,18 @@ The Codex SDK has **no API to list existing threads**. Thread metadata is stored
 Pi allows `session.setModel()` mid-session. Codex sets the model at thread/Codex instantiation. To switch models, you'd likely need to create a new `Thread` with the desired model. This is fine since `resumeThread(id)` can carry a new model config.
 
 ### 4. **No In-Process Tool Scoping**
-Pi's `createCodingTools(workspace)` runs tools in-process. Codex's tools run inside the sandboxed subprocess. This is actually *simpler* for TeleCodex — you just set `workingDirectory` and the sandbox handles the rest.
+Pi's `createCodingTools(workspace)` runs tools in-process. Codex's tools run inside the sandboxed subprocess. This is actually *simpler* for TeleCode — you just set `workingDirectory` and the sandbox handles the rest.
 
 ### 5. **Handoff Story** — Different but Doable
 Pi sessions use JSONL files; Codex uses SQLite + thread IDs. Handoff would work via thread ID:
-- TeleCodex → CLI: `codex resume <thread-id>`  
-- CLI → TeleCodex: Pass thread ID to TeleCodex, call `codex.resumeThread(id)`
+- TeleCode → CLI: `codex resume <thread-id>`
+- CLI → TeleCode: Pass thread ID to TeleCode, call `codex.resumeThread(id)`
 
 ### 6. **Authentication**
-Codex supports ChatGPT login (OAuth) or API key (`CODEX_API_KEY`). The SDK accepts `apiKey` in `CodexOptions`. TeleCodex would need to configure this.
+Codex supports ChatGPT login (OAuth) or API key (`CODEX_API_KEY`). The SDK accepts `apiKey` in `CodexOptions`. TeleCode would need to configure this.
 
 ### 7. **Sandbox Modes**
-Codex has built-in sandboxing (`read-only`, `workspace-write`, `danger-full-access`). TeleCodex running on a server would likely want `workspace-write` or `danger-full-access` (since the Telegram user is trusted and the server *is* the sandbox).
+Codex has built-in sandboxing (`read-only`, `workspace-write`, `danger-full-access`). TeleCode running on a server would likely want `workspace-write` or `danger-full-access` (since the Telegram user is trusted and the server *is* the sandbox).
 
 ## Proposed Architecture
 
@@ -125,7 +125,7 @@ Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
 
 ### Phase 3: Handoff
 7. **`/handback`** — Send `codex resume <thread-id>` command
-8. **Pi CLI extension equivalent** — A Codex config/hook that launches TeleCodex with a thread ID
+8. **Pi CLI extension equivalent** — A Codex config/hook that launches TeleCode with a thread ID
 
 ### Phase 4: Extras
 9. **Richer tool display**: File changes (with diff info), todo lists, web search results

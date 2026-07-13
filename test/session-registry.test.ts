@@ -3,7 +3,7 @@ import path from "node:path";
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile, createLaunchProfile } from "../src/codex-launch.js";
-import type { TeleCodexConfig } from "../src/config.js";
+import type { TeleCodeConfig } from "../src/config.js";
 
 const mockFsState = vi.hoisted(() => {
   const files = new Map<string, string>();
@@ -84,7 +84,7 @@ describe("SessionRegistry", () => {
     vi.restoreAllMocks();
   });
 
-  const createConfig = (overrides: Partial<TeleCodexConfig> = {}): TeleCodexConfig => ({
+  const createConfig = (overrides: Partial<TeleCodeConfig> = {}): TeleCodeConfig => ({
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],
     telegramAllowedUserIdSet: new Set([123]),
@@ -144,7 +144,7 @@ describe("SessionRegistry", () => {
   beforeEach(() => {
     mockFsState.reset();
     mockSessionState.reset();
-    mockSessionState.create.mockImplementation(async (config: TeleCodexConfig, options?: {
+    mockSessionState.create.mockImplementation(async (config: TeleCodeConfig, options?: {
       workspace?: string;
       model?: string;
       reasoningEffort?: string;

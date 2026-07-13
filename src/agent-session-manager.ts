@@ -259,6 +259,17 @@ export class AgentSessionManager {
       .sort((left, right) => right.updatedAt - left.updatedAt);
   }
 
+  /** Jobs cannot survive a bridge process restart. Mark persisted in-flight jobs aborted. */
+  abortPersistedJobs(): AgentJobRecord[] {
+    const aborted: AgentJobRecord[] = [];
+    for (const job of [...this.jobs.values()]) {
+      if (job.status === "running" || job.status === "waiting") {
+        aborted.push(this.abortJob(job.id));
+      }
+    }
+    return aborted;
+  }
+
   importLegacyContexts(
     contexts: ContextMetadata[],
     options: { defaultProvider?: AgentProviderKind; selectImported?: boolean } = {},

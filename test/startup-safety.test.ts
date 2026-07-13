@@ -24,10 +24,42 @@ describe("startup safety", () => {
     expect(() =>
       assertTelegramPollingSafety({
         token: "123456:secret-token",
-        env: { TELECODEX_TOKEN_ROLE: "production" },
+        env: { TELECODE_TOKEN_ROLE: "production" },
       }),
-    ).toThrow("TELECODEX_TOKEN_ROLE=production requires TELECODEX_ALLOW_PRODUCTION_POLLING=true.");
+    ).toThrow("TELECODE_TOKEN_ROLE=production requires TELECODE_ALLOW_PRODUCTION_POLLING=true.");
 
+    expect(() =>
+      assertTelegramPollingSafety({
+        token: "123456:secret-token",
+        env: {
+          TELECODE_TOKEN_ROLE: "production",
+          TELECODE_ALLOW_PRODUCTION_POLLING: "true",
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it("keeps canary and production modes separate", () => {
+    expect(() =>
+      assertTelegramPollingSafety({
+        token: "123456:secret-token",
+        env: { TELECODE_TOKEN_ROLE: "canary" },
+      }),
+    ).toThrow("TELECODE_TOKEN_ROLE=canary requires TELECODE_CANARY_MODE=true.");
+
+    expect(() =>
+      assertTelegramPollingSafety({
+        token: "123456:secret-token",
+        env: {
+          TELECODE_TOKEN_ROLE: "production",
+          TELECODE_CANARY_MODE: "true",
+          TELECODE_ALLOW_PRODUCTION_POLLING: "true",
+        },
+      }),
+    ).toThrow("TELECODE_TOKEN_ROLE=production cannot be used with TELECODE_CANARY_MODE=true.");
+  });
+
+  it("accepts legacy TELECODEX safety variables", () => {
     expect(() =>
       assertTelegramPollingSafety({
         token: "123456:secret-token",
@@ -39,30 +71,10 @@ describe("startup safety", () => {
     ).not.toThrow();
   });
 
-  it("keeps canary and production modes separate", () => {
-    expect(() =>
-      assertTelegramPollingSafety({
-        token: "123456:secret-token",
-        env: { TELECODEX_TOKEN_ROLE: "canary" },
-      }),
-    ).toThrow("TELECODEX_TOKEN_ROLE=canary requires TELECODEX_CANARY_MODE=true.");
-
-    expect(() =>
-      assertTelegramPollingSafety({
-        token: "123456:secret-token",
-        env: {
-          TELECODEX_TOKEN_ROLE: "production",
-          TELECODEX_CANARY_MODE: "true",
-          TELECODEX_ALLOW_PRODUCTION_POLLING: "true",
-        },
-      }),
-    ).toThrow("TELECODEX_TOKEN_ROLE=production cannot be used with TELECODEX_CANARY_MODE=true.");
-  });
-
   it("detects Claude processes that start the Telegram plugin", () => {
     expect(
       findClaudeTelegramPluginCommandLines([
-        "123 node.exe C:\\Users\\Anthony\\codetest\\tools\\telecodex\\dist\\index.js",
+        "123 node.exe C:\\Users\\Anthony\\codetest\\tools\\telecode\\dist\\index.js",
         "456 claude.exe --model sonnet --strict-mcp-config",
         "567 powershell.exe Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*plugin:telegram*' -and $_.CommandLine -like '*claude*' }",
         "678 cmd.exe /c \"C:\\Users\\Anthony\\.local\\bin\\claude.exe --channels plugin:telegram@claude-plugins-official & cmd /k\"",

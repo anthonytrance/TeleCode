@@ -1,14 +1,14 @@
-# Claude Provider — Unified Design (TeleCodex + Hermes)
+# Claude Provider — Unified Design (TeleCode + Hermes)
 
 Date: 2026-06-17
 Status: DESIGN. Supersedes the three earlier docs, which are now stale references:
-- `tools/telecodex/CLAUDE_PROVIDER_PLAN.md` (2026-06-12, minimal slice)
-- `tools/telecodex/PLAN.md` (2026-05-20, unified bot plan)
+- `tools/telecode/CLAUDE_PROVIDER_PLAN.md` (2026-06-12, minimal slice)
+- `tools/telecode/PLAN.md` (2026-05-20, unified bot plan)
 - `%LOCALAPPDATA%/hermes/CLAUDE_CODE_PROVIDER_PLAN.md` (2026-06-12, Shape A in-core)
 
 Authoritative pointer doc: `C:\Users\Anthony\codetest\CLAUDE_PROVIDER_HANDOFF.md` (2026-06-17).
 
-This document designs BOTH projects end to end. Build order is TeleCodex first, then Hermes. H1 (subscription PTY) is built first; H2 (Agent SDK) is designed here but built later, only if the billing question lands acceptably.
+This document designs BOTH projects end to end. Build order is TeleCode first, then Hermes. H1 (subscription PTY) is built first; H2 (Agent SDK) is designed here but built later, only if the billing question lands acceptably.
 
 ---
 
@@ -24,7 +24,7 @@ This document designs BOTH projects end to end. Build order is TeleCodex first, 
 
 The fragile part of this whole project is the PTY + transcript mechanics (spawn args, trust dialog, readiness markers, bracketed-paste input, transcript tailing, compact/interrupt/resume, usage extraction). Build it ONCE and share it.
 
-- TeleCodex already has a TypeScript implementation under `src/providers/` (claude-pty, claude-transcript, claude-state, claude-adapter).
+- TeleCode already has a TypeScript implementation under `src/providers/` (claude-pty, claude-transcript, claude-state, claude-adapter).
 - Hermes has a Python implementation (`claude_pty_session.py`, `claude_event_projector.py`) — currently jammed into Hermes core; it moves OUT into Anthony's own plugin package (see Section 5).
 - These two implementations of the same mechanics are the maintenance cost. Keep them behaviourally identical and documented from the same spec (this doc). If we later want a single source of truth, the OpenAI-compatible local bridge (appendix) collapses both consumers onto one Python engine — deferred, not part of H1.
 
@@ -65,7 +65,7 @@ Verified by live forensics 2026-07-07/08 on Claude Code 2.1.198: interactive Cla
 
 ---
 
-## 3. TeleCodex V1 — full command coverage
+## 3. TeleCode V1 — full command coverage
 
 The current adapter declares `slashCommands: false` and wires a handful of commands. V1 now targets the FULL Claude Code command surface. The live set is 98 commands (fetched 2026-06-17 from code.claude.com/docs/en/commands). "Every command supported" means: every command is RECOGNISED and HANDLED — no silent drops, no stack traces — with the meaningful ones fully functional and the terminal-cosmetic ones returning a clear "not applicable over Telegram" reply.
 
@@ -75,7 +75,7 @@ Each command maps to exactly one handler class, driven by a command-capability t
 
 - **DISPATCH** — type the command into the PTY; it works as-is. Covers commands whose effect is in-session and whose output lands in the transcript. Includes the bundled skills/workflows (they are just prompts handed to Claude).
 - **DISPATCH+ARG** — menu-driven in the TUI, but a non-interactive argument form exists; require/encourage the arg form over Telegram (e.g. `/model sonnet`, `/advisor opus`, `/effort high`). Bare (menu) form returns the current value + usage hint in V1; full inline-button menu navigation is a Phase 2 fast-follow.
-- **EMULATE** — TeleCodex owns the behaviour because typing it into the TUI is wrong or unsafe over a bridge (`/clear` → start fresh session and say so; `/resume`/`/branch`/`/fork` → session-manager operations; `/exit` → dispose the PTY).
+- **EMULATE** — TeleCode owns the behaviour because typing it into the TUI is wrong or unsafe over a bridge (`/clear` → start fresh session and say so; `/resume`/`/branch`/`/fork` → session-manager operations; `/exit` → dispose the PTY).
 - **SURFACE** — answer from data the engine already has rather than round-tripping the TUI (`/usage`, `/context`, `/cost`, `/status`, `/stats` → from transcript usage snapshot; `/session` → descriptor). Cheaper and screen-reader-clean.
 - **NA** — terminal/host-cosmetic with no meaning over a text bridge; reply with a one-line "not applicable over Telegram" + what to use instead if relevant. Never errors.
 - **BLOCK** — deliberately refused for safety (auth/billing/destructive-to-environment), with a clear reason.
@@ -92,7 +92,7 @@ EMULATE (session-manager owns it):
 `/clear /resume /branch /fork /rename /export /copy /rewind /background /bg`
 
 SURFACE (answer from engine data):
-`/usage /context /cost /status /stats /session(TeleCodex-native) /doctor /debug(report) /heapdump(report or NA)`
+`/usage /context /cost /status /stats /session(TeleCode-native) /doctor /debug(report) /heapdump(report or NA)`
 
 NA (recognised, clear "not applicable over Telegram" reply):
 `/color /theme /vim /scroll-speed /statusline /ide /terminal-setup /tui /desktop /mobile /chrome /voice /radio /stickers /focus(cosmetic) /scroll-speed /remote-control /remote-env /teleport /install-github-app /install-slack-app /web-setup /setup-bedrock /setup-vertex /privacy-settings /color /stickers /reload-plugins /reload-skills /reload-* /terminal-setup /keybindings(menu) /fast(host) /tui`
@@ -110,7 +110,7 @@ BLOCK (safety — refuse with reason):
 
 Set `slashCommands: true`. Add `commandClassFor(name)` to the adapter, plus `permissions`/`userQuestions` handling needed by the menu/approval commands (these were `false` in the minimal slice; advanced commands pull some of them forward — scope precisely during build).
 
-### TeleCodex ship steps
+### TeleCode ship steps
 
 1. Build the command table + handler classes + the CI "every-command-classified" test.
 2. Wire progress narration delivery (Section 2) into the existing `PROGRESS_DELIVERY` path; add `/verbosity`.
@@ -120,7 +120,7 @@ Set `slashCommands: true`. Add `commandClassFor(name)` to the adapter, plus `per
 
 ---
 
-## 3B. TeleCodex — parallel sessions, cross-provider switching, background completion notices
+## 3B. TeleCode — parallel sessions, cross-provider switching, background completion notices
 
 This was the design target of the old `PLAN.md` (lane / selected-session / running-job model, Phases 2–5). The minimal Claude slice deferred it; it is now IN SCOPE because Anthony runs OpenAI Codex and Claude Code in parallel and needs to be told when a background turn finishes. The earlier sections of this doc under-specified this — this section is the correction.
 
@@ -167,7 +167,7 @@ All of these are screen-reader-clean plain text, and unsupported-per-provider co
 
 ### Sequence note
 
-TeleCodex build splits into: **V1a** = full command coverage (Section 3) + progress narration (Section 2) on the existing per-context provider switching; **V1b** = this section (lanes/jobs/buffers + background completion notices). V1b is the larger lift (it's the session-manager rework). Both ship before the production cutover; canary covers mixed Codex+Claude parallel runs explicitly.
+TeleCode build splits into: **V1a** = full command coverage (Section 3) + progress narration (Section 2) on the existing per-context provider switching; **V1b** = this section (lanes/jobs/buffers + background completion notices). V1b is the larger lift (it's the session-manager rework). Both ship before the production cutover; canary covers mixed Codex+Claude parallel runs explicitly.
 
 ## 4. Hermes — Step 0: stop patching core
 
@@ -181,7 +181,7 @@ Risks + guards: the wrapper depends on `run_conversation` staying patchable and 
 
 ---
 
-## 5. Hermes H1 — PTY backend (subscription-safe, ship after TeleCodex)
+## 5. Hermes H1 — PTY backend (subscription-safe, ship after TeleCode)
 
 Behind the plugin boundary, the PTY backend (the shared engine, Python side) runs one Claude Code session per Hermes session, resumed by UUID across gateway restarts.
 
@@ -222,15 +222,15 @@ Still to PIN at H2 build time (code API only, not auth): exact SDK custom-tool r
 
 ## 7. Sequencing
 
-1. TeleCodex: full command coverage + progress narration + canary + ship (gated).
+1. TeleCode: full command coverage + progress narration + canary + ship (gated).
 2. Hermes Step 0: extract the core patch into a `~/.hermes/plugins` plugin; revert core edits; add the patchability self-check.
 3. Hermes H1: PTY backend behind the plugin, hardened memory, progress narration; CLI live test (Anthony's go), then gateway.
 4. Hermes H2: when billing is settled — wire the SDK backend (MCP memory tool + hooks + permission callback). Config flip.
 
-Shared engine built once (TeleCodex), mirrored in the Hermes plugin. Optional later: collapse both onto one Python OpenAI-compatible local bridge (appendix) for a single source of truth.
+Shared engine built once (TeleCode), mirrored in the Hermes plugin. Optional later: collapse both onto one Python OpenAI-compatible local bridge (appendix) for a single source of truth.
 
 ---
 
 ## Appendix: OpenAI-compatible local bridge (deferred option)
 
-Wrap the Python PTY engine in a local server speaking OpenAI `/v1/chat/completions`, registered in Hermes as a `chat_completions` custom provider (base_url → localhost) = zero core patch, sidesteps `_VALID_API_MODES`, and serves both TeleCodex and Hermes from one engine. NOT used for H1 because it makes Claude opaque to Hermes' deeper memory/skill hooks (worse for the memory requirement) and re-introduces OpenAI-compat streaming fiddliness. Kept as the long-term single-source-of-truth option if maintaining two engine implementations becomes painful.
+Wrap the Python PTY engine in a local server speaking OpenAI `/v1/chat/completions`, registered in Hermes as a `chat_completions` custom provider (base_url → localhost) = zero core patch, sidesteps `_VALID_API_MODES`, and serves both TeleCode and Hermes from one engine. NOT used for H1 because it makes Claude opaque to Hermes' deeper memory/skill hooks (worse for the memory requirement) and re-introduces OpenAI-compat streaming fiddliness. Kept as the long-term single-source-of-truth option if maintaining two engine implementations becomes painful.

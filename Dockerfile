@@ -10,10 +10,10 @@ RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY . .
 RUN npm run build
 
-RUN adduser -D -u 1001 telecodex \
-  && mkdir -p /workspace /home/telecodex/.codex \
-  && chown -R telecodex:telecodex /workspace /home/telecodex
+RUN adduser -D -u 1001 telecode \
+  && mkdir -p /workspace /home/telecode/.codex \
+  && chown -R telecode:telecode /workspace /home/telecode
 
-USER telecodex
+USER telecode
 
 CMD ["node", "dist/index.js"]

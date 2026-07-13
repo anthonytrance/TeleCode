@@ -48,6 +48,51 @@ describe("usage rendering", () => {
     expect(text).toContain("Purchased credits: none");
     expect(text).toContain("Full limit resets available: 3");
     expect(text).toContain("live app-server");
-    expect(text).toContain("app-server or upstream rate-limit state is inconsistent");
+    expect(text).toContain("fresh OpenAI account/rateLimits/read request");
+  });
+
+  it("flags a live response that drops a recently observed five-hour window", () => {
+    const snapshot = mergeLiveAppServerRateLimits({
+      sessionFile: "session.jsonl",
+      lastKnownFiveHour: {
+        used_percent: 100,
+        window_minutes: 300,
+        resets_at: 1783884960,
+        observed_at: "2026-07-12T16:13:04.215Z",
+      },
+    }, {
+      rateLimits: {
+        limitId: "codex",
+        primary: { usedPercent: 19, windowDurationMins: 10080, resetsAt: 1784490848 },
+        secondary: null,
+        planType: "plus",
+        credits: { hasCredits: false, unlimited: false, balance: "0" },
+      },
+      rateLimitsByLimitId: {
+        codex: {
+          primary: { usedPercent: 19, windowDurationMins: 10080, resetsAt: 1784490848 },
+          secondary: null,
+        },
+      },
+      rateLimitResetCredits: { availableCount: 3, credits: [] },
+    });
+
+    const text = renderUsagePlain(snapshot);
+    expect(text).toContain("5-hour limit: unavailable, OpenAI omitted this window");
+    expect(text).toContain("Last 5-hour report (stale): 100.0% used");
+    expect(text).toContain("Weekly limit: 19.0% used");
+    expect(text).toContain("live response is incomplete");
+  });
+
+  it("classifies both provided windows by their reported duration", () => {
+    const snapshot: CodexUsageSnapshot = {
+      sessionFile: "session.jsonl",
+      primary: { used_percent: 12, window_minutes: 10080 },
+      secondary: { used_percent: 34, window_minutes: 300 },
+    };
+
+    const text = renderUsagePlain(snapshot);
+    expect(text).toContain("Weekly limit: 12.0% used");
+    expect(text).toContain("5-hour limit: 34.0% used");
   });
 });

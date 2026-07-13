@@ -9,13 +9,13 @@
 Use Node.js 20+.
 
 - `npm install` installs project dependencies.
-- `npm run dev` starts TeleCodex with `tsx` against `src/index.ts`.
+- `npm run dev` starts TeleCode with `tsx` against `src/index.ts`.
 - `npm run build` runs `tsc` and emits production files to `dist/`.
 - `npm test` runs the Vitest suite once.
 - `docker compose up --build` starts the bot in the provided container setup.
 
 ## Coding Style & Naming Conventions
-This repository uses strict TypeScript with ES modules. Follow the existing style: 2-space indentation, double quotes, semicolons, and explicit `.js` import specifiers in TypeScript source. Prefer small, focused modules and descriptive camelCase identifiers; use PascalCase for exported types and classes, such as `TeleCodexConfig` and `CodexSessionService`.
+This repository uses strict TypeScript with ES modules. Follow the existing style: 2-space indentation, double quotes, semicolons, and explicit `.js` import specifiers in TypeScript source. Prefer small, focused modules and descriptive camelCase identifiers; use PascalCase for exported types and classes, such as `TeleCodeConfig` and `CodexSessionService`.
 
 Keep environment variable names uppercase with underscores, for example `CODEX_APPROVAL_POLICY`. Match new filenames to the current pattern: lowercase kebab-free names in `src/`, and `*.test.ts` in `test/`.
 
@@ -23,7 +23,7 @@ Keep environment variable names uppercase with underscores, for example `CODEX_A
 Tests use Vitest with globals enabled and the pattern `test/**/*.test.ts`. Add or update tests alongside behavior changes, especially for config parsing, formatting, and session lifecycle logic. Run `npm test` before opening a PR; run `npm run build` when changing types, imports, or entrypoint wiring.
 
 ## Commit & Pull Request Guidelines
-The current history uses short, descriptive commit subjects, for example: `Initial TeleCodex implementation - Telegram bridge for OpenAI Codex CLI SDK`. Keep commit messages imperative, concise, and scoped to one logical change.
+The current history uses short, descriptive commit subjects, for example: `Initial TeleCode implementation - Telegram bridge for OpenAI Codex CLI SDK`. Keep commit messages imperative, concise, and scoped to one logical change.
 
 PRs should explain the behavior change, note any config or Docker impact, and link related issues when present. Include screenshots or Telegram message samples for UI or formatting changes.
 
@@ -31,4 +31,4 @@ PRs should explain the behavior change, note any config or Docker impact, and li
 Do not commit `.env`, API keys, or Telegram tokens. Restrict `TELEGRAM_ALLOWED_USER_IDS` to trusted users, and default to `CODEX_SANDBOX_MODE=workspace-write` unless broader access is required.
 
 ## Release Automation
-TeleCodex does not yet ship with the TelePi npm release workflow, but the reusable Trusted Publishing setup has been documented in `docs/npm-trusted-publishing.md`. Use that playbook when wiring TeleCodex for npm publication and tag-driven GitHub Actions releases.
+TeleCode does not yet ship with the TelePi npm release workflow, but the reusable Trusted Publishing setup has been documented in `docs/npm-trusted-publishing.md`. Use that playbook when wiring TeleCode for npm publication and tag-driven GitHub Actions releases.

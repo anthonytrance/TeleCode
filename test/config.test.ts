@@ -10,7 +10,7 @@ describe("loadConfig", () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(path.join(tmpdir(), "telecodex-config-"));
+    tempDir = mkdtempSync(path.join(tmpdir(), "telecode-config-"));
     process.chdir(tempDir);
     process.env = { ...originalEnv };
     delete process.env.TELEGRAM_BOT_TOKEN;

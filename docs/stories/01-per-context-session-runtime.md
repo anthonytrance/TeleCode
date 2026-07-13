@@ -1,6 +1,6 @@
 # Story 01: Per-Context Session Runtime
 
-TeleCodex currently runs as a single shared `CodexSessionService` instance for the entire bot process. That keeps the implementation simple, but it caps the product at one active conversation at a time and prevents Telegram chats or forum topics from behaving like independent workspaces. This story upgrades the runtime so each Telegram context gets its own Codex session state and processing lifecycle.
+TeleCode currently runs as a single shared `CodexSessionService` instance for the entire bot process. That keeps the implementation simple, but it caps the product at one active conversation at a time and prevents Telegram chats or forum topics from behaving like independent workspaces. This story upgrades the runtime so each Telegram context gets its own Codex session state and processing lifecycle.
 
 ## Architecture Context And Reuse Guidance
 
@@ -9,10 +9,10 @@ Use the existing streaming and formatting pipeline in `src/bot.ts`, `src/codex-s
 Patterns to borrow:
 
 - `Ev3rlasting/tg-codex`: topic-to-thread mapping and context-scoped sessions.
-- `Headcrab/telecodex`: one logical session per Telegram chat/topic pair.
+- `Headcrab/telecode`: one logical session per Telegram chat/topic pair.
 - `yschaub/codex-telegram`: persistent session-per-project behavior and explicit isolation between contexts.
 
-Keep these TeleCodex strengths:
+Keep these TeleCode strengths:
 
 - streamed tool output and todo rendering
 - `~/.codex` thread browsing via `src/codex-state.ts`

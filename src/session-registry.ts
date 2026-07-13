@@ -4,7 +4,7 @@ import path from "node:path";
 import { createCodexSession, type CodexSessionRuntime } from "./codex-backend.js";
 import { isCodexMcpEnabled, setCodexMcpEnabled } from "./codex-mcp-toggle.js";
 import { findLaunchProfile } from "./codex-launch.js";
-import type { CodexBackend, ProgressDelivery, TeleCodexConfig } from "./config.js";
+import type { CodexBackend, ProgressDelivery, TeleCodeConfig } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
 import { parseJsonFileText } from "./json.js";
 import type { AgentProviderKind } from "./providers/types.js";
@@ -23,7 +23,7 @@ export interface ContextMetadata {
   updatedAt: number;
 }
 
-interface TeleCodexPreferences {
+interface TeleCodePreferences {
   selectedCodexModel?: string;
   codexMcpEnabled?: boolean;
 }
@@ -36,7 +36,7 @@ export class SessionRegistry {
   private selectedCodexModel?: string;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
 
-  constructor(private readonly config: TeleCodexConfig) {
+  constructor(private readonly config: TeleCodeConfig) {
     this.persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
     this.preferencesPath = path.join(config.workspace, ".telecodex", "preferences.json");
     this.loadPersistedMetadata();
@@ -282,14 +282,14 @@ export class SessionRegistry {
       if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true });
       }
-      const data: TeleCodexPreferences = {
+      const data: TeleCodePreferences = {
         selectedCodexModel: this.selectedCodexModel,
         codexMcpEnabled: isCodexMcpEnabled(),
       };
       writeFileSync(this.preferencesPath, JSON.stringify(data, null, 2), "utf8");
     } catch (error) {
       console.warn(
-        "Failed to persist TeleCodex preferences:",
+        "Failed to persist TeleCode preferences:",
         error instanceof Error ? error.message : String(error),
       );
     }
@@ -301,7 +301,7 @@ export class SessionRegistry {
         return;
       }
       const raw = readFileSync(this.preferencesPath, "utf8");
-      const preferences = parseJsonFileText<TeleCodexPreferences>(raw);
+      const preferences = parseJsonFileText<TeleCodePreferences>(raw);
       this.selectedCodexModel = preferences.selectedCodexModel;
       setCodexMcpEnabled(preferences.codexMcpEnabled === true);
     } catch {
@@ -311,7 +311,7 @@ export class SessionRegistry {
 }
 
 function resolveLaunchProfileId(
-  config: TeleCodexConfig,
+  config: TeleCodeConfig,
   meta: ContextMetadata | undefined,
 ): string | undefined {
   if (!meta?.launchProfileId) {

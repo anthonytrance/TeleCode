@@ -8,7 +8,7 @@ describe("bridge log", () => {
   let workspace: string;
 
   beforeEach(() => {
-    workspace = mkdtempSync(path.join(tmpdir(), "telecodex-bridge-log-"));
+    workspace = mkdtempSync(path.join(tmpdir(), "telecode-bridge-log-"));
   });
 
   afterEach(() => {

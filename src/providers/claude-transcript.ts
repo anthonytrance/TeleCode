@@ -179,7 +179,7 @@ export async function locateActiveTranscript(options: {
  * Find the transcript turn for the exact prompt that was just sent. This is stricter
  * than file-growth detection: interactive Claude can rewrite metadata or repaint old
  * screen content without actually accepting a new prompt. For normal user prompts,
- * TeleCodex must not tail an answer until the prompt itself appears after the
+ * TeleCode must not tail an answer until the prompt itself appears after the
  * captured pre-send offset.
  */
 export async function locateActiveTranscriptTurnByPrompt(options: {
@@ -253,16 +253,19 @@ export async function locateTranscriptTurnByPrompt(options: {
   expectedSessionId?: string;
   knownPath?: string;
   minOffset?: number;
+  /** Pre-send transcript sizes. Historical prompts before these offsets are never eligible. */
+  before?: Set<string> | Map<string, number>;
   configDir?: string;
 }): Promise<ActiveTranscript | null> {
   const candidates = await transcriptPromptRecoveryCandidates(options);
+  const before = options.before ? normalizeTranscriptSnapshot(options.before) : undefined;
   const normalizedPrompt = normalizePromptText(options.promptText);
   if (!normalizedPrompt) {
     return null;
   }
 
   for (const candidate of candidates) {
-    const minOffset = candidate === options.knownPath ? options.minOffset : undefined;
+    const minOffset = recoveryMinOffset(candidate, options.knownPath, options.minOffset, before);
     const startOffset = findLastPromptOffset(candidate, normalizedPrompt, minOffset);
     if (startOffset !== undefined) {
       return { path: candidate, startOffset };
@@ -281,11 +284,14 @@ export async function locateSingleHumanPromptTurn(options: {
   expectedSessionId?: string;
   knownPath?: string;
   minOffset?: number;
+  /** Pre-send transcript sizes. Historical prompts before these offsets are never eligible. */
+  before?: Set<string> | Map<string, number>;
   configDir?: string;
 }): Promise<ActiveTranscript | null> {
   const candidates = await transcriptPromptRecoveryCandidates(options);
+  const before = options.before ? normalizeTranscriptSnapshot(options.before) : undefined;
   for (const candidate of candidates) {
-    const minOffset = candidate === options.knownPath ? options.minOffset : undefined;
+    const minOffset = recoveryMinOffset(candidate, options.knownPath, options.minOffset, before);
     const matches = findHumanPromptOffsets(candidate, minOffset);
     if (matches.length === 1) {
       return { path: candidate, startOffset: matches[0]! };
@@ -788,6 +794,18 @@ async function transcriptPromptRecoveryCandidates(options: {
     .forEach((entry) => candidates.push(entry.filePath));
 
   return [...new Set(candidates)];
+}
+
+function recoveryMinOffset(
+  candidate: string,
+  knownPath: string | undefined,
+  knownOffset: number | undefined,
+  before: Map<string, number> | undefined,
+): number {
+  if (candidate === knownPath && knownOffset !== undefined) {
+    return knownOffset;
+  }
+  return before?.get(candidate) ?? 0;
 }
 
 function findLastPromptOffset(filePath: string, normalizedPrompt: string, minOffset = 0): number | undefined {

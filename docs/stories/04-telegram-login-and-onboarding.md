@@ -1,6 +1,6 @@
 # Story 04: Telegram Login And Onboarding
 
-TeleCodex currently assumes the host already has Codex installed and authenticated. That is workable for a solo developer, but it creates avoidable setup friction and makes remote recovery hard when auth expires. This story adds a Telegram-driven onboarding and auth flow so the bot can guide a trusted operator through login status, device auth, and recovery without SSHing into the host first.
+TeleCode currently assumes the host already has Codex installed and authenticated. That is workable for a solo developer, but it creates avoidable setup friction and makes remote recovery hard when auth expires. This story adds a Telegram-driven onboarding and auth flow so the bot can guide a trusted operator through login status, device auth, and recovery without SSHing into the host first.
 
 ## Architecture Context And Reuse Guidance
 
@@ -8,7 +8,7 @@ This story should not replace API-key support or existing `.env` loading. It sho
 
 Patterns to borrow:
 
-- `Headcrab/telecodex`: `/login` and `/logout` commands with device-auth style flow and explicit operator feedback.
+- `Headcrab/telecode`: `/login` and `/logout` commands with device-auth style flow and explicit operator feedback.
 - `gergomiklos/heyagent`: guided pairing and setup mindset, not necessarily its exact transport.
 
 Constraints:
@@ -22,7 +22,7 @@ Constraints:
 - Detect whether Codex is already authenticated before starting a new turn.
 - If unauthenticated, fail fast with a clear Telegram message that offers the next valid step.
 - Implement a small auth helper module that shells out to the local `codex` CLI in a controlled way and parses stable output only.
-- Persist as little auth state as possible in TeleCodex. Let the Codex CLI remain the source of truth.
+- Persist as little auth state as possible in TeleCode. Let the Codex CLI remain the source of truth.
 - Extend `/start` and `/voice`-style status reporting so operators can immediately see whether the bridge is usable.
 
 ## File Touch List
@@ -41,7 +41,7 @@ Constraints:
    - check whether Codex is authenticated
    - start a login flow if enabled
    - run logout if supported
-2. Gate prompt execution so TeleCodex responds with a clear auth-required message instead of failing deep inside the SDK.
+2. Gate prompt execution so TeleCode responds with a clear auth-required message instead of failing deep inside the SDK.
 3. Add `/login` command behavior:
    - if already authenticated, say so
    - if login is supported, start the flow and surface the next step in Telegram
@@ -70,7 +70,7 @@ Constraints:
 
 ## Acceptance Criteria
 
-- TeleCodex can report whether Codex is currently authenticated without requiring the operator to inspect the host manually.
+- TeleCode can report whether Codex is currently authenticated without requiring the operator to inspect the host manually.
 - When unauthenticated, normal prompts fail fast with an actionable Telegram message instead of a low-level SDK error.
 - `/login` provides the best supported auth path available in the installed environment and degrades gracefully when full remote login is unavailable.
 - `CODEX_API_KEY` setups continue to work without regression.

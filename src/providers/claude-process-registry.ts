@@ -103,7 +103,7 @@ export async function cleanupRegisteredClaudeProcesses(workspace: string): Promi
       try {
         registry.removePid(record.pid);
       } catch (error) {
-        console.warn("Failed to remove stale TeleCodex Claude process record", error);
+        console.warn("Failed to remove stale TeleCode Claude process record", error);
       }
     }
   }

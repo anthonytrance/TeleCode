@@ -1,3 +1,3 @@
 @echo off
-cd /d "%~dp0\.."
-powershell -NoProfile -ExecutionPolicy Bypass -NoExit -File "%~dp0start-claude-telecodex.ps1" %*
+call "%~dp0start-claude-telecode.bat" %*
+exit /b %ERRORLEVEL%

@@ -1,9 +1,10 @@
 import { existsSync, statSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { bridgeLog } from "../bridge-log.js";
-import type { ClaudePermissionMode, TeleCodexConfig } from "../config.js";
+import type { ClaudePermissionMode, TeleCodeConfig } from "../config.js";
 import { ClaudeSdkInputController, runClaudeSdkTurn } from "./claude-sdk-engine.js";
 import type {
   AgentProviderAdapter,
@@ -15,6 +16,7 @@ import type {
 } from "./types.js";
 import { ensureClaudeConfigDir } from "./claude-config-dir.js";
 import { getClaudeCommandSpec, parseClaudeSlashCommand } from "./claude-commands.js";
+import { fetchClaudeUsageReport } from "./claude-usage.js";
 import {
   CLAUDE_FULLSCREEN_PROMPT_MARKERS,
   CLAUDE_READY_MARKERS,
@@ -112,7 +114,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   private readonly sessions = new Map<string, RuntimeSession>();
   private readonly processRegistry: ClaudeProcessRegistry;
 
-  constructor(private readonly config: TeleCodexConfig) {
+  constructor(private readonly config: TeleCodeConfig) {
     this.processRegistry = new ClaudeProcessRegistry(claudeProcessRegistryPath(config.workspace));
   }
 
@@ -568,44 +570,19 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     };
   }
 
-  /**
-   * Scrape Claude Code's own `/usage` panel, which is the only place the live subscription
-   * rate-limit picture (5-hour block, weekly, resets) is shown — it is not in the transcript
-   * or any local file. We drive the interactive panel in the PTY, capture the rendered text,
-   * then dismiss it and confirm the prompt returned so the session stays usable.
-   */
+  /** Read the same OAuth usage endpoint as Claude Code without spawning or touching a PTY. */
   async getUsageReport(sessionId: string): Promise<string | null> {
     const runtime = this.requireRuntime(sessionId);
     if (runtime.busy) {
       throw new Error("Cannot read Claude usage while a turn is running");
     }
-    await this.ensurePty(runtime, "resume");
-    const ptySession = runtime.pty;
-    if (!ptySession) {
-      return null;
+    const configDir = this.config.claudeStrictMcpConfig
+      ? join(homedir(), ".claude")
+      : this.config.claudeConfigDir;
+    if (!this.config.claudeStrictMcpConfig) {
+      ensureClaudeConfigDir(configDir);
     }
-
-    ptySession.clearBuffer();
-    await ptySession.sendCommand("/usage");
-    // Wait for the panel to paint; on no match, fall through and scrape whatever rendered.
-    await ptySession.waitForMarker(
-      [/current/, /resets?/, /limit/, /%/, /week/, /session/, /usage/],
-      8000,
-    );
-    await sleep(900);
-    const screen = ptySession.strippedText();
-
-    // Dismiss the panel and confirm the interactive prompt came back, so the next turn is
-    // typed at the prompt and not into a stuck panel.
-    ptySession.pressEscape();
-    ptySession.clearBuffer();
-    const ready = await ptySession.waitForReadyPrompt(4000);
-    if (!ready) {
-      ptySession.pressEscape();
-      await sleep(400);
-    }
-
-    return cleanUsagePanel(screen);
+    return await fetchClaudeUsageReport({ configDir });
   }
 
   async dispose(sessionId?: string): Promise<void> {
@@ -646,7 +623,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           "--session-id",
           runtime.providerSessionId,
           "-n",
-          runtime.descriptor.displayName || "TeleCodex Claude",
+          runtime.descriptor.displayName || "TeleCode Claude",
           "--permission-mode",
           runtime.permissionMode,
         ]
@@ -673,8 +650,8 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       args.unshift("--dangerously-skip-permissions");
     }
 
-    args.push("--settings", JSON.stringify(TELECODEX_CLAUDE_SETTINGS));
-    args.push("--append-system-prompt", TELECODEX_CLAUDE_SYSTEM_PROMPT);
+    args.push("--settings", JSON.stringify(TELECODE_CLAUDE_SETTINGS));
+    args.push("--append-system-prompt", TELECODE_CLAUDE_SYSTEM_PROMPT);
 
     const strictMcp = this.config.claudeStrictMcpConfig;
     if (strictMcp) {
@@ -746,7 +723,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         // Large-session resume picker.
         if (this.config.claudeLargeSessionResume === "manual") {
           await disposeWith(
-            "Claude is asking how to resume a very large session. Set CLAUDE_LARGE_SESSION_RESUME=summary or full, then restart TeleCodex.",
+            "Claude is asking how to resume a very large session. Set CLAUDE_LARGE_SESSION_RESUME=summary or full, then restart TeleCode.",
           );
         }
         const resumeStartedAt = Date.now();
@@ -867,7 +844,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     try {
       this.processRegistry.upsert(record);
     } catch (error) {
-      console.warn("Failed to record TeleCodex Claude process", error);
+      console.warn("Failed to record TeleCode Claude process", error);
     }
   }
 
@@ -875,7 +852,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     try {
       this.processRegistry.removePid(pid);
     } catch (error) {
-      console.warn("Failed to remove TeleCodex Claude process record", error);
+      console.warn("Failed to remove TeleCode Claude process record", error);
     }
   }
 
@@ -883,7 +860,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     try {
       this.processRegistry.removeSession(sessionId);
     } catch (error) {
-      console.warn("Failed to remove TeleCodex Claude session process record", error);
+      console.warn("Failed to remove TeleCode Claude session process record", error);
     }
   }
 
@@ -988,6 +965,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           expectedSessionId: runtime.providerSessionId,
           knownPath,
           minOffset: knownOffset,
+          before,
           configDir,
         });
         if (recovered) {
@@ -997,6 +975,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
           expectedSessionId: runtime.providerSessionId,
           knownPath,
           minOffset: knownOffset,
+          before,
           configDir,
         });
         if (singlePrompt) {
@@ -1184,7 +1163,7 @@ function extractModelCommandFailure(screen: string): string | undefined {
 }
 
 /**
- * True when the prompt is a real Claude Code slash command that TeleCodex forwards to the
+ * True when the prompt is a real Claude Code slash command that TeleCode forwards to the
  * PTY (DISPATCH / DISPATCH+ARG). These are recorded by Claude as <command-name> transcript
  * entries, not plain user prompts, so their turns must be located by transcript growth
  * rather than by prompt echo. /model is handled separately, so it is excluded here.
@@ -1203,17 +1182,17 @@ function shouldPassClaudeModel(model: string): boolean {
   return Boolean(normalized && normalized !== "default");
 }
 
-const TELECODEX_CLAUDE_SETTINGS = {
+const TELECODE_CLAUDE_SETTINGS = {
   channelsEnabled: false,
   enabledPlugins: {
     "telegram@claude-plugins-official": false,
   },
 };
 
-const TELECODEX_CLAUDE_SYSTEM_PROMPT = [
-  "You are running inside TeleCodex, which relays this Claude Code session to Anthony through its own Telegram bot.",
+const TELECODE_CLAUDE_SYSTEM_PROMPT = [
+  "You are running inside TeleCode, which relays this Claude Code session to Anthony through its own Telegram bot.",
   "Do not send Telegram messages yourself. Do not use Telegram channel plugins, Telegram skills, Telegram bot tokens, curl requests to api.telegram.org, or scripts that contact Telegram.",
-  "Return every response through the current Claude Code conversation transcript only; TeleCodex will deliver it to Anthony.",
+  "Return every response through the current Claude Code conversation transcript only; TeleCode will deliver it to Anthony.",
 ].join("\n");
 
 function safeFileSize(filePath: string): number {
@@ -1239,7 +1218,7 @@ function appendScreenTail(message: string, ptySession: ClaudePty | undefined): s
 
 /**
  * Turn a raw `/usage` panel screen capture into a clean, screen-reader-friendly block:
- * drop box-drawing chrome, the input prompt/footer, and the TeleCodex system-prompt echo,
+ * drop box-drawing chrome, the input prompt/footer, and the TeleCode system-prompt echo,
  * then collapse blank runs. Returns null when nothing usable is left.
  */
 export function cleanUsagePanel(screen: string): string | null {
@@ -1259,7 +1238,7 @@ export function cleanUsagePanel(screen: string): string | null {
         lower.includes("? for shortcuts") ||
         lower.includes("esc to") ||
         lower.includes("to go back") ||
-        lower.includes("telecodex") ||
+        lower.includes("telecode") ||
         lower.startsWith(">") ||
         lower === "usage" ||
         /^[\s>│|]+$/.test(line)
@@ -1328,7 +1307,7 @@ function cleanScreenFallbackCandidate(raw: string): string | undefined {
     lower.includes("accept edits") ||
     lower.includes("shift+tab") ||
     lower.includes("/effort") ||
-    lower.includes("telecodex") ||
+    lower.includes("telecode") ||
     lower.includes("tokens)") ||
     lower === "high" ||
     lower === "medium" ||

@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { collectArtifactReport, collectArtifacts, ensureOutDir, formatArtifactSummary } from "../src/artifacts.js";
 
 describe("ensureOutDir", () => {
-  const testDir = path.join(tmpdir(), `telecodex-art-${randomUUID()}`);
+  const testDir = path.join(tmpdir(), `telecode-art-${randomUUID()}`);
 
   afterEach(async () => {
     await rm(testDir, { recursive: true, force: true }).catch(() => {});
@@ -21,7 +21,7 @@ describe("ensureOutDir", () => {
 });
 
 describe("collectArtifacts", () => {
-  const testDir = path.join(tmpdir(), `telecodex-collect-${randomUUID()}`);
+  const testDir = path.join(tmpdir(), `telecode-collect-${randomUUID()}`);
 
   afterEach(async () => {
     await rm(testDir, { recursive: true, force: true }).catch(() => {});

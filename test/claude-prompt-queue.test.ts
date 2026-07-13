@@ -13,7 +13,7 @@ describe("ClaudePromptQueue", () => {
   let queuePath: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(path.join(tmpdir(), "telecodex-claude-queue-"));
+    tempDir = mkdtempSync(path.join(tmpdir(), "telecode-claude-queue-"));
     queuePath = claudePromptQueuePath(tempDir);
   });
 

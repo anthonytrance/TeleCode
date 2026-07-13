@@ -20,21 +20,24 @@ const execFileAsync = promisify(execFile);
 
 export function assertTelegramPollingSafety(options: PollingSafetyOptions): PollingSafetyResult {
   const env = options.env ?? process.env;
-  const tokenRole = parseTokenRole(env.TELECODEX_TOKEN_ROLE);
-  const canaryMode = parseBoolean(env.TELECODEX_CANARY_MODE, false);
-  const allowProductionPolling = parseBoolean(env.TELECODEX_ALLOW_PRODUCTION_POLLING, false);
+  const tokenRole = parseTokenRole(readTeleCodeEnv(env, "TOKEN_ROLE"));
+  const canaryMode = parseBoolean(readTeleCodeEnv(env, "CANARY_MODE"), false);
+  const allowProductionPolling = parseBoolean(
+    readTeleCodeEnv(env, "ALLOW_PRODUCTION_POLLING"),
+    false,
+  );
   const tokenFingerprint = fingerprintTelegramToken(options.token);
 
   if (tokenRole === "canary" && !canaryMode) {
-    throw new Error("TELECODEX_TOKEN_ROLE=canary requires TELECODEX_CANARY_MODE=true.");
+    throw new Error("TELECODE_TOKEN_ROLE=canary requires TELECODE_CANARY_MODE=true.");
   }
 
   if (tokenRole === "production" && canaryMode) {
-    throw new Error("TELECODEX_TOKEN_ROLE=production cannot be used with TELECODEX_CANARY_MODE=true.");
+    throw new Error("TELECODE_TOKEN_ROLE=production cannot be used with TELECODE_CANARY_MODE=true.");
   }
 
   if (tokenRole === "production" && !allowProductionPolling) {
-    throw new Error("TELECODEX_TOKEN_ROLE=production requires TELECODEX_ALLOW_PRODUCTION_POLLING=true.");
+    throw new Error("TELECODE_TOKEN_ROLE=production requires TELECODE_ALLOW_PRODUCTION_POLLING=true.");
   }
 
   return {
@@ -43,6 +46,10 @@ export function assertTelegramPollingSafety(options: PollingSafetyOptions): Poll
     allowProductionPolling,
     tokenFingerprint,
   };
+}
+
+function readTeleCodeEnv(env: NodeJS.ProcessEnv, suffix: string): string | undefined {
+  return env[`TELECODE_${suffix}`] ?? env[`TELECODEX_${suffix}`];
 }
 
 export function fingerprintTelegramToken(token: string): string {
@@ -99,7 +106,7 @@ function parseTokenRole(raw: string | undefined): TelegramTokenRole {
       return value;
     default:
       throw new Error(
-        `Invalid TELECODEX_TOKEN_ROLE: ${raw}. Expected development, canary, or production.`,
+        `Invalid TELECODE_TOKEN_ROLE: ${raw}. Expected development, canary, or production.`,
       );
   }
 }

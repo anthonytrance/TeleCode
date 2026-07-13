@@ -37,7 +37,7 @@ describe("codex-mcp-toggle", () => {
   let savedCodexHome: string | undefined;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(path.join(os.tmpdir(), "telecodex-mcp-toggle-"));
+    tempDir = mkdtempSync(path.join(os.tmpdir(), "telecode-mcp-toggle-"));
     savedCodexHome = process.env.CODEX_HOME;
     process.env.CODEX_HOME = tempDir;
     setCodexMcpEnabled(false);

@@ -66,7 +66,7 @@ import {
   readThreadHistory,
   type CodexThreadRecord,
 } from "./codex-state.js";
-import type { CodexBackend, ClaudePermissionMode, ProgressDelivery, TeleCodexConfig, ToolVerbosity } from "./config.js";
+import type { CodexBackend, ClaudePermissionMode, ProgressDelivery, TeleCodeConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
@@ -101,7 +101,6 @@ export const PROGRESS_EDIT_BUDGET_CHARS = 3500;
 // A held Claude narration line is flushed after this idle gap so the first line does not
 // wait for Claude's next block. Long enough that a normal turn ends (clearing it) first.
 const NARRATION_IDLE_FLUSH_MS = 1500;
-const BACKGROUND_NOTICE_PREVIEW_LIMIT = 700;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
 const STREAMING_PREVIEW_LIMIT = 3800;
@@ -132,7 +131,7 @@ const NATIVE_CODEX_COMMANDS = [
   "config",
   "limits",
 ] as const;
-const TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
+const TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "start",
   "help",
   "health",
@@ -150,6 +149,10 @@ const TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "sessions",
   "switch",
   "use",
+  "replay",
+  "copy",
+  "last",
+  "repeat",
   "workspaces",
   "workspace",
   "backend",
@@ -277,12 +280,12 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
   return keyboard;
 }
 
-export interface TeleCodexBot extends Bot<Context> {
+export interface TeleCodeBot extends Bot<Context> {
   disposeProviders(): Promise<void>;
 }
 
-export function createBot(config: TeleCodexConfig, registry: SessionRegistry): TeleCodexBot {
-  const bot = new Bot<Context>(config.telegramBotToken) as TeleCodexBot;
+export function createBot(config: TeleCodeConfig, registry: SessionRegistry): TeleCodeBot {
+  const bot = new Bot<Context>(config.telegramBotToken) as TeleCodeBot;
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
   const startedAt = Date.now();
   initBridgeLog(config.workspace);
@@ -293,6 +296,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     session.workspace = normalizePersistedWorkspace(session.workspace, config.workspace);
   }
   const agentSessions = new AgentSessionManager({ state: agentSessionState });
+  applyAgentSessionRepairs(
+    agentSessions,
+    path.join(config.workspace, ".telecodex", "provider-state", "agent-session-repair.json"),
+  );
+  agentSessions.abortPersistedJobs();
   const outputBuffer = new OutputBuffer();
   const busyProviders = new Map<TelegramContextKey, Set<AgentProviderKind>>();
   agentSessions.importLegacyContexts(registry.listContexts(), { defaultProvider: "codex", selectImported: true });
@@ -336,6 +344,43 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     ? new ClaudeBackendPrefs(claudeBackendPrefsPath(config.workspace))
     : undefined;
   const claudeSessions = new Map<TelegramContextKey, AgentSessionDescriptor>();
+
+  // The provider state is the authoritative pointer for the Claude conversation
+  // attached to a Telegram lane. If transcript recovery ever corrected that pointer,
+  // keep the parallel session index in sync on startup instead of leaving /sessions
+  // pointed at a stale transcript.
+  if (claudeState) {
+    let repairedAgentSessionState = false;
+    for (const record of claudeState.list()) {
+      const laneClaudeSessions = agentSessions
+        .listLaneSessions(record.telegramContextKey)
+        .filter((session) => session.provider === "claude");
+      const target = laneClaudeSessions.sort((left, right) =>
+        Math.abs(left.createdAt - record.createdAt) - Math.abs(right.createdAt - record.createdAt)
+      )[0];
+      if (!target) {
+        continue;
+      }
+      if (target.providerSessionId !== record.sessionId) {
+        agentSessions.updateProviderSessionId(target.id, record.sessionId);
+        repairedAgentSessionState = true;
+      }
+      const repairedMetadata = {
+        ...target.metadata,
+        model: record.model,
+        permissionMode: record.permissionMode,
+        transcriptPath: record.transcriptPath,
+        backend: claudeBackendPrefs?.get(record.telegramContextKey) ?? config.claudeBackend,
+      };
+      if (JSON.stringify(target.metadata ?? {}) !== JSON.stringify(repairedMetadata)) {
+        agentSessions.updateMetadata(target.id, repairedMetadata);
+        repairedAgentSessionState = true;
+      }
+    }
+    if (repairedAgentSessionState) {
+      persistSafe(agentSessionStore, agentSessions);
+    }
+  }
 
   const cancelPendingClaudeLogin = (contextKey: TelegramContextKey): void => {
     const pending = pendingClaudeLogins.get(contextKey);
@@ -821,7 +866,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
     }
     const backend = getClaudeBackend(contextKey);
-    const descriptor = resumablePersisted && persistedTranscript
+    let descriptor = resumablePersisted && persistedTranscript
       ? await claudeAdapter.resumeSession({
           ...buildClaudeDescriptor(resumablePersisted),
           metadata: {
@@ -833,13 +878,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         }, onStartupStatus)
       : await claudeAdapter.createSession({
           workspace: config.claudeWorkspace,
-          displayName: `TeleCodex ${contextKey}`,
+          displayName: `TeleCode ${contextKey}`,
           metadata: {
             model: config.claudeDefaultModel,
             permissionMode: config.claudePermissionMode,
             backend,
           },
         }, onStartupStatus);
+    const actualBackend = claudeAdapter.getBackend(descriptor.id);
+    if (actualBackend !== backend) {
+      bridgeLog("backend", `correcting claude engine lane=${contextKey} requested=${backend} actual=${actualBackend}`);
+      await claudeAdapter.setBackend(descriptor.id, backend);
+      descriptor = await claudeAdapter.getSessionInfo(descriptor.id);
+    } else {
+      bridgeLog("backend", `claude engine selected lane=${contextKey} engine=${backend}`);
+    }
     claudeSessions.set(contextKey, descriptor);
     persistClaudeSession(contextKey, descriptor);
     return descriptor;
@@ -857,7 +910,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const previous = claudeSessions.get(contextKey);
     const descriptor = await claudeAdapter.createSession({
       workspace: config.claudeWorkspace,
-      displayName: `TeleCodex ${contextKey}`,
+      displayName: `TeleCode ${contextKey}`,
       metadata: {
         model,
         permissionMode: config.claudePermissionMode,
@@ -1392,6 +1445,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     let isFlushing = false;
     let flushPending = false;
     let finalized = false;
+    let finalizationPromise: Promise<void> | undefined;
     let planMessageId: number | undefined;
     let lastRenderedPlan = "";
     let planMessageSending = false;
@@ -1402,6 +1456,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     let agentJobId: string | undefined;
     let completedSuccessfully = false;
     let backgroundCompletionText: string | undefined;
+    const finalDelivery = { disposition: "none" as "none" | "foreground" | "buffered" };
 
     const isCodexForeground = (): boolean => isProviderForeground(contextKey, "codex");
     const bufferCodexOutput = (
@@ -1636,6 +1691,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
       if (!isCodexForeground()) {
+        for (const part of extractStreamParts(force)) {
+          bufferCodexOutput("assistant", part, false);
+        }
         return;
       }
       if (isFlushing) {
@@ -1799,6 +1857,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       if (!isCodexForeground()) {
         const text = chunks.map((chunk) => chunk.fallbackText ?? chunk.text).join("\n\n").trim();
         bufferCodexOutput(kind, text, priority);
+        if (kind === "final" || kind === "error") {
+          finalDelivery.disposition = "buffered";
+        }
         return;
       }
 
@@ -1825,6 +1886,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           fallbackText: chunk.fallbackText,
           messageThreadId,
         });
+      }
+      if (kind === "final" || kind === "error") {
+        finalDelivery.disposition = "foreground";
       }
     };
 
@@ -1883,6 +1947,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
       if (!isCodexForeground()) {
+        accumulatedText = "";
+        pendingStreamText = "";
+        bufferCodexOutput("assistant", text, false);
         return;
       }
 
@@ -1972,6 +2039,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         return;
       }
 
+    };
+
+    const requestFinalization = (): Promise<void> => {
+      finalizationPromise ??= finalizeResponse();
+      return finalizationPromise;
     };
 
     const callbacks: CodexSessionCallbacks = {
@@ -2175,7 +2247,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       },
       onAgentEnd: () => {
         if (finalizeOnAgentEnd) {
-          void finalizeResponse().catch((error) => {
+          void requestFinalization().catch((error) => {
             console.error("Failed to finalize Telegram response message", error);
           });
         } else {
@@ -2246,7 +2318,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         await session.prompt(promptInput, callbacks);
       }
       updateSessionMetadata(contextKey, session);
-      await finalizeResponse();
+      await requestFinalization();
       backgroundCompletionText = lastAssistantReply.get(contextKey) ?? "Codex finished.";
       completedSuccessfully = true;
     } catch (error) {
@@ -2298,12 +2370,32 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
           console.error("Failed to deliver artifacts:", artifactError);
         }
       }
-      if (codexAgentSession && backgroundCompletionText && !isCodexForeground()) {
+      if (codexAgentSession && backgroundCompletionText && finalDelivery.disposition === "buffered") {
         try {
-          await sendBackgroundCompletionNotice(ctx, contextKey, codexAgentSession, backgroundCompletionText, messageThreadId);
+          const delivered = isCodexForeground()
+            ? await (async (): Promise<boolean> => {
+                await deliverFinalMarkdown(
+                  backgroundCompletionText,
+                  completedSuccessfully ? "final" : "error",
+                  true,
+                );
+                return true;
+              })()
+            : await sendBackgroundCompletionNotice(
+                ctx,
+                contextKey,
+                codexAgentSession,
+                backgroundCompletionText,
+                messageThreadId,
+              );
+          if (delivered) {
+            clearDeliveredCompletionFromBuffer(codexAgentSession.id, backgroundCompletionText);
+          }
         } catch (noticeError) {
           console.error("Failed to send Codex background completion notice:", noticeError);
         }
+      } else if (codexAgentSession && backgroundCompletionText && finalDelivery.disposition === "foreground") {
+        clearDeliveredCompletionFromBuffer(codexAgentSession.id, backgroundCompletionText);
       }
       activeProgressRefreshers.delete(contextKey);
       if (agentJobId) {
@@ -2461,6 +2553,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     // Rolling window of recent Claude narration lines, mirroring the Codex progress buffer.
     const recentClaudeProgress: string[] = [];
     let descriptor: AgentSessionDescriptor | undefined;
+    let claudeAgentSession: AgentSessionRecord | undefined;
     let agentJobId: string | undefined;
     let completedSuccessfully = false;
     let deferQueuedDispatch = false;
@@ -2473,7 +2566,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       if (!descriptor || !outputText.trim()) {
         return;
       }
-      outputBuffer.append(descriptor.id, {
+      outputBuffer.append(claudeAgentSession?.id ?? descriptor.id, {
         kind,
         text: outputText,
         priority,
@@ -2606,6 +2699,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         select: isProviderForeground(contextKey, "claude"),
         metadata: descriptor.metadata,
       });
+      claudeAgentSession = agentSession;
       const provisionalTitle = provisionalClaudeTitle(text);
       if (provisionalTitle && isGenericClaudeDisplayName(descriptor.displayName, contextKey)) {
         descriptor = { ...descriptor, displayName: provisionalTitle };
@@ -2663,14 +2757,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
             await flushPendingClaudeAssistantProgress();
             await deliverClaudeStatusMessage(event.text);
             break;
-          case "tool_failed":
+          case "tool_failed": {
+            await flushPendingClaudeAssistantProgress();
+            if (config.toolVerbosity !== "all" && config.toolVerbosity !== "errors-only") {
+              break;
+            }
+            const message = `Claude tool failed: ${event.toolName}${event.text ? `: ${event.text}` : ""}`;
+            if (isProviderForeground(contextKey, "claude")) {
+              await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
+            } else {
+              bufferClaudeOutput("tool", message, true);
+            }
+            break;
+          }
           case "error": {
             // B1 invariant: a held narration block must not be lost when the turn
             // errors mid-way; flush it as progress before reporting the failure.
             await flushPendingClaudeAssistantProgress();
-            const message = event.type === "error"
-              ? `Claude error: ${event.message}`
-              : `Claude tool failed: ${event.toolName}${event.text ? `: ${event.text}` : ""}`;
+            const message = `Claude error: ${event.message}`;
             if (isProviderForeground(contextKey, "claude")) {
               await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
             } else {
@@ -2743,16 +2847,38 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         }
       };
 
+      let finalDelivered = false;
       if (finalTextToDeliver) {
         if (isProviderForeground(contextKey, "claude")) {
           await deliverClaudeFinal(finalTextToDeliver);
+          finalDelivered = true;
         } else {
-          const label = descriptor?.displayName || descriptor?.providerSessionId?.slice(0, 8);
-          const header = label
-            ? `Claude Code finished in background: ${label}`
-            : "Claude Code finished in background.";
-          await deliverClaudeFinal(finalTextToDeliver, header);
+          finalDelivered = source.ctx && descriptor
+            ? await sendBackgroundCompletionNotice(
+                source.ctx,
+                contextKey,
+                descriptor,
+                finalTextToDeliver,
+                messageThreadId,
+              )
+            : false;
+          if (!finalDelivered && isProviderForeground(contextKey, "claude")) {
+            await deliverClaudeFinal(finalTextToDeliver);
+            finalDelivered = true;
+          } else if (!finalDelivered && !source.ctx) {
+            const label = descriptor?.displayName || descriptor?.providerSessionId?.slice(0, 8);
+            const header = label
+              ? `Claude Code finished in background: ${label}`
+              : "Claude Code finished in background.";
+            await deliverClaudeFinal(finalTextToDeliver, header);
+            finalDelivered = true;
+          } else if (!finalDelivered) {
+            bufferClaudeOutput("final", finalTextToDeliver, true);
+          }
         }
+      }
+      if (descriptor && finalDelivered) {
+        clearDeliveredCompletionFromBuffer(claudeAgentSession?.id ?? descriptor.id, finalTextToDeliver);
       }
       if (descriptor) {
         persistClaudeSession(contextKey, descriptor);
@@ -2882,37 +3008,65 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
   };
 
+  const clearDeliveredCompletionFromBuffer = (sessionId: string, deliveredText: string): void => {
+    const normalizedDeliveredText = deliveredText.trim();
+    outputBuffer.drainWhere(
+      sessionId,
+      (event) => event.kind === "final" || (
+        event.kind === "error" && event.text?.trim() === normalizedDeliveredText
+      ),
+    );
+  };
+
+  const outputBufferSessionId = (
+    contextKey: TelegramContextKey,
+    descriptor: AgentSessionDescriptor | AgentSessionRecord,
+  ): string => {
+    if (agentSessions.getSession(descriptor.id)) {
+      return descriptor.id;
+    }
+    const matchingSession = agentSessions.listLaneSessions(contextKey).find((session) =>
+      session.provider === descriptor.provider &&
+      Boolean(descriptor.providerSessionId) &&
+      session.providerSessionId === descriptor.providerSessionId,
+    );
+    return matchingSession?.id ?? descriptor.id;
+  };
+
   const sendBackgroundCompletionNotice = async (
     ctx: Context,
     contextKey: TelegramContextKey,
     descriptor: AgentSessionDescriptor | AgentSessionRecord,
     finalText: string,
     messageThreadId?: number,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     if (isProviderForeground(contextKey, descriptor.provider)) {
-      return;
+      return false;
     }
 
     const lane = agentSessions.getLane(contextKey);
     if (lane?.notifyOnBackgroundCompletion === false) {
-      return;
+      return false;
     }
 
-    const providerName = formatProviderDisplayName(descriptor.provider);
-    const providerCommand = descriptor.provider === "claude"
-      ? "/claude"
-      : descriptor.provider === "codex"
-        ? "/codex"
-        : "/provider";
-    const label = descriptor.displayName || descriptor.providerSessionId?.slice(0, 8) || descriptor.id;
-    const preview = truncateBackgroundPreview(finalText, BACKGROUND_NOTICE_PREVIEW_LIMIT);
-    const plain = [
-      `${providerName} finished in background: ${label}`,
-      preview ? `Preview: ${preview}` : undefined,
-      `Use ${providerCommand} to switch back. Use /copy to resend the latest final reply.`,
-    ].filter((line): line is string => Boolean(line)).join("\n");
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return false;
+    }
 
-    await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+    const providerName = descriptor.provider === "claude"
+      ? "Claude Code"
+      : formatProviderDisplayName(descriptor.provider);
+    const label = descriptor.displayName || descriptor.providerSessionId?.slice(0, 8) || descriptor.id;
+    const completionText = `${providerName} finished in background: ${label}\n\n${finalText}`.trim();
+    for (const chunk of splitMarkdownForTelegram(completionText)) {
+      await sendTextMessage(ctx.api, chatId, chunk.text, {
+        parseMode: chunk.parseMode,
+        fallbackText: chunk.fallbackText,
+        messageThreadId,
+      });
+    }
+    return true;
   };
 
   const flushBufferedPriority = async (
@@ -2921,7 +3075,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     descriptor: AgentSessionDescriptor | AgentSessionRecord,
     messageThreadId?: number,
   ): Promise<void> => {
-    const events = outputBuffer.drainWhere(descriptor.id, (event) => event.priority);
+    const events = outputBuffer.drainWhere(
+      outputBufferSessionId(contextKey, descriptor),
+      (event) => event.priority,
+    );
     if (events.length === 0) {
       return;
     }
@@ -2963,7 +3120,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     const { parsed, spec } = classified;
-    if (TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE.has(parsed.name)) {
+    if (TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE.has(parsed.name)) {
       return false;
     }
 
@@ -3155,7 +3312,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       return;
     }
 
-    if (commandName === "copy") {
+    if (commandName === "copy" || commandName === "last" || commandName === "repeat") {
       const reply = lastAssistantReply.get(contextKey);
       if (!reply) {
         const message = "No assistant reply is available to copy yet.";
@@ -3624,7 +3781,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const rawContextKey = contextKeyFromCtx(ctx);
     if (rawContextKey && isClaudeActive(rawContextKey)) {
       const lines = [
-        "TeleCodex is running.",
+        "TeleCode is running.",
         "Active provider: Claude Code",
         `Workspace: ${config.claudeWorkspace}`,
         `Model: ${config.claudeDefaultModel}`,
@@ -4417,7 +4574,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         const goal = await getThreadGoal();
         if (goal?.status === "active" && session.getProcessingKind?.() !== "goal") {
           const note = [
-            "Goal is marked active, but TeleCodex is not currently attached to a running goal monitor.",
+            "Goal is marked active, but TeleCode is not currently attached to a running goal monitor.",
             "Use /goal resume to reattach and continue progress updates, or /goal pause to stop it.",
             "",
             formatThreadGoal(goal),
@@ -4707,7 +4864,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     startUserPrompt(ctx, contextKey, chatId, session, cached);
   });
 
-  bot.command("copy", async (ctx) => {
+  bot.command(["copy", "last", "repeat"], async (ctx) => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
       return;
@@ -4927,7 +5084,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
       }
 
       if (session.renameThread) {
-        await session.renameThread(`TeleCodex smoke ${new Date().toISOString()}`);
+        await session.renameThread(`TeleCode smoke ${new Date().toISOString()}`);
         steps.push("renamed thread");
       }
 
@@ -4980,9 +5137,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     const session = registry.get(contextKey);
     const workspace = session?.getCurrentWorkspace() ?? config.workspace;
     const outDir = outboxPath(workspace, turnId);
-    const filePath = path.join(outDir, "telecodex-artifact-test.txt");
+    const filePath = path.join(outDir, "telecode-artifact-test.txt");
     const content = [
-      "TeleCodex artifact delivery test",
+      "TeleCode artifact delivery test",
       `Created: ${new Date().toISOString()}`,
       `Backend: ${registry.getBackend(contextKey)}`,
       `Workspace: ${workspace}`,
@@ -5360,7 +5517,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         copiedToClipboard ? "" : undefined,
         copiedToClipboard ? "📋 Command copied to clipboard!" : undefined,
         "",
-        "Send any message here to start a new TeleCodex thread.",
+        "Send any message here to start a new TeleCode thread.",
       ]
         .filter((line): line is string => line !== undefined)
         .join("\n");
@@ -5373,7 +5530,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
         copiedToClipboard ? "" : undefined,
         copiedToClipboard ? "📋 <i>Command copied to clipboard!</i>" : undefined,
         "",
-        "Send any message here to start a new TeleCodex thread.",
+        "Send any message here to start a new TeleCode thread.",
       ]
         .filter((line): line is string => line !== undefined)
         .join("\n");
@@ -5451,6 +5608,55 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): T
     }
 
     await selectUnifiedAgentSession(ctx, contextKeyForAgent, agentArg);
+  });
+
+  bot.command("replay", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const chatId = ctx.chat?.id;
+    if (!contextKey || !chatId) {
+      return;
+    }
+
+    mirrorCurrentCodexAgentSession(contextKey, isProviderForeground(contextKey, "codex"));
+    const selectedSession = agentSessions.getSelectedSession(contextKey);
+    if (!selectedSession) {
+      const message = "No selected provider session has buffered output.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    const rawCount = getCommandArgument(ctx).trim().toLowerCase();
+    const requestedCount = rawCount === "all" ? 100 : rawCount ? Number(rawCount) : 20;
+    if (!Number.isInteger(requestedCount) || requestedCount < 1 || requestedCount > 100) {
+      const message = "Usage: /replay [1-100|all]";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    const replayable = outputBuffer
+      .list(selectedSession.id)
+      .filter((event) => !event.priority && (event.kind === "assistant" || event.kind === "tool" || event.kind === "status"));
+    const events = replayable.slice(-requestedCount);
+    if (events.length === 0) {
+      const message = `No buffered ${formatProviderDisplayName(selectedSession.provider)} commentary is waiting.`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+
+    const plain = [
+      `Buffered ${formatProviderDisplayName(selectedSession.provider)} output, ${events.length} block${events.length === 1 ? "" : "s"}:`,
+      ...events.map((event) => formatBufferedOutputEvent(event)),
+    ].join("\n\n");
+    for (const chunk of splitMarkdownForTelegram(plain)) {
+      await sendTextMessage(ctx.api, chatId, chunk.text, {
+        parseMode: chunk.parseMode,
+        fallbackText: chunk.fallbackText,
+        messageThreadId: parseContextKey(contextKey).messageThreadId,
+      });
+    }
+
+    const replayedIds = new Set(events.map((event) => event.id));
+    outputBuffer.drainWhere(selectedSession.id, (event) => replayedIds.has(event.id));
   });
 
   bot.hears(/^(?:use|switch)\s+(.+)/i, async (ctx) => {
@@ -6989,6 +7195,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "appbackendtest", description: "Smoke-test app-server backend" },
     { command: "artifacttest", description: "Send a generated test file" },
     { command: "sessions", description: "Browse provider sessions" },
+    { command: "replay", description: "Release buffered background commentary" },
     { command: "history", description: "Show recent local thread history" },
     { command: "children", description: "List child sessions" },
     { command: "follow", description: "Switch to a child session" },
@@ -7502,7 +7709,7 @@ async function downloadTelegramFile(
 
   const buffer = Buffer.from(await response.arrayBuffer());
   const extension = path.extname(file.file_path) || ".bin";
-  const tempPath = path.join(tmpdir(), `telecodex-file-${randomUUID()}${extension}`);
+  const tempPath = path.join(tmpdir(), `telecode-file-${randomUUID()}${extension}`);
   await writeFile(tempPath, buffer);
   return tempPath;
 }
@@ -7973,7 +8180,7 @@ function findEmbeddedClaudeCommandLine(text: string): string | undefined {
       continue;
     }
     const classified = classifyClaudeSlashCommand(trimmed);
-    if (classified?.spec || TELECODEX_COMMANDS_WHILE_CLAUDE_ACTIVE.has(commandName)) {
+    if (classified?.spec || TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE.has(commandName)) {
       return trimmed.split(/\s+/u)[0];
     }
   }
@@ -7992,6 +8199,38 @@ function isStandaloneClaudeDispatchPrompt(text: string): boolean {
 function commandNameFromSlashLine(text: string): string | undefined {
   const match = text.match(/^\/([a-zA-Z0-9_*.-]+)(?:@\w+)?(?:\s|$)/u);
   return match?.[1]?.trim().toLowerCase().replace(/_/g, "-");
+}
+
+function applyAgentSessionRepairs(manager: AgentSessionManager, filePath: string): void {
+  if (!existsSync(filePath)) {
+    return;
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as {
+      version?: number;
+      sessions?: Array<{
+        id?: string;
+        providerSessionId?: string;
+        metadata?: Record<string, unknown>;
+      }>;
+    };
+    if (parsed.version !== 1) {
+      return;
+    }
+    for (const repair of parsed.sessions ?? []) {
+      if (!repair.id || !manager.getSession(repair.id)) {
+        continue;
+      }
+      if (repair.providerSessionId) {
+        manager.updateProviderSessionId(repair.id, repair.providerSessionId);
+      }
+      if (repair.metadata) {
+        manager.updateMetadata(repair.id, repair.metadata);
+      }
+    }
+  } catch (error) {
+    console.warn("Failed to apply agent session repairs", error);
+  }
 }
 
 function asClaudePermissionMode(value: unknown): ClaudePermissionMode | undefined {
@@ -8040,14 +8279,6 @@ function formatBufferedOutputEvent(event: BufferedOutputEvent): string {
             : event.kind;
   const value = event.text ?? event.artifactPath ?? "";
   return value ? `${label}: ${value}` : label;
-}
-
-function truncateBackgroundPreview(text: string, maxLength: number): string {
-  const singleLine = text.replace(/\s+/g, " ").trim();
-  if (singleLine.length <= maxLength) {
-    return singleLine;
-  }
-  return `${singleLine.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
 function formatAgentJobLine(index: number, job: AgentJobRecord, session?: AgentSessionRecord): string {
@@ -8176,7 +8407,7 @@ function shouldReplaceSessionDisplayName(
   if (provider === "codex" && lower === "codex") {
     return true;
   }
-  if (provider === "claude" && (lower === "claude code" || lower.startsWith("telecodex "))) {
+  if (provider === "claude" && (lower === "claude code" || lower.startsWith("telecode "))) {
     return true;
   }
 
@@ -8288,7 +8519,7 @@ function isGenericClaudeDisplayName(displayName: string | undefined, contextKey:
     return true;
   }
   const normalized = displayName.trim().toLowerCase();
-  return normalized === "claude code" || normalized === `telecodex ${contextKey}`.toLowerCase();
+  return normalized === "claude code" || normalized === `telecode ${contextKey}`.toLowerCase();
 }
 
 type ClaudeTranscriptSessionSummary = {

@@ -473,6 +473,39 @@ describe("transcript discovery", () => {
     expect(active).toBeNull();
   });
 
+  it("does not recover a matching prompt from a stale transcript captured before send", async () => {
+    const stalePath = path.join(projectDir, "stale-canary.jsonl");
+    const livePath = path.join(projectDir, "live.jsonl");
+    writeFileSync(stalePath, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "test" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "CANARY_NEW_MODEL" }] } }),
+      "",
+    ].join("\n"), "utf8");
+    writeFileSync(livePath, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "still working" }] } })}\n`, "utf8");
+    const before = await snapshotTranscriptSizes(configDir);
+
+    appendFileSync(livePath, `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "background task finished" }] } })}\n`, "utf8");
+
+    const exact = await locateTranscriptTurnByPrompt({
+      promptText: "test",
+      expectedSessionId: "stale-canary",
+      knownPath: stalePath,
+      minOffset: before.get(stalePath),
+      before,
+      configDir,
+    });
+    const single = await locateSingleHumanPromptTurn({
+      expectedSessionId: "stale-canary",
+      knownPath: stalePath,
+      minOffset: before.get(stalePath),
+      before,
+      configDir,
+    });
+
+    expect(exact).toBeNull();
+    expect(single).toBeNull();
+  });
+
   it("recovers the single human prompt after the offset while ignoring tool results", async () => {
     const realPath = path.join(projectDir, "real-id.jsonl");
     writeFileSync(realPath, [

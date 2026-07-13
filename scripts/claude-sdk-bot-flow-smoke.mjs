@@ -17,7 +17,7 @@ import { acquireClaudeLiveLock } from "./claude-live-lock.mjs";
 process.env.ENABLE_CLAUDE_PROVIDER = "true";
 
 const baseConfig = loadConfig();
-const tempWorkspace = mkdtempSync(path.join(tmpdir(), "telecodex-sdk-smoke-"));
+const tempWorkspace = mkdtempSync(path.join(tmpdir(), "telecode-sdk-smoke-"));
 const memoryWord = "ZEBRAFISH";
 let registry;
 let bot;
@@ -165,8 +165,8 @@ function installBotInfo(bot) {
   bot.botInfo = {
     id: 999,
     is_bot: true,
-    first_name: "TeleCodex",
-    username: "TeleCodexBot",
+    first_name: "TeleCode",
+    username: "TeleCodeBot",
     can_join_groups: true,
     can_read_all_group_messages: false,
     supports_inline_queries: false,

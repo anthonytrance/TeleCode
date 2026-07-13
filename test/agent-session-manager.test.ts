@@ -2,6 +2,48 @@ import type { ContextMetadata } from "../src/session-registry.js";
 import { AgentSessionManager } from "../src/agent-session-manager.js";
 
 describe("AgentSessionManager", () => {
+  it("aborts jobs that were still in flight in persisted state", () => {
+    const manager = new AgentSessionManager({
+      now: () => 200,
+      state: {
+        version: 1,
+        lanes: [{
+          laneKey: "123",
+          defaultProvider: "claude",
+          sessionIds: ["claude-1"],
+          selectedSessionId: "claude-1",
+          deliveryMode: "buffer-background",
+          notifyOnBackgroundCompletion: true,
+          createdAt: 100,
+          updatedAt: 100,
+        }],
+        sessions: [{
+          id: "claude-1",
+          laneKey: "123",
+          provider: "claude",
+          workspace: "C:\\workspace",
+          status: "running",
+          currentJobId: "job-1",
+          createdAt: 100,
+          updatedAt: 100,
+        }],
+        jobs: [{
+          id: "job-1",
+          laneKey: "123",
+          sessionId: "claude-1",
+          provider: "claude",
+          status: "running",
+          startedAt: 100,
+          updatedAt: 100,
+        }],
+      },
+    });
+
+    expect(manager.abortPersistedJobs()).toHaveLength(1);
+    expect(manager.getSession("claude-1")).toMatchObject({ status: "aborted", currentJobId: undefined });
+    expect(manager.listJobs()[0]).toMatchObject({ status: "aborted", completedAt: 200 });
+  });
+
   const createManager = () => {
     let now = 1000;
     let id = 0;

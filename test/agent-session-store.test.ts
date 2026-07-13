@@ -13,7 +13,7 @@ describe("JsonAgentSessionStore", () => {
   let tempDir: string;
 
   beforeEach(() => {
-    tempDir = mkdtempSync(path.join(tmpdir(), "telecodex-agent-store-"));
+    tempDir = mkdtempSync(path.join(tmpdir(), "telecode-agent-store-"));
   });
 
   afterEach(() => {
@@ -31,14 +31,14 @@ describe("JsonAgentSessionStore", () => {
   });
 
   it("saves and loads agent session state without touching legacy contexts", () => {
-    const telecodexDir = path.join(tempDir, ".telecodex");
-    const legacyPath = path.join(telecodexDir, "contexts.json");
+    const telecodeDir = path.join(tempDir, ".telecodex");
+    const legacyPath = path.join(telecodeDir, "contexts.json");
     const storePath = agentSessionStatePath(tempDir);
     const manager = new AgentSessionManager({ idGenerator: (prefix) => `${prefix}-1`, now: () => 1000 });
     const session = manager.createSession("123", "codex", { workspace: tempDir });
     manager.startJob(session.id);
 
-    mkdirSync(telecodexDir, { recursive: true });
+    mkdirSync(telecodeDir, { recursive: true });
     writeFileSync(legacyPath, JSON.stringify([{ contextKey: "legacy" }]), { encoding: "utf8", flag: "wx" });
 
     const store = new JsonAgentSessionStore(storePath);

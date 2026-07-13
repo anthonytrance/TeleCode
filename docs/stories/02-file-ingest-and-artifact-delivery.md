@@ -1,6 +1,6 @@
 # Story 02: File Ingest And Artifact Delivery
 
-TeleCodex currently supports text, voice/audio transcription, and photos, but not the broader file workflow that serious remote coding requires. Users need to send logs, patches, repro archives, PDFs, and source files into a turn, and they need generated artifacts back out. This story adds a practical file pipeline without waiting for arbitrary binary support from the Codex SDK input surface.
+TeleCode currently supports text, voice/audio transcription, and photos, but not the broader file workflow that serious remote coding requires. Users need to send logs, patches, repro archives, PDFs, and source files into a turn, and they need generated artifacts back out. This story adds a practical file pipeline without waiting for arbitrary binary support from the Codex SDK input surface.
 
 ## Architecture Context And Reuse Guidance
 
@@ -8,7 +8,7 @@ Current input handling lives in `src/bot.ts`, and `src/codex-session.ts` already
 
 Patterns to borrow:
 
-- `Headcrab/telecodex`: stage inbound files under a session-local inbox and return artifacts from a known output directory.
+- `Headcrab/telecode`: stage inbound files under a session-local inbox and return artifacts from a known output directory.
 - `yschaub/codex-telegram`: treat uploads as first-class coding inputs, not chat extras.
 - `zonigold-zz/codex-cli-telegram-wrapper`: keep the Telegram UX readable by editing a rolling status message rather than spamming the chat.
 
@@ -83,7 +83,7 @@ OpenAI constraint to respect:
 
 ## Acceptance Criteria
 
-- A Telegram document can be sent to TeleCodex and becomes available to Codex inside the active workspace without manual operator intervention.
+- A Telegram document can be sent to TeleCode and becomes available to Codex inside the active workspace without manual operator intervention.
 - Image handling continues to work exactly as before.
 - Codex receives clear instructions about where non-image files were staged and where output files should be written.
 - Files written to the configured turn output directory are uploaded back to Telegram after the turn completes.

@@ -1,14 +1,17 @@
-# TeleCodex
+# TeleCode
 
-TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex thread alive from your phone, streams agent responses and tool output in real time, and lets you hand the thread back to the CLI whenever you want.
+TeleCode is a provider-aware Telegram interface for coding agents. It runs persistent OpenAI Codex and Claude Code sessions, supports parallel provider workflows, and exposes SDK, app-server, session, usage, and delivery diagnostics without requiring a visual terminal.
 
 ## Features
 
-- **Per-context sessions** — each Telegram chat or forum topic gets its own independent Codex session with separate thread, model, and busy state
-- **Streaming responses** — agent text edits in-place as Codex generates it
+- **Codex and Claude Code** — switch providers per Telegram context while preserving each provider's conversation
+- **Parallel provider sessions** — keep working in the foreground while another provider finishes in the background
+- **Per-context sessions** — each Telegram chat or forum topic gets independent provider sessions, models, and busy state
+- **Backend diagnostics** — inspect and switch Codex SDK/app-server and Claude SDK/PTY paths from Telegram
+- **Streaming responses** — agent text can be delivered as messages, a rolling edited message, or final-only output
 - **Full tool visibility** — shell commands, file changes, web searches, MCP calls, and error items shown with configurable verbosity
 - **Live plan display** — Codex's todo list rendered as a separate message and updated as steps complete
-- **Voice transcription** — send a voice message or audio file; TeleCodex transcribes it (local parakeet-coreml or OpenAI Whisper) and forwards the text to Codex
+- **Voice transcription** — send a voice message or audio file; TeleCode transcribes it (local parakeet-coreml or OpenAI Whisper) and forwards the text to Codex
 - **Image input** — send a photo (with optional caption) to pass screenshots or images directly to Codex
 - **File ingest & artifacts** — send a document to stage it for Codex; generated files are delivered back as Telegram documents
 - **Session browser** — `/sessions` lists recent threads from `~/.codex`, grouped by workspace; tap to switch
@@ -53,7 +56,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    | `TELEGRAM_ALLOWED_USER_IDS` | ✅ | Comma-separated Telegram user IDs |
    | `CODEX_API_KEY` | — | API key for Codex (alternative to ChatGPT login) |
    | `CODEX_MODEL` | — | Default model, e.g. `gpt-5.4`, `o3` |
-   | `CODEX_BACKEND` | — | Runtime backend selector. Keep `sdk` for now; `app-server` is reserved until the native backend is implemented |
+  | `CODEX_BACKEND` | — | Runtime backend selector: `app-server` or `sdk` |
    | `CODEX_APP_SERVER_PATH` | — | Optional absolute Codex binary path used by `/appserver` |
    | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
    | `CODEX_APPROVAL_POLICY` | — | `never` *(default)*, `on-request`, `on-failure`, `untrusted` |
@@ -96,10 +99,11 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/appserverturn <prompt>` | Run one isolated app-server diagnostic turn |
 | `/appserversteer <initial> || <steer>` | Run one isolated app-server turn and steer it mid-turn |
 | `/appbackendtest` | Smoke-test the app-server backend path without switching this Telegram context |
-| `/artifacttest` | Generate and send a small text file through TeleCodex artifact delivery |
+| `/artifacttest` | Generate and send a small text file through TeleCode artifact delivery |
 | `/sessions` | Browse recent threads grouped by workspace; tap to switch |
 | `/switch <id>` | Switch directly to a thread by ID |
 | `/retry` | Resend the last prompt |
+| `/last` | Repeat the latest completed assistant reply (`/copy` and `/repeat` aliases) |
 | `/abort` | Cancel the current turn |
 | `/steer <text>` | Steer an active Codex app-server turn or active Claude turn |
 | `/launch_profiles` | Select launch profile for new or reattached threads (`/launch` alias kept) |
@@ -114,9 +118,9 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 
 ### Voice, image & file input
 
-- **Voice / audio** — send any voice message or audio file; TeleCodex transcribes it and sends the result to Codex
+- **Voice / audio** — send any voice message or audio file; TeleCode transcribes it and sends the result to Codex
 - **Photos** — send a photo with an optional caption; the image is forwarded to Codex as visual input
-- **Documents** — send a file (with optional caption); TeleCodex stages it in the workspace, runs Codex, and delivers any generated files back as Telegram documents
+- **Documents** — send a file (with optional caption); TeleCode stages it in the workspace, runs Codex, and delivers any generated files back as Telegram documents
 
 ### Tool verbosity
 
@@ -141,9 +145,11 @@ Per-turn token usage is hidden by default. Set `SHOW_TURN_TOKEN_USAGE=true` if y
 
 Changing `/verbosity` during an active turn affects future progress updates in that turn. Telegram messages already sent are not merged or rewritten into the new mode.
 
+When Codex or Claude finishes in the background, TeleCode sends the full final answer with a provider completion heading. Intermediate background commentary stays quiet and is retained in a bounded 100-event in-memory backlog. Switch to that provider session and use `/replay [1-100|all]` to release the backlog in message-sized blocks. `/history` remains the transcript-backed option for older Codex output.
+
 ### Launch profiles
 
-- TeleCodex always provides a built-in `default` profile synthesized from `CODEX_SANDBOX_MODE` and `CODEX_APPROVAL_POLICY`
+- TeleCode always provides a built-in `default` profile synthesized from `CODEX_SANDBOX_MODE` and `CODEX_APPROVAL_POLICY`
 - Built-in Telegram-visible presets are:
   - `Default`
   - `Read Only`
@@ -188,6 +194,8 @@ The `SessionRegistry` maps context keys to `CodexSessionService` instances:
 
 Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecodex/contexts.json` and restored on restart so threads survive bot reboots.
 
+The `.telecodex` state directory is intentionally retained as a compatibility path after the TeleCode rename. Existing sessions and settings therefore need no migration. New `TELECODE_*` safety variables are canonical, while their legacy `TELECODEX_*` equivalents remain accepted.
+
 `/newsummary` follows the same active-thread replacement rule as `/new`, but it first captures a handoff summary from the previous active thread and sends that summary into the newly created thread.
 
 Each context has independent busy-state tracking, so a running prompt in one topic doesn't block another.
@@ -195,7 +203,7 @@ Each context has independent busy-state tracking, so a running prompt in one top
 ## Handoff: Telegram → CLI
 
 1. Run `/handback` in Telegram
-2. TeleCodex replies with:
+2. TeleCode replies with:
    ```bash
    cd '/path/to/project' && codex resume 'thread-abc123'
    ```
@@ -205,7 +213,7 @@ On macOS the command is also copied to the clipboard automatically.
 
 ## Handoff: Thread to Fresh Thread
 
-Run `/newsummary` or send `new from summary` to create a compact handoff inside Telegram. TeleCodex first asks the current thread for a summary, then starts a fresh Codex thread in the same context and sends that summary as the initial handoff. `/session` token totals are scoped to the new active thread after the handoff; previous-thread totals are not carried over.
+Run `/newsummary` or send `new from summary` to create a compact handoff inside Telegram. TeleCode first asks the current thread for a summary, then starts a fresh Codex thread in the same context and sends that summary as the initial handoff. `/session` token totals are scoped to the new active thread after the handoff; previous-thread totals are not carried over.
 
 ## Architecture
 
@@ -231,7 +239,7 @@ Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
 ## Project Layout
 
 ```
-TeleCodex/
+TeleCode/
 ├── src/
 │   ├── index.ts           — startup, signal handling, polling loop
 │   ├── bot.ts             — Telegram bot, all commands and handlers
@@ -278,7 +286,7 @@ npm test         # run vitest
 
 ## Release Automation
 
-TeleCodex does not yet use the TelePi npm release pipeline, but the exact Trusted Publishing process has been documented so it can be adopted here.
+TeleCode does not yet use the TelePi npm release pipeline, but the exact Trusted Publishing process has been documented so it can be adopted here.
 
 See:
 - `docs/npm-trusted-publishing.md`

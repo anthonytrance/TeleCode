@@ -27,7 +27,7 @@ describe("Claude command registry", () => {
       name: "model",
       argument: "sonnet",
     });
-    expect(parseClaudeSlashCommand("/add-dir@TeleCodexBot C:\\Users\\Anthony\\codetest")).toEqual({
+    expect(parseClaudeSlashCommand("/add-dir@TeleCodeBot C:\\Users\\Anthony\\codetest")).toEqual({
       name: "add-dir",
       argument: "C:\\Users\\Anthony\\codetest",
     });

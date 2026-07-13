@@ -9,7 +9,7 @@ import { acquireClaudeLiveLock } from "./claude-live-lock.mjs";
 process.env.ENABLE_CLAUDE_PROVIDER = "true";
 
 const baseConfig = loadConfig();
-const tempWorkspace = mkdtempSync(path.join(tmpdir(), "telecodex-claude-tool-smoke-"));
+const tempWorkspace = mkdtempSync(path.join(tmpdir(), "telecode-claude-tool-smoke-"));
 const config = {
   ...baseConfig,
   workspace: tempWorkspace,
@@ -39,7 +39,7 @@ try {
   console.log("[claude-tool-smoke] model:", config.claudeDefaultModel);
 
   const descriptor = await adapter.createSession({
-    displayName: "TeleCodex Claude tool smoke",
+    displayName: "TeleCode Claude tool smoke",
     workspace: config.claudeWorkspace,
     metadata: {
       model: config.claudeDefaultModel,
@@ -49,8 +49,8 @@ try {
   sessionId = descriptor.id;
 
   const prompt = [
-    "Use PowerShell to run this exact command: Write-Output TELECODEX_TOOL_OK",
-    "After the command succeeds, reply with exactly TELECODEX_TOOL_OK and nothing else.",
+    "Use PowerShell to run this exact command: Write-Output TELECODE_TOOL_OK",
+    "After the command succeeds, reply with exactly TELECODE_TOOL_OK and nothing else.",
   ].join("\n");
 
   let assistantText = "";
@@ -69,8 +69,8 @@ try {
     }
   }
 
-  if (!assistantText.toUpperCase().includes("TELECODEX_TOOL_OK")) {
-    throw new Error(`Expected TELECODEX_TOOL_OK, got ${JSON.stringify(assistantText.trim())}`);
+  if (!assistantText.toUpperCase().includes("TELECODE_TOOL_OK")) {
+    throw new Error(`Expected TELECODE_TOOL_OK, got ${JSON.stringify(assistantText.trim())}`);
   }
   if (!seen.tool_started || !seen.tool_completed) {
     throw new Error(`Expected tool_started and tool_completed events, saw ${JSON.stringify(seen)}`);

@@ -8,7 +8,7 @@ import readline from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
 import { buildCodexMcpOverrideArgs } from "./codex-mcp-toggle.js";
-import type { TeleCodexConfig } from "./config.js";
+import type { TeleCodeConfig } from "./config.js";
 
 const REQUEST_TIMEOUT_MS = 15000;
 const TURN_TIMEOUT_MS = 120000;
@@ -252,8 +252,8 @@ export class CodexAppServerClient {
   async initialize(optOutNotificationMethods = DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS): Promise<AppServerInitializeResponse> {
     return await this.request<AppServerInitializeResponse>("initialize", {
       clientInfo: {
-        name: "telecodex",
-        title: "TeleCodex",
+        name: "telecode",
+        title: "TeleCode",
         version: "0.1.0",
       },
       capabilities: {
@@ -495,7 +495,7 @@ export function safeAppServerServerRequestResponse(method: string): JsonValue | 
         contentItems: [
           {
             type: "inputText",
-            text: "TeleCodex does not support this app-server tool request yet.",
+            text: "TeleCode does not support this app-server tool request yet.",
           },
         ],
       };
@@ -505,7 +505,7 @@ export function safeAppServerServerRequestResponse(method: string): JsonValue | 
 }
 
 export async function probeCodexAppServer(
-  config: TeleCodexConfig,
+  config: TeleCodeConfig,
   options: AppServerClientOptions = {},
 ): Promise<AppServerProbeResult> {
   const startedAt = Date.now();
@@ -563,7 +563,7 @@ export async function probeCodexAppServer(
 }
 
 export async function readCodexAppServerRateLimits(
-  config: TeleCodexConfig,
+  config: TeleCodeConfig,
   options: AppServerClientOptions = {},
 ): Promise<unknown> {
   const client = new CodexAppServerClient({
@@ -584,7 +584,7 @@ export async function readCodexAppServerRateLimits(
 }
 
 export async function runCodexAppServerTurn(
-  config: TeleCodexConfig,
+  config: TeleCodeConfig,
   prompt: string,
   options: AppServerClientOptions = {},
 ): Promise<AppServerTurnResult> {
@@ -698,7 +698,7 @@ export async function runCodexAppServerTurn(
 }
 
 export async function runCodexAppServerSteeredTurn(
-  config: TeleCodexConfig,
+  config: TeleCodeConfig,
   initialPrompt: string,
   steerPrompt: string,
   options: AppServerClientOptions & { steerDelayMs?: number } = {},

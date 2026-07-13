@@ -18,11 +18,11 @@ import {
   type SpawnAppServerProcess,
 } from "../src/app-server.js";
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
-import type { TeleCodexConfig } from "../src/config.js";
+import type { TeleCodeConfig } from "../src/config.js";
 
 describe("resolveCodexBinaryPath", () => {
   it("prefers Codex 0.133+ bin layout over the legacy codex directory", () => {
-    const tempDir = mkdtempSync(path.join(os.tmpdir(), "telecodex-codex-path-"));
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "telecode-codex-path-"));
     try {
       const vendorRoot = path.join(tempDir, "vendor");
       const targetTriple = "x86_64-pc-windows-msvc";
@@ -40,7 +40,7 @@ describe("resolveCodexBinaryPath", () => {
   });
 
   it("falls back to the pre-0.133 legacy codex directory when bin is absent", () => {
-    const tempDir = mkdtempSync(path.join(os.tmpdir(), "telecodex-codex-path-"));
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "telecode-codex-path-"));
     try {
       const vendorRoot = path.join(tempDir, "vendor");
       const targetTriple = "x86_64-pc-windows-msvc";
@@ -103,7 +103,7 @@ describe("CodexAppServerClient", () => {
   let savedCodexHome: string | undefined;
   beforeEach(() => {
     savedCodexHome = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = path.join(os.tmpdir(), `telecodex-test-empty-codex-home-${process.pid}`);
+    process.env.CODEX_HOME = path.join(os.tmpdir(), `telecode-test-empty-codex-home-${process.pid}`);
   });
   afterEach(() => {
     if (savedCodexHome === undefined) {
@@ -428,7 +428,7 @@ describe("runCodexAppServerSteeredTurn", () => {
   });
 });
 
-function createConfig(): TeleCodexConfig {
+function createConfig(): TeleCodeConfig {
   return {
     telegramBotToken: "bot-token",
     telegramAllowedUserIds: [123],

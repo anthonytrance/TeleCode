@@ -14,6 +14,7 @@ type RateLimitWindow = {
   used_percent?: number;
   window_minutes?: number;
   resets_at?: number;
+  observed_at?: string;
 };
 
 type CreditsInfo = unknown;
@@ -32,6 +33,7 @@ export type CodexUsageSnapshot = {
   modelContextWindow?: number;
   primary?: RateLimitWindow;
   secondary?: RateLimitWindow;
+  lastKnownFiveHour?: RateLimitWindow;
   planType?: string;
   credits?: CreditsInfo;
   availableResetCredits?: number;
@@ -64,6 +66,7 @@ export function mergeLiveAppServerRateLimits(
     modelContextWindow: snapshot?.modelContextWindow,
     primary: normalizeLiveWindow(limits.primary),
     secondary: normalizeLiveWindow(limits.secondary),
+    lastKnownFiveHour: snapshot?.lastKnownFiveHour,
     planType: asString(limits.planType),
     credits: limits.credits,
     availableResetCredits: availableCount,
@@ -85,6 +88,7 @@ export async function readLatestCodexUsage(): Promise<CodexUsageSnapshot | null>
   for (const file of files) {
     const snapshot = await readLatestUsageFromFile(file.path);
     if (snapshot) {
+      snapshot.lastKnownFiveHour = await findLatestWindowByDuration(files, 300);
       return snapshot;
     }
   }
@@ -98,8 +102,28 @@ export function renderUsagePlain(snapshot: CodexUsageSnapshot | null): string {
   }
 
   const lines = ["Codex usage:"];
-  lines.push(formatLimitLine("5-hour limit", snapshot.primary));
-  lines.push(formatLimitLine("Weekly limit", snapshot.secondary));
+  const windows = [snapshot.primary, snapshot.secondary]
+    .filter((window): window is RateLimitWindow => Boolean(window));
+  const fiveHour = windows.find((window) => window.window_minutes === 300);
+  const weekly = windows.find((window) => window.window_minutes === 7 * 24 * 60);
+  if (fiveHour) {
+    lines.push(formatLimitLine("5-hour limit", fiveHour));
+  } else if (snapshot.rateLimitsSource === "live-app-server") {
+    lines.push("5-hour limit: unavailable, OpenAI omitted this window from the live response");
+    if (snapshot.lastKnownFiveHour) {
+      lines.push(formatLimitLine("Last 5-hour report (stale)", snapshot.lastKnownFiveHour, true));
+    }
+  } else {
+    lines.push("5-hour limit: not reported");
+  }
+  lines.push(weekly
+    ? formatLimitLine("Weekly limit", weekly)
+    : "Weekly limit: not reported");
+  for (const window of windows) {
+    if (window !== fiveHour && window !== weekly) {
+      lines.push(formatLimitLine(formatWindowLabel(window.window_minutes), window));
+    }
+  }
 
   if (snapshot.planType) {
     lines.push(`Plan: ${snapshot.planType}`);
@@ -110,7 +134,10 @@ export function renderUsagePlain(snapshot: CodexUsageSnapshot | null): string {
     lines.push(`Full limit resets available: ${snapshot.availableResetCredits}`);
   }
   if (snapshot.rateLimitsSource === "live-app-server") {
-    lines.push("Source: a fresh account/rateLimits/read request. If a prompt reports a different reset, Codex's app-server or upstream rate-limit state is inconsistent.");
+    lines.push("Source: a fresh OpenAI account/rateLimits/read request.");
+    if (!fiveHour && snapshot.lastKnownFiveHour) {
+      lines.push("Warning: OpenAI's live response is incomplete. This account reported and enforced a 5-hour window recently, but that window is currently missing.");
+    }
   }
 
   const contextLine = formatContextLine(snapshot.lastTokenUsage, snapshot.modelContextWindow);
@@ -190,14 +217,52 @@ async function readLatestUsageFromFile(filePath: string): Promise<CodexUsageSnap
   return null;
 }
 
-function formatLimitLine(label: string, window?: RateLimitWindow): string {
-  if (!window) {
-    return `${label}: not reported`;
+async function findLatestWindowByDuration(
+  files: Array<{ path: string }>,
+  windowMinutes: number,
+): Promise<RateLimitWindow | undefined> {
+  for (const file of files) {
+    let contents: string;
+    try {
+      contents = await readFile(file.path, "utf8");
+    } catch {
+      continue;
+    }
+    const lines = contents.trimEnd().split(/\r?\n/).reverse();
+    for (const line of lines) {
+      if (!line.includes('"token_count"')) {
+        continue;
+      }
+      try {
+        const event = JSON.parse(line);
+        const payload = event?.payload;
+        if (payload?.type !== "token_count") {
+          continue;
+        }
+        for (const window of [payload.rate_limits?.primary, payload.rate_limits?.secondary]) {
+          if (window?.window_minutes === windowMinutes) {
+            return { ...window, observed_at: event.timestamp };
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
   }
+  return undefined;
+}
 
-  const percent = typeof window.used_percent === "number" ? `${window.used_percent.toFixed(1)}% used` : "not reported";
-  const reset = typeof window.resets_at === "number" ? `resets ${formatEpochSeconds(window.resets_at)}` : "reset unknown";
-  return `${label}: ${percent}, ${reset}`;
+function formatLimitLine(label: string, window: RateLimitWindow, includeObservedAt = false): string {
+  const percent = typeof window.used_percent === "number"
+    ? `${window.used_percent.toFixed(1)}% used`
+    : "percentage not reported";
+  const reset = typeof window.resets_at === "number"
+    ? `resets ${formatEpochSeconds(window.resets_at)}`
+    : "reset time not reported";
+  const observed = includeObservedAt && window.observed_at
+    ? `, observed ${formatTimestamp(window.observed_at)}`
+    : "";
+  return `${label}: ${percent}, ${reset}${observed}`;
 }
 
 function formatContextLine(lastUsage?: TokenUsage, contextWindow?: number): string | null {
@@ -254,6 +319,24 @@ function formatTimestamp(timestamp: string): string {
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
+}
+
+function formatWindowLabel(minutes?: number): string {
+  return minutes === undefined
+    ? "Unspecified window"
+    : `${formatWindowDuration(minutes)} window`;
+}
+
+function formatWindowDuration(minutes: number): string {
+  if (minutes % (24 * 60) === 0) {
+    const days = minutes / (24 * 60);
+    return `${days} ${days === 1 ? "day" : "days"}`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+  }
+  return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
 }
 
 function normalizeLiveWindow(value: unknown): RateLimitWindow | undefined {

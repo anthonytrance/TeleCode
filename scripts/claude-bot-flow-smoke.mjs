@@ -11,7 +11,7 @@ import { acquireClaudeLiveLock } from "./claude-live-lock.mjs";
 process.env.ENABLE_CLAUDE_PROVIDER = "true";
 
 const baseConfig = loadConfig();
-const tempWorkspace = mkdtempSync(path.join(tmpdir(), "telecodex-bot-claude-smoke-"));
+const tempWorkspace = mkdtempSync(path.join(tmpdir(), "telecode-bot-claude-smoke-"));
 const expectedFirst = "CANARY_BOT_FLOW";
 const expectedSecond = "CANARY_BOT_SECOND";
 const expectedAfterExit = "CANARY_AFTER_EXIT";
@@ -158,8 +158,8 @@ function installBotInfo(bot) {
   bot.botInfo = {
     id: 999,
     is_bot: true,
-    first_name: "TeleCodex",
-    username: "TeleCodexBot",
+    first_name: "TeleCode",
+    username: "TeleCodeBot",
     can_join_groups: true,
     can_read_all_group_messages: false,
     supports_inline_queries: false,

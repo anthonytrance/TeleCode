@@ -11,7 +11,7 @@ import {
   type CodexSessionInfo,
   type CreateOptions,
 } from "./codex-session.js";
-import type { TeleCodexConfig } from "./config.js";
+import type { TeleCodeConfig } from "./config.js";
 import type { CodexModelRecord, CodexThreadRecord } from "./codex-state.js";
 
 export interface CodexSessionRuntime {
@@ -51,7 +51,7 @@ export interface CodexSessionRuntime {
 }
 
 export async function createCodexSession(
-  config: TeleCodexConfig,
+  config: TeleCodeConfig,
   options?: CreateOptions,
 ): Promise<CodexSessionRuntime> {
   if (config.codexBackend === "sdk") {

@@ -10,7 +10,7 @@ describe("ensureClaudeConfigDir", () => {
   let target: string;
 
   beforeEach(() => {
-    root = mkdtempSync(path.join(tmpdir(), "telecodex-cfgdir-"));
+    root = mkdtempSync(path.join(tmpdir(), "telecode-cfgdir-"));
     source = path.join(root, "real-claude");
     target = path.join(root, "isolated", "claude-config");
     mkdirSync(source, { recursive: true });

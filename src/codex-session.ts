@@ -10,7 +10,7 @@ import {
 } from "@openai/codex-sdk";
 
 import { buildCodexMcpOverrideConfig } from "./codex-mcp-toggle.js";
-import type { TeleCodexConfig } from "./config.js";
+import type { TeleCodeConfig } from "./config.js";
 import {
   getThread,
   getThreadByPrefix,
@@ -121,12 +121,12 @@ export class CodexSessionService {
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
   private sessionTokens = { input: 0, cached: 0, output: 0 };
 
-  private constructor(private readonly config: TeleCodexConfig) {
+  private constructor(private readonly config: TeleCodeConfig) {
     this.currentWorkspace = config.workspace;
     this.currentLaunchProfile = getLaunchProfile(config, config.defaultLaunchProfileId);
   }
 
-  static async create(config: TeleCodexConfig, options?: CreateOptions): Promise<CodexSessionService> {
+  static async create(config: TeleCodeConfig, options?: CreateOptions): Promise<CodexSessionService> {
     const service = new CodexSessionService(config);
     service.currentWorkspace = options?.workspace ?? config.workspace;
     service.currentModel = options?.model ?? config.codexModel;
@@ -599,7 +599,7 @@ export class CodexSessionService {
   }
 }
 
-function getLaunchProfile(config: TeleCodexConfig, profileId: string): CodexLaunchProfile {
+function getLaunchProfile(config: TeleCodeConfig, profileId: string): CodexLaunchProfile {
   const profile = findLaunchProfile(config.launchProfiles, profileId);
   if (!profile) {
     throw new Error(`Unknown launch profile: ${profileId}`);

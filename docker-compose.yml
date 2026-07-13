@@ -1,9 +1,9 @@
 services:
-  telecodex:
+  telecode:
     build: .
     env_file: .env
     volumes:
-      - ${HOME}/.codex:/home/telecodex/.codex:rw
+      - ${HOME}/.codex:/home/telecode/.codex:rw
       - ./workspace:/workspace:rw
     cap_drop:
       - ALL
