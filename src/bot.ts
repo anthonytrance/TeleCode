@@ -5222,8 +5222,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           "",
           "Available: pty, sdk",
           "",
-          "Use /backend sdk for the Agent SDK engine (full progress narration; currently billed to the subscription like interactive use, policy pause, revocable).",
-          "Use /backend pty for the terminal engine (guaranteed subscription floor).",
+          "Use /backend sdk for the Agent SDK engine (structured events, full progress narration).",
+          "Use /backend pty for the interactive terminal engine.",
           "The choice persists for this Telegram context and takes effect from the next turn.",
           "To change the Codex backend instead, switch with /codex first.",
         ].join("\n");

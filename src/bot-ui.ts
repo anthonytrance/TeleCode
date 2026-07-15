@@ -11,6 +11,18 @@ export interface DualText {
 export function renderHelpMessage(): DualText {
   const sections = [
     {
+      title: "🔀 Providers",
+      commands: [
+        ["/provider", "Show active provider for this context"],
+        ["/provider codex|claude", "Set the default provider"],
+        ["/claude", "Switch this context to Claude Code"],
+        ["/claude <prompt>", "Run one Claude prompt (and switch)"],
+        ["/codex", "Switch this context back to Codex"],
+        ["/jobs", "List running provider jobs in this context"],
+        ["/alljobs", "List running jobs across all contexts"],
+      ],
+    },
+    {
       title: "💬 Session",
       commands: [
         ["/new", "Start in current workspace"],
@@ -42,6 +54,7 @@ export function renderHelpMessage(): DualText {
         ["/use <number>", "Switch after /sessions"],
         ["/use previous", "Switch to previous thread"],
         ["/use latest", "Switch to latest thread"],
+        ["/switch <id>", "Switch directly to a thread by ID"],
         ["/history", "Show recent local thread history"],
         ["/children", "List child sessions"],
         ["/follow latest", "Switch to newest child session"],
@@ -88,6 +101,7 @@ export function renderHelpMessage(): DualText {
       commands: [
         ["/start", "Welcome & status"],
         ["/help", "This reference"],
+        ["/health", "Bridge health & delivery diagnostics"],
         ["/voice", "Voice transcription status"],
       ],
     },

@@ -1,28 +1,29 @@
 # TeleCode
 
-TeleCode is a provider-aware Telegram interface for coding agents. It runs persistent OpenAI Codex and Claude Code sessions, supports parallel provider workflows, and exposes SDK, app-server, session, usage, and delivery diagnostics without requiring a visual terminal.
+TeleCode is a provider-aware Telegram interface for coding agents. It runs persistent **OpenAI Codex** and **Claude Code** sessions side by side, supports parallel provider workflows, and exposes session, backend, usage, and delivery diagnostics without requiring a visual terminal.
+
+Everything is text-first and screen-reader friendly: progress, tool activity, plans, and final answers all arrive as plain Telegram messages.
 
 ## Features
 
 - **Codex and Claude Code** — switch providers per Telegram context while preserving each provider's conversation
-- **Parallel provider sessions** — keep working in the foreground while another provider finishes in the background
+- **Parallel provider sessions** — keep working in the foreground while another provider finishes in the background; background completions arrive with a provider heading, and `/replay` releases buffered commentary
 - **Per-context sessions** — each Telegram chat or forum topic gets independent provider sessions, models, and busy state
-- **Backend diagnostics** — inspect and switch Codex SDK/app-server and Claude SDK/PTY paths from Telegram
-- **Streaming responses** — agent text can be delivered as messages, a rolling edited message, or final-only output
-- **Full tool visibility** — shell commands, file changes, web searches, MCP calls, and error items shown with configurable verbosity
-- **Live plan display** — Codex's todo list rendered as a separate message and updated as steps complete
-- **Voice transcription** — send a voice message or audio file; TeleCode transcribes it (local parakeet-coreml or OpenAI Whisper) and forwards the text to Codex
-- **Image input** — send a photo (with optional caption) to pass screenshots or images directly to Codex
-- **File ingest & artifacts** — send a document to stage it for Codex; generated files are delivered back as Telegram documents
-- **Session browser** — `/sessions` lists recent threads from `~/.codex`, grouped by workspace; tap to switch
-- **Telegram login** — `/login` authenticates against the Codex CLI via device auth flow, no terminal needed
-- **Launch profiles** — `/launch_profiles` selects the sandbox + approval mode for new or reattached threads in the current Telegram context (`/launch` remains an alias)
-- **Model picker** — `/model` shows available models and lets you switch for new threads
-- **Reasoning effort** — `/effort` lets you dial from `minimal` to `xhigh` for new threads
-- **Optional message reactions** — 👀 while processing, 👍 on success when enabled; silently degrades in chats without reaction support
+- **Backend switching from Telegram** — Codex `sdk` / `app-server`, Claude `pty` (interactive terminal) / `sdk` (Agent SDK); choices persist per context across restarts
+- **Streaming responses** — agent text delivered as separate messages, a rolling edited message, or final-only output
+- **Live steering** — `/steer <text>` injects an instruction into an active Codex or Claude turn instead of waiting for it to finish
+- **Prompt queueing** — messages sent while the agent is busy are queued and dispatched in order instead of dropped
+- **Full tool visibility** — shell commands, file changes, web searches, MCP calls, and errors shown with configurable verbosity
+- **Live plan display** — the agent's todo list rendered as a separate message and updated as steps complete
+- **Voice transcription** — send a voice message or audio file; TeleCode transcribes it (faster-whisper, parakeet-coreml, or OpenAI Whisper) and forwards the text
+- **Image input** — send a photo (with optional caption) to pass screenshots or images to the agent
+- **File ingest & artifacts** — send a document to stage it in the workspace; generated files are delivered back as Telegram documents
+- **Session browser** — `/sessions` lists recent threads grouped by workspace; switch with a tap or `/use <n>`
+- **Telegram login** — `/login` runs the Codex device-auth flow, `/claude_login` the Claude Code login, no terminal needed
+- **Launch profiles** — `/launch_profiles` selects the sandbox + approval mode for new or reattached Codex threads
+- **Model picker & reasoning effort** — `/model` and `/effort` per context
 - **Friendly errors** — common SDK and network errors are translated to actionable messages with command hints
-- **Token usage** — session token totals shown on `/session`, with optional per-turn footer in replies
-- **Handback flow** — `/handback` prints a ready-to-run `codex resume <id>` command (copied to clipboard on macOS)
+- **Token usage** — session totals on `/session`, live Codex rate limits on `/usage`, optional per-turn footer
 - **User allowlist** — only configured Telegram user IDs can interact with the bot
 - **Docker-friendly** — workspace auto-detected (`/workspace` in containers, `cwd` otherwise)
 
@@ -33,6 +34,7 @@ TeleCode is a provider-aware Telegram interface for coding agents. It runs persi
 - The Codex CLI installed and authenticated on the host:
   - API key auth: set `CODEX_API_KEY`
   - ChatGPT login: `codex login` on the machine, or use `/login` from Telegram
+- *(Optional)* Claude Code installed and logged in on the host, for the Claude provider
 - *(Optional)* `ffmpeg` — required for local voice transcription via parakeet-coreml
 - *(Optional)* `OPENAI_API_KEY` — enables OpenAI Whisper as a voice transcription fallback
 
@@ -55,21 +57,33 @@ TeleCode is a provider-aware Telegram interface for coding agents. It runs persi
    | `TELEGRAM_BOT_TOKEN` | ✅ | Bot token from @BotFather |
    | `TELEGRAM_ALLOWED_USER_IDS` | ✅ | Comma-separated Telegram user IDs |
    | `CODEX_API_KEY` | — | API key for Codex (alternative to ChatGPT login) |
-   | `CODEX_MODEL` | — | Default model, e.g. `gpt-5.4`, `o3` |
-  | `CODEX_BACKEND` | — | Runtime backend selector: `app-server` or `sdk` |
+   | `CODEX_MODEL` | — | Default Codex model |
+   | `CODEX_BACKEND` | — | Codex runtime backend: `app-server` *(default)* or `sdk` |
    | `CODEX_APP_SERVER_PATH` | — | Optional absolute Codex binary path used by `/appserver` |
    | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
    | `CODEX_APPROVAL_POLICY` | — | `never` *(default)*, `on-request`, `on-failure`, `untrusted` |
    | `CODEX_LAUNCH_PROFILES_JSON` | — | Optional JSON array of named launch profiles for `/launch_profiles` |
    | `CODEX_DEFAULT_LAUNCH_PROFILE` | — | Default launch profile id (defaults to `default`) |
-   | `ENABLE_UNSAFE_LAUNCH_PROFILES` | — | Set to `true` to allow extra `danger-full-access` launch profiles |
+   | `ENABLE_UNSAFE_LAUNCH_PROFILES` | — | Set to `true` to allow `danger-full-access` launch profiles |
+   | `ENABLE_CLAUDE_PROVIDER` | — | Set to `true` to enable the Claude Code provider (`false` by default) |
+   | `CLAUDE_BIN` | — | Absolute Claude Code binary path; defaults to `~/.local/bin/claude(.exe)` or PATH |
+   | `CLAUDE_DEFAULT_MODEL` | — | Default Claude model for new sessions (default `claude-sonnet-5`) |
+   | `CLAUDE_BACKEND` | — | Default Claude engine: `pty` *(default)* or `sdk` |
+   | `CLAUDE_PERMISSION_MODE` | — | `default`, `acceptEdits` *(default)*, `plan`, `bypassPermissions` |
+   | `CLAUDE_WORKSPACE` | — | Workspace for Claude sessions (defaults to the main workspace) |
+   | `CLAUDE_TURN_IDLE_TIMEOUT` | — | Seconds of transcript silence before a Claude turn is considered stalled (default `180`) |
+   | `CLAUDE_CONTEXT_WINDOW` | — | Context window tokens used for `/context` reporting (default `200000`) |
+   | `CLAUDE_STRICT_MCP_CONFIG` | — | Keep `true` so the spawned Claude cannot start a competing Telegram poller |
+   | `CLAUDE_LARGE_SESSION_RESUME` | — | Resume policy for very large transcripts: `summary` *(default)*, `full`, `manual` |
    | `TOOL_VERBOSITY` | — | `all`, `summary` *(default)*, `errors-only`, `none` |
-   | `STREAM_ASSISTANT_TEXT` | — | Stream assistant text before final reply (`false` by default) |
-   | `PROGRESS_DELIVERY` | — | Intermediate progress delivery: `messages` *(default)*, `edit`, or `none` |
+   | `STREAM_ASSISTANT_TEXT` | — | Stream assistant text before the final reply (`false` by default) |
+   | `PROGRESS_DELIVERY` | — | Progress delivery: `messages` *(default)*, `edit`, or `none` |
    | `SHOW_TURN_TOKEN_USAGE` | — | Show the per-turn `in/cached/out` footer in final replies (`false` by default) |
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
    | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
+   | `FASTER_WHISPER_PYTHON` | — | Python binary of a faster-whisper environment for local voice transcription |
+   | `FASTER_WHISPER_MODEL` | — | faster-whisper model name (default `tiny`) |
    | `OPENAI_API_KEY` | — | Enables OpenAI Whisper voice transcription fallback |
 
 4. Start the bot:
@@ -79,50 +93,82 @@ TeleCode is a provider-aware Telegram interface for coding agents. It runs persi
 
 ## Telegram Commands
 
+### Providers
+
+| Command | Description |
+|---|---|
+| `/provider` | Show the active provider for this context |
+| `/provider codex\|claude` | Set the default provider for new sessions |
+| `/claude [prompt]` | Switch this context to Claude Code (optionally running a prompt immediately) |
+| `/codex` | Switch this context back to Codex |
+| `/jobs` | List running provider jobs in this context |
+| `/alljobs` | List running provider jobs across all contexts |
+| `/replay [n\|all]` | Release buffered background commentary for the selected session |
+
+### Session
+
 | Command | Description |
 |---|---|
 | `/start` | Welcome & status (concise for returning users) |
 | `/help` | Grouped command reference |
 | `/new` | Start a fresh thread (workspace picker if multiple workspaces) |
-| `/new default` | Start a fresh thread in `CODEX_WORKSPACE` |
+| `/new default` | Start a fresh thread in the configured workspace |
+| `/new claude [model]` | Start a fresh Claude session, optionally with a model |
 | `/newsummary` | Start a fresh thread from a handoff summary of the current thread |
-| `/newsummary default` | Summarize the current thread into a fresh `CODEX_WORKSPACE` thread |
-| `/forkthread [n]` | Fork the active app-server thread; with `n`, roll back that many turns on the fork only |
+| `/fork` | Fork the current session (Claude: fork the conversation; Codex: alias of `/new`) |
+| `/forkthread [n]` | Fork the active Codex app-server thread; with `n`, roll back that many turns on the fork |
 | `/renamethread <name>` | Rename the active app-server thread |
 | `/rollbackthread <n>` | Roll back app-server thread history by `n` turns; file changes are not reverted |
-| `/session` | Current thread ID, workspace, model, effort, and token totals |
-| `/backend` | Show the current backend for this Telegram context |
-| `/backend appserver` | Switch this Telegram context to app-server; persists across restarts |
-| `/backend sdk` | Switch this Telegram context back to SDK; persists across restarts |
-| `/verbosity <mode>` | Set progress delivery for this Telegram context: `messages`, `edit`, or `none` |
-| `/appserver` | Probe the Codex app-server without switching the live backend |
-| `/appserverturn <prompt>` | Run one isolated app-server diagnostic turn |
-| `/appserversteer <initial> || <steer>` | Run one isolated app-server turn and steer it mid-turn |
-| `/appbackendtest` | Smoke-test the app-server backend path without switching this Telegram context |
-| `/artifacttest` | Generate and send a small text file through TeleCode artifact delivery |
+| `/session` | Current thread ID, workspace, model, effort, and token totals (`/status` alias) |
 | `/sessions` | Browse recent threads grouped by workspace; tap to switch |
+| `/use <n\|previous\|latest>` | Switch sessions after `/sessions` |
 | `/switch <id>` | Switch directly to a thread by ID |
-| `/retry` | Resend the last prompt |
-| `/last` | Repeat the latest completed assistant reply (`/copy` and `/repeat` aliases) |
-| `/abort` | Cancel the current turn |
-| `/steer <text>` | Steer an active Codex app-server turn or active Claude turn |
-| `/launch_profiles` | Select launch profile for new or reattached threads (`/launch` alias kept) |
-| `/model` | View and change the model |
-| `/effort` | Set reasoning effort: `minimal` · `low` · `medium` · `high` · `xhigh` |
-| `/auth` | Check authentication status |
-| `/login` | Start Codex device-auth flow from Telegram |
-| `/logout` | Sign out of Codex |
-| `/voice` | Check voice transcription backend status |
-| `/handback` | Print `codex resume <id>` for CLI handoff |
+| `/history` | Show recent local thread history |
 | `/attach <id>` | Bind an existing Codex thread to this forum topic |
+| `/handback` | Print `codex resume <id>` for CLI handoff |
+| `/clear` | Forget this Telegram context |
 
-### Voice, image & file input
+### Turn control
 
-- **Voice / audio** — send any voice message or audio file; TeleCode transcribes it and sends the result to Codex
-- **Photos** — send a photo with an optional caption; the image is forwarded to Codex as visual input
-- **Documents** — send a file (with optional caption); TeleCode stages it in the workspace, runs Codex, and delivers any generated files back as Telegram documents
+| Command | Description |
+|---|---|
+| `/abort` | Cancel the current turn (`/stop` alias) |
+| `/steer <text>` | Steer an active Codex app-server turn or active Claude turn |
+| `/retry` | Resend the last prompt |
+| `/last` | Repeat the latest completed reply of the selected session (`/copy`, `/repeat` aliases) |
+| `/goal [task\|pause\|resume\|clear]` | Native goal mode for long-running objectives |
 
-### Tool verbosity
+### Configuration
+
+| Command | Description |
+|---|---|
+| `/model [slug]` | View and change the model (applies to the active provider) |
+| `/effort [level]` | Reasoning effort: `minimal` · `low` · `medium` · `high` · `xhigh` |
+| `/backend` | Show or switch the backend: Codex `sdk`/`appserver`, Claude `pty`/`sdk` |
+| `/verbosity <mode>` | Progress delivery for this context: `messages`, `edit`, or `none` |
+| `/launch_profiles [id]` | Select the sandbox + approval profile for new Codex threads |
+| `/mcp [on\|off]` | Show or toggle Codex MCP tool servers |
+| `/usage` | Codex rate limits and reset times |
+| `/auth`, `/login`, `/logout` | Codex authentication |
+| `/claude_login` | Claude Code login flow |
+| `/voice` | Voice transcription backend status |
+| `/health` | Bridge uptime, lanes, and delivery diagnostics |
+
+### Codex CLI passthrough
+
+`/compact`, `/agents`, `/diff`, `/doctor`, `/prompts`, `/memory`, `/mentions`, `/init`, `/bug`, `/config`, and `/limits` are forwarded to the Codex CLI when Codex is active.
+
+### Claude Code slash commands
+
+While Claude is the active provider, TeleCode maps Claude Code's own slash commands onto Telegram. Workflow commands (`/compact`, `/review`, `/plan`, …) dispatch into the live session; session commands (`/resume`, `/fork`, `/rename`, `/exit`, …) are emulated by TeleCode; status commands (`/status`, `/usage`, `/context`, `/doctor`, …) answer from local state. Authentication and subscription commands (`/login`, `/logout`, `/upgrade`) are blocked from Telegram by design, as are commands that would install external apps.
+
+## Voice, image & file input
+
+- **Voice / audio** — send any voice message or audio file; TeleCode transcribes it locally (faster-whisper or parakeet-coreml) or via OpenAI Whisper, then sends the text to the agent
+- **Photos** — send a photo with an optional caption; the image is forwarded as visual input
+- **Documents** — send a file (with optional caption); TeleCode stages it in the workspace, runs the agent, and delivers any generated files back as Telegram documents
+
+## Tool verbosity
 
 | Mode | What you see |
 |---|---|
@@ -131,74 +177,57 @@ TeleCode is a provider-aware Telegram interface for coding agents. It runs persi
 | `errors-only` | Only failed tool calls |
 | `none` | Silent |
 
-Per-turn token usage is hidden by default. Set `SHOW_TURN_TOKEN_USAGE=true` if you want the `in / cached / out` footer appended to final replies.
+Per-turn token usage is hidden by default. Set `SHOW_TURN_TOKEN_USAGE=true` for the `in / cached / out` footer on final replies.
 
-### Progress delivery
+## Progress delivery
 
-`PROGRESS_DELIVERY` sets the default progress delivery mode, and `/verbosity <mode>` overrides it per Telegram context.
+`PROGRESS_DELIVERY` sets the default, and `/verbosity <mode>` overrides it per Telegram context.
 
 | Mode | What you see |
 |---|---|
 | `messages` *(default)* | Separate progress messages during the turn, with the final answer sent cleanly |
-| `edit` | One short rolling progress message for assistant progress text only, then a separate final answer. Tool activity stays silent in this mode |
+| `edit` | One rolling edited progress message for assistant narration, then a separate final answer |
 | `none` | No progress messages, only the final answer unless there is an error |
 
-Changing `/verbosity` during an active turn affects future progress updates in that turn. Telegram messages already sent are not merged or rewritten into the new mode.
+When a provider finishes in the background (you switched providers or sessions mid-turn), TeleCode sends the full final answer with a provider completion heading. Intermediate background commentary is retained in a bounded in-memory backlog (100 events per session); switch to that session and use `/replay [n|all]` to release it in message-sized blocks. `/history` remains the transcript-backed option for older Codex output.
 
-When Codex or Claude finishes in the background, TeleCode sends the full final answer with a provider completion heading. Intermediate background commentary stays quiet and is retained in a bounded 100-event in-memory backlog. Switch to that provider session and use `/replay [1-100|all]` to release the backlog in message-sized blocks. `/history` remains the transcript-backed option for older Codex output.
-
-### Launch profiles
+## Launch profiles
 
 - TeleCode always provides a built-in `default` profile synthesized from `CODEX_SANDBOX_MODE` and `CODEX_APPROVAL_POLICY`
-- Built-in Telegram-visible presets are:
-  - `Default`
-  - `Read Only`
-  - `Review`
-  - `Full Access` when `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
-- `Workspace Write` is not listed separately because it is already the default behavior in the shipped config
-- Optional extra profiles can be configured with `CODEX_LAUNCH_PROFILES_JSON`, for example:
+- Built-in Telegram-visible presets: `Default`, `Read Only`, `Review`, plus `Full Access` when `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
+- Optional extra profiles can be configured with `CODEX_LAUNCH_PROFILES_JSON`:
   ```json
   [
     { "id": "readonly", "label": "Read Only", "sandboxMode": "read-only", "approvalPolicy": "never" },
     { "id": "review", "label": "Review", "sandboxMode": "workspace-write", "approvalPolicy": "on-request" }
   ]
   ```
-- `/launch_profiles` changes only future thread creation or reattachment in the current chat/topic context; it does not mutate an already active thread in place
-- Extra `danger-full-access` profiles are blocked unless `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
-- Selecting a `danger-full-access` profile from Telegram requires an explicit confirmation step
+- `/launch_profiles` changes only future thread creation or reattachment in the current context
+- Extra `danger-full-access` profiles are blocked unless `ENABLE_UNSAFE_LAUNCH_PROFILES=true`, and selecting one from Telegram requires an explicit confirmation step
 
-## Multi-Session Architecture
+## Multi-session architecture
 
-Each Telegram chat or forum topic is identified by a **context key** — the chat ID alone for private chats, or `chatId:threadId` for forum topics. This means every topic in a supergroup gets its own independent Codex session.
+Each Telegram chat or forum topic is identified by a **context key** — the chat ID alone for private chats, or `chatId:threadId` for forum topics. Every topic in a supergroup gets its own independent sessions, and each context tracks busy state separately, so a running prompt in one topic doesn't block another.
 
-The `SessionRegistry` maps context keys to `CodexSessionService` instances:
+Within a context, TeleCode keeps a lane of provider sessions. The **selected** session receives your messages; other sessions keep running in the background and buffer their output. `/sessions`, `/use`, `/switch`, and `/provider` move the selection.
 
-```
-┌───────────────────┐      ┌───────────────────────────────┐
-│ Private Chat A     │─────▶│ CodexSessionService (thread X) │
-│ key: "111"         │      └───────────────────────────────┘
-├───────────────────┤      ┌───────────────────────────────┐
-│ Group B / Topic 1  │─────▶│ CodexSessionService (thread Y) │
-│ key: "222:1"       │      └───────────────────────────────┘
-├───────────────────┤      ┌───────────────────────────────┐
-│ Group B / Topic 2  │─────▶│ CodexSessionService (thread Z) │
-│ key: "222:2"       │      └───────────────────────────────┘
-└───────────────────┘
-```
+Session metadata (thread ID, workspace, launch profile, model, effort, backend, active provider) is persisted to `.telecode/contexts.json` and restored on restart, so threads survive bot reboots. On first startup after upgrading from the legacy TeleCodex naming, a `.telecodex` state directory is migrated automatically; legacy `TELECODEX_*` environment variables remain accepted.
 
-- **First message** in a context → creates a new `CodexSessionService` → starts a new Codex thread
-- **Subsequent messages** → same context key → same session → conversation continues
-- **`/new`** → replaces the thread within the same context (optionally picking a workspace first)
-- **`/sessions`** → lists all Codex threads from `~/.codex`, lets you switch within the current context
-- **`/attach <id>`** → resumes a specific Codex CLI thread (useful for picking up work started in the terminal)
+## The Claude Code provider
 
-Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecode/contexts.json` and restored on restart so threads survive bot reboots.
+Set `ENABLE_CLAUDE_PROVIDER=true` and run `/claude` in any context. Two engines are available per context via `/backend`:
 
-TeleCode stores runtime state in `.telecode`. On first startup after upgrading, it automatically moves a legacy `.telecodex` state directory when the new path does not yet exist. New `TELECODE_*` safety variables are canonical, while their legacy `TELECODEX_*` equivalents remain accepted temporarily.
+- **pty** *(default)* — drives the real interactive Claude Code terminal through a pseudo-terminal and tails its transcript. Battle-tested, works with your full local Claude setup.
+- **sdk** — runs the Claude Agent SDK with the Claude Code system prompt, user + project settings, CLAUDE.md, and skills. Structured events and complete progress narration.
 
-`/newsummary` follows the same active-thread replacement rule as `/new`, but it first captures a handoff summary from the previous active thread and sends that summary into the newly created thread.
+Safety rules TeleCode enforces around the spawned Claude:
 
-Each context has independent busy-state tracking, so a running prompt in one topic doesn't block another.
+- The child process never starts Claude's own Telegram plugin (which would conflict with TeleCode's polling on the same bot token)
+- Inherited `CLAUDECODE`, `CLAUDE_CODE_*`, and `CLAUDE_CONFIG_DIR` variables are stripped before spawning
+- Registered Claude processes are tracked by PID and verified by command line before any cleanup kill
+- If Claude is busy, new messages queue as the next turn; `/steer` injects into the running turn
+
+See `docs/claude-telecode-operations.md` for the full operations guide.
 
 ## Handoff: Telegram → CLI
 
@@ -207,61 +236,58 @@ Each context has independent busy-state tracking, so a running prompt in one top
    ```bash
    cd '/path/to/project' && codex resume 'thread-abc123'
    ```
-3. Paste and run in your terminal
+3. Paste and run in your terminal (on macOS the command is also copied to the clipboard)
 
-On macOS the command is also copied to the clipboard automatically.
-
-## Handoff: Thread to Fresh Thread
-
-Run `/newsummary` or send `new from summary` to create a compact handoff inside Telegram. TeleCode first asks the current thread for a summary, then starts a fresh Codex thread in the same context and sends that summary as the initial handoff. `/session` token totals are scoped to the new active thread after the handoff; previous-thread totals are not carried over.
+`/newsummary` performs the same handoff inside Telegram: it captures a summary of the current thread and starts a fresh thread seeded with it.
 
 ## Architecture
 
 ```
-Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
+Telegram ←→ grammY bot (auto-retry, HTML formatting, inline keyboards)
                 |
                 v
-        SessionRegistry  ──→  per-context CodexSessionService instances
-                |
-                ├── @openai/codex-sdk  ──→  spawns Codex CLI subprocess
-                │     └── ThreadEvents (agent text, commands, file changes,
-                │                       MCP calls, web searches, todo lists,
-                │                       reasoning, errors, token usage)
-                ├── CodexStateReader  ──→  ~/.codex/state_*.sqlite  (threads)
-                │                    ──→  ~/.codex/models_cache.json (models)
-                ├── CodexAuth        ──→  codex login/logout subprocess
-                ├── Attachments      ──→  .telecode/inbox/<turnId>/ (staged files)
-                ├── Artifacts        ──→  .telecode/outbox/<turnId>/ (generated files)
-                └── VoiceTranscriber  ──→  parakeet-coreml (local)
-                                     ──→  OpenAI Whisper (cloud fallback)
+        SessionRegistry + AgentSessionManager (per-context lanes, jobs,
+                |                              background output buffers)
+                ├── Codex provider
+                │     ├── @openai/codex-sdk        → Codex CLI subprocess
+                │     ├── app-server backend       → JSON-RPC to codex app-server
+                │     ├── CodexStateReader         → ~/.codex state (threads, models)
+                │     └── CodexAuth                → codex login/logout
+                ├── Claude provider
+                │     ├── PTY engine               → interactive claude in a pseudo-terminal
+                │     ├── SDK engine               → @anthropic-ai/claude-agent-sdk
+                │     ├── transcript tailer        → ~/.claude/projects/*.jsonl
+                │     └── process registry         → verified PID cleanup
+                ├── Attachments                    → .telecode/inbox/<turnId>/
+                ├── Artifacts                      → .telecode/turns/<turnId>/out/
+                └── VoiceTranscriber               → faster-whisper / parakeet / Whisper
 ```
 
-## Project Layout
+## Project layout
 
 ```
 TeleCode/
 ├── src/
-│   ├── index.ts           — startup, signal handling, polling loop
-│   ├── bot.ts             — Telegram bot, all commands and handlers
-│   ├── bot-ui.ts          — pure render helpers (/help, /start, session labels)
-│   ├── codex-launch.ts    — launch profile parsing, validation, and formatting
-│   ├── codex-session.ts   — CodexSessionService wrapping the SDK
-│   ├── codex-state.ts     — SQLite reader for thread/model discovery
-│   ├── codex-auth.ts      — Codex CLI auth (login status, device auth, logout)
-│   ├── session-registry.ts — per-context session map with persistence
-│   ├── context-key.ts     — Telegram chat/topic → context key derivation
-│   ├── attachments.ts     — file staging (sanitization, size limits)
-│   ├── artifacts.ts       — generated file collection and Telegram delivery
-│   ├── error-messages.ts  — SDK/network error → user-friendly translation
-│   ├── voice.ts           — voice transcription (parakeet / Whisper)
-│   ├── config.ts          — environment loading and validation
-│   └── format.ts          — Markdown → Telegram HTML conversion
-├── test/                  — 19 test files, 217+ tests (vitest)
+│   ├── index.ts                 — startup, signal handling, polling loop
+│   ├── bot.ts                   — Telegram bot, all commands and handlers
+│   ├── bot-ui.ts                — pure render helpers (/help, /start, session labels)
+│   ├── agent-session-manager.ts — provider lanes, jobs, background sessions
+│   ├── codex-session.ts         — Codex SDK session service
+│   ├── app-server.ts            — Codex app-server JSON-RPC backend
+│   ├── codex-state.ts           — Codex thread/model discovery
+│   ├── providers/               — Claude adapter, PTY + SDK engines, transcript tailer
+│   ├── session-registry.ts      — per-context session map with persistence
+│   ├── attachments.ts           — file staging (sanitization, size limits)
+│   ├── artifacts.ts             — generated file collection and delivery
+│   ├── voice.ts                 — voice transcription backends
+│   ├── config.ts                — environment loading and validation
+│   └── format.ts                — Markdown → Telegram HTML conversion
+├── test/                        — vitest suite (~400 tests)
+├── scripts/                     — live smoke tests and Windows launchers
+├── docs/                        — operations guide, release playbook
 ├── .env.example
-├── Dockerfile
-├── docker-compose.yml
-├── tsconfig.json
-└── vitest.config.ts
+├── Dockerfile / docker-compose.yml
+└── tsconfig.json / vitest.config.ts
 ```
 
 ## Docker
@@ -270,11 +296,7 @@ TeleCode/
 docker compose up --build
 ```
 
-The compose file:
-- loads environment from `.env`
-- mounts `~/.codex` for auth state and persisted threads
-- mounts `./workspace` as `/workspace`
-- runs as a non-root user
+The compose file loads environment from `.env`, mounts `~/.codex` for auth state and persisted threads, mounts `./workspace` as `/workspace`, and runs as a non-root user. A `.dockerignore` keeps `.env`, local state, and logs out of image layers.
 
 ## Development
 
@@ -284,28 +306,34 @@ npm run build    # compile TypeScript
 npm test         # run vitest
 ```
 
-## Release Automation
+Live smoke tests that drive a real Claude process (they consume real usage):
 
-TeleCode does not yet use the TelePi npm release pipeline, but the exact Trusted Publishing process has been documented so it can be adopted here.
+```bash
+npm run test:claude-smoke       # provider adapter round-trip
+npm run test:claude-tool-smoke  # tool events + final text
+npm run test:claude-bot-smoke   # full bot flow with mocked Telegram
+```
 
-See:
-- `docs/npm-trusted-publishing.md`
+## Security notes
 
-That playbook covers:
-- making the package publishable on npm
-- adding a tag-driven GitHub Actions workflow
-- configuring npm Trusted Publishing
-- the maintainer release flow (`npm version ...` + `git push --follow-tags`)
-
-## Security Notes
-
-- Only users in `TELEGRAM_ALLOWED_USER_IDS` can interact with the bot
-- Default sandbox mode is `workspace-write` — Codex can read and write within the working directory
-- Use `danger-full-access` only if you fully trust the user and the host environment
-- The built-in `Full Access` profile and any extra `danger-full-access` launch profiles are opt-in via `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
-- Default approval policy is `never` — suited for headless/automated use
-- `/launch_profiles` only selects from validated configured profiles; Telegram users cannot submit arbitrary sandbox or approval values
-- `CODEX_API_KEY` (agent auth) and `OPENAI_API_KEY` (voice transcription) are separate credentials
-- `/login` and `/logout` can be disabled by setting `ENABLE_TELEGRAM_LOGIN=false`
+- Only users in `TELEGRAM_ALLOWED_USER_IDS` can interact with the bot; everything else is rejected by the first middleware
+- Default Codex sandbox mode is `workspace-write`; use `danger-full-access` only if you fully trust the user and host
+- `danger-full-access` launch profiles are opt-in (`ENABLE_UNSAFE_LAUNCH_PROFILES=true`) and require an in-chat confirmation
+- `CLAUDE_PERMISSION_MODE=bypassPermissions` also requires `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
+- Claude/Codex authentication changes are blocked or gated from Telegram (`/login` and `/logout` can be disabled with `ENABLE_TELEGRAM_LOGIN=false`)
 - Files uploaded via Telegram are sanitized (name, size, type) before staging in the workspace
-- All Markdown output is sanitized before being sent as Telegram HTML
+- All Markdown output is escaped before being sent as Telegram HTML
+- State files are written atomically; the Docker build excludes `.env` and local state from image layers
+- **Remember what this is:** anyone on the allowlist can run a coding agent on your machine. Keep the allowlist to yourself, keep the bot token secret, and prefer the default sandboxed profiles
+
+## Release automation
+
+TeleCode does not yet ship an npm release pipeline; `docs/npm-trusted-publishing.md` documents the tag-driven GitHub Actions + npm Trusted Publishing process that can be adopted when it is time to publish.
+
+## Credits
+
+TeleCode began as a fork of [TeleCodex](https://github.com/benedict2310/telecodex) by Benedict Evert, which itself was modeled on the TelePi Telegram bridge. The Claude Code provider, parallel-session architecture, and accessibility-focused delivery work were added in this fork.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,12 +1,12 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/` contains the runtime code for the Telegram bridge. The main entrypoint is `src/index.ts`, bot wiring lives in `src/bot.ts`, Codex session management is in `src/codex-session.ts`, config parsing is in `src/config.ts`, and Telegram-safe formatting is in `src/format.ts`.
+`src/` contains the runtime code for the Telegram bridge. The main entrypoint is `src/index.ts`, bot wiring lives in `src/bot.ts`, Codex session management is in `src/codex-session.ts`, the Claude provider lives under `src/providers/`, config parsing is in `src/config.ts`, and Telegram-safe formatting is in `src/format.ts`.
 
 `test/` mirrors the source layout with Vitest files such as `test/config.test.ts`. Build output goes to `dist/` and should not be committed. Runtime configuration is defined in `.env.example`; local secrets belong in `.env`.
 
 ## Build, Test, and Development Commands
-Use Node.js 20+.
+Use Node.js 22+.
 
 - `npm install` installs project dependencies.
 - `npm run dev` starts TeleCode with `tsx` against `src/index.ts`.
