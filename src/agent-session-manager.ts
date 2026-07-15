@@ -306,12 +306,26 @@ export class AgentSessionManager {
   }
 
   serialize(): PersistedAgentSessionState {
+    this.pruneFinishedJobs();
     return {
       version: 1,
       lanes: [...this.lanes.values()].map(cloneLane),
       sessions: [...this.sessions.values()].map(cloneSession),
       jobs: [...this.jobs.values()].map(cloneJob),
     };
+  }
+
+  /**
+   * The job list is persisted, so without pruning it grows without bound across
+   * restarts. Keep every active job plus a bounded tail of recently finished ones.
+   */
+  private pruneFinishedJobs(keep = 200): void {
+    const finished = [...this.jobs.values()]
+      .filter((job) => job.status !== "running" && job.status !== "waiting")
+      .sort((left, right) => right.updatedAt - left.updatedAt);
+    for (const job of finished.slice(keep)) {
+      this.jobs.delete(job.id);
+    }
   }
 
   private finishJob(jobId: string, status: Exclude<AgentJobStatus, "running" | "waiting">, error?: string): AgentJobRecord {

@@ -1,6 +1,6 @@
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { bridgeLog } from "../bridge-log.js";
@@ -613,7 +613,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     if (runtime.pty?.isAlive) {
       return;
     }
-    if (!existsSync(this.config.claudeBin)) {
+    // A bare command name resolves via PATH at spawn time; only reject configured
+    // absolute paths that are verifiably missing.
+    if (isAbsolute(this.config.claudeBin) && !existsSync(this.config.claudeBin)) {
       throw new Error(`Claude binary not found: ${this.config.claudeBin}`);
     }
 

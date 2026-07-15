@@ -29,7 +29,7 @@ import {
   stageFile,
   type StagedFile,
 } from "./attachments.js";
-import { collectArtifactReport, ensureOutDir, formatArtifactSummary } from "./artifacts.js";
+import { collectArtifactReport, ensureOutDir, formatArtifactSummary, pruneOldTurnDirectories } from "./artifacts.js";
 import { AgentSessionManager, type AgentJobRecord, type AgentSessionRecord } from "./agent-session-manager.js";
 import { agentSessionStatePath, JsonAgentSessionStore } from "./agent-session-store.js";
 import {
@@ -7261,7 +7261,6 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           console.error("Failed to deliver artifacts:", artifactError);
         } finally {
           await cleanupInbox(workspace, turnId);
-          // TODO: prune old outbox turn folders by age or count to avoid unbounded growth
         }
       },
     });
@@ -7273,6 +7272,19 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   });
 
   queueMicrotask(recoverPersistedClaudeQueue);
+
+  // Old per-turn staging folders otherwise accumulate forever (see outboxPath).
+  queueMicrotask(() => {
+    void pruneOldTurnDirectories(config.workspace)
+      .then((removed) => {
+        if (removed > 0) {
+          bridgeLog("cleanup", `pruned ${removed} old turn director${removed === 1 ? "y" : "ies"}`);
+        }
+      })
+      .catch((error) => {
+        console.warn("Failed to prune old turn directories", error);
+      });
+  });
 
   // Warm persisted Claude PTYs in the background so the first message after a
   // bridge restart does not pay claude.exe --resume interactively (a bare
