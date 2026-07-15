@@ -5,7 +5,7 @@ import path from "node:path";
 /**
  * Ensure an isolated CLAUDE_CONFIG_DIR exists for TeleCode-spawned claude.exe.
  *
- * The child must still authenticate on Anthony's normal Claude subscription, so we
+ * The child must still authenticate on the user's normal Claude subscription, so we
  * seed the isolated dir with a copy of the live OAuth credentials. We deliberately do
  * NOT copy plugins/ or installed_plugins.json, so the user-scoped telegram plugin is
  * absent in the child and cannot start a competing getUpdates poller — that poller is

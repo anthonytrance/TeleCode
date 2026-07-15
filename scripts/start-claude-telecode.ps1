@@ -1,6 +1,6 @@
 param(
   [string]$Workspace = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-  [string]$ClaudeBin = "C:\Users\Anthony\.local\bin\claude.exe",
+  [string]$ClaudeBin = (Join-Path $env:USERPROFILE ".local\bin\claude.exe"),
   [string]$Model = "sonnet",
   [ValidateSet("default", "acceptEdits", "plan", "bypassPermissions")]
   [string]$PermissionMode = "acceptEdits"

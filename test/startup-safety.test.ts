@@ -74,10 +74,10 @@ describe("startup safety", () => {
   it("detects Claude processes that start the Telegram plugin", () => {
     expect(
       findClaudeTelegramPluginCommandLines([
-        "123 node.exe C:\\Users\\Anthony\\codetest\\tools\\telecode\\dist\\index.js",
+        "123 node.exe C:\\Users\\Dev\\codetest\\tools\\telecode\\dist\\index.js",
         "456 claude.exe --model sonnet --strict-mcp-config",
         "567 powershell.exe Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*plugin:telegram*' -and $_.CommandLine -like '*claude*' }",
-        "678 cmd.exe /c \"C:\\Users\\Anthony\\.local\\bin\\claude.exe --channels plugin:telegram@claude-plugins-official & cmd /k\"",
+        "678 cmd.exe /c \"C:\\Users\\Dev\\.local\\bin\\claude.exe --channels plugin:telegram@claude-plugins-official & cmd /k\"",
         "789 claude.exe --channels plugin:telegram@claude-plugins-official --model opus",
       ]),
     ).toEqual(["789 claude.exe --channels plugin:telegram@claude-plugins-official --model opus"]);

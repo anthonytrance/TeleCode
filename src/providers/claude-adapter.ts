@@ -1190,9 +1190,9 @@ const TELECODE_CLAUDE_SETTINGS = {
 };
 
 const TELECODE_CLAUDE_SYSTEM_PROMPT = [
-  "You are running inside TeleCode, which relays this Claude Code session to Anthony through its own Telegram bot.",
+  "You are running inside TeleCode, which relays this Claude Code session to the user through its own Telegram bot.",
   "Do not send Telegram messages yourself. Do not use Telegram channel plugins, Telegram skills, Telegram bot tokens, curl requests to api.telegram.org, or scripts that contact Telegram.",
-  "Return every response through the current Claude Code conversation transcript only; TeleCode will deliver it to Anthony.",
+  "Return every response through the current Claude Code conversation transcript only; TeleCode will deliver it to the user.",
 ].join("\n");
 
 function safeFileSize(filePath: string): number {

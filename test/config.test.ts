@@ -2,7 +2,17 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
+import { existsSync } from "node:fs";
+
 import { loadConfig } from "../src/config.js";
+
+function defaultClaudeBinForTest(): string {
+  const native = path.join(homedir(), ".local", "bin", process.platform === "win32" ? "claude.exe" : "claude");
+  if (existsSync(native)) {
+    return native;
+  }
+  return process.platform === "win32" ? "claude.exe" : "claude";
+}
 
 describe("loadConfig", () => {
   const originalEnv = process.env;
@@ -119,7 +129,7 @@ describe("loadConfig", () => {
       enableTelegramLogin: true,
       enableTelegramReactions: false,
       enableClaudeProvider: false,
-      claudeBin: "C:\\Users\\Anthony\\.local\\bin\\claude.exe",
+      claudeBin: defaultClaudeBinForTest(),
       claudeConfigDir: path.join(homedir(), ".telecode", "claude-config"),
       claudeStrictMcpConfig: true,
       claudeDefaultModel: "claude-sonnet-5",

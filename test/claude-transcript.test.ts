@@ -325,7 +325,7 @@ describe("transcript discovery", () => {
 
   beforeEach(() => {
     configDir = mkdtempSync(path.join(tmpdir(), "claude-cfg-"));
-    projectDir = path.join(configDir, "projects", "C--Users-Anthony-codetest");
+    projectDir = path.join(configDir, "projects", "C--Users-Dev-codetest");
     mkdirSync(projectDir, { recursive: true });
   });
 

@@ -189,7 +189,7 @@ function textMessage(messageId, text, config) {
     message_id: messageId,
     date: Math.floor(Date.now() / 1000),
     chat: { id: userId, type: "private" },
-    from: { id: userId, is_bot: false, first_name: "Anthony" },
+    from: { id: userId, is_bot: false, first_name: "Tester" },
     text,
     entities: commandMatch
       ? [{ type: "bot_command", offset: 0, length: commandMatch[0].length }]

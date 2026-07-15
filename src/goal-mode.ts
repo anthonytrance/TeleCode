@@ -40,7 +40,7 @@ export function applyGoalModeConstraints(objective: string, options: { noAgents?
   return [
     normalized,
     "",
-    "Constraint: do not spawn subagents or child sessions. Work only in the current thread unless Anthony explicitly changes this.",
+    "Constraint: do not spawn subagents or child sessions. Work only in the current thread unless the user explicitly changes this.",
   ].join("\n");
 }
 

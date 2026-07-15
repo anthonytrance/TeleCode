@@ -973,7 +973,7 @@ function createConfig(workspace: string): TeleCodeConfig {
     enableTelegramLogin: false,
     enableTelegramReactions: false,
     enableClaudeProvider: true,
-    claudeBin: "C:\\Users\\Anthony\\.local\\bin\\claude.exe",
+    claudeBin: "C:\\Users\\Dev\\.local\\bin\\claude.exe",
     claudeConfigDir: path.join(workspace, ".claude-config"),
     claudeStrictMcpConfig: true,
     claudeDefaultModel: "sonnet",
@@ -999,7 +999,7 @@ function textMessage(messageId: number, text: string) {
     message_id: messageId,
     date: 1,
     chat: { id: 123, type: "private" },
-    from: { id: 123, is_bot: false, first_name: "Anthony" },
+    from: { id: 123, is_bot: false, first_name: "Tester" },
     text,
     entities: commandMatch
       ? [{ type: "bot_command", offset: 0, length: commandMatch[0].length }]

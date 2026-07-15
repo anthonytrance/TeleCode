@@ -92,7 +92,7 @@ export function loadConfig(): TeleCodeConfig {
     false,
   );
   const enableClaudeProvider = parseBooleanEnv(optionalString(process.env.ENABLE_CLAUDE_PROVIDER), false);
-  const claudeBin = optionalString(process.env.CLAUDE_BIN) ?? "C:\\Users\\Anthony\\.local\\bin\\claude.exe";
+  const claudeBin = optionalString(process.env.CLAUDE_BIN) ?? defaultClaudeBin();
   // Isolated config dir for TeleCode-spawned claude.exe. Pointing CLAUDE_CONFIG_DIR
   // at a folder that does NOT contain the user-scoped telegram plugin keeps the child
   // from starting a competing getUpdates poller and 409ing the live Telegram bridge.
@@ -185,6 +185,16 @@ function resolveWorkspace(): string {
 
 function isRunningInDocker(): boolean {
   return existsSync("/.dockerenv") || process.env.container === "docker";
+}
+
+function defaultClaudeBin(): string {
+  // Claude Code's native installer places the binary under ~/.local/bin.
+  // Prefer that location when it exists; otherwise rely on PATH resolution.
+  const native = path.join(homedir(), ".local", "bin", process.platform === "win32" ? "claude.exe" : "claude");
+  if (existsSync(native)) {
+    return native;
+  }
+  return process.platform === "win32" ? "claude.exe" : "claude";
 }
 
 function loadEnvFile(envPath: string): void {

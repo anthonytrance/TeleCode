@@ -128,7 +128,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
     model: options.model,
     permissionMode: options.permissionMode,
     pathToClaudeCodeExecutable: options.claudeBin,
-    // Behave like Anthony's interactive sessions: Claude Code system prompt,
+    // Behave like the user's interactive sessions: Claude Code system prompt,
     // user + project settings, CLAUDE.md, and skills.
     systemPrompt: { type: "preset", preset: "claude_code" },
     settingSources: ["user", "project"],
