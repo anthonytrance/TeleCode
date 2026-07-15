@@ -135,6 +135,11 @@ const TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "start",
   "help",
   "health",
+  "jobs",
+  "alljobs",
+  "retry",
+  "auth",
+  "history",
   "abort",
   "stop",
   "steer",
@@ -459,7 +464,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       return;
     }
-    if (!existsSync(config.claudeBin)) {
+    // A bare command name ("claude") resolves via PATH at spawn time; only reject
+    // configured absolute paths that are verifiably missing.
+    if (path.isAbsolute(config.claudeBin) && !existsSync(config.claudeBin)) {
       const message = `Claude binary not found: ${config.claudeBin}`;
       await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       return;
@@ -3294,7 +3301,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         "Claude provider diagnostics:",
         `Enabled: ${config.enableClaudeProvider}`,
         `Binary: ${config.claudeBin}`,
-        `Binary exists: ${existsSync(config.claudeBin)}`,
+        `Binary exists: ${path.isAbsolute(config.claudeBin) ? existsSync(config.claudeBin) : "resolved via PATH"}`,
         `Workspace: ${config.claudeWorkspace}`,
         `Default model: ${config.claudeDefaultModel}`,
         `Strict MCP config: ${config.claudeStrictMcpConfig}`,
@@ -3696,7 +3703,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     rawSelection: string,
   ): Promise<boolean> => {
     const picks = pendingAgentSessionPicks.get(contextKey) ?? buildRecentProviderSessionPicks(contextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
-    const targetPick = resolveProviderSessionPick(rawSelection, picks);
+    const targetPick = resolveProviderSessionPick(rawSelection, picks, agentSessions.getLane(contextKey)?.selectedSessionId);
     if (!targetPick) {
       const matches = findProviderSessionPickMatches(rawSelection, picks);
       const message = matches.length > 1
@@ -3828,11 +3835,14 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   bot.command("start", async (ctx) => {
     const rawContextKey = contextKeyFromCtx(ctx);
     if (rawContextKey && isClaudeActive(rawContextKey)) {
+      const descriptor = claudeSessions.get(rawContextKey);
+      const persisted = claudeState?.get(rawContextKey);
+      const model = String(descriptor?.metadata?.model ?? persisted?.model ?? config.claudeDefaultModel);
       const lines = [
         "TeleCode is running.",
         "Active provider: Claude Code",
-        `Workspace: ${config.claudeWorkspace}`,
-        `Model: ${config.claudeDefaultModel}`,
+        `Workspace: ${descriptor?.workspace ?? persisted?.workspace ?? config.claudeWorkspace}`,
+        `Model: ${model}`,
         "Use /codex to switch this context back to Codex.",
       ];
       await safeReply(ctx, lines.map((line) => escapeHTML(line)).join("\n"), {
@@ -4552,7 +4562,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
     pendingIdleSteers.delete(contextKey);
     if (Date.now() > pending.expiresAt) {
-      await next();
+      // Don't fall through: that would send a literal "y"/"n" to the agent as a prompt.
+      const message = "That steer confirmation expired, so I discarded the steer text. Send /steer again if you still want it.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       return;
     }
 
@@ -4884,6 +4896,25 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   });
 
   bot.command("retry", async (ctx) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    const rawChatId = ctx.chat?.id;
+    if (rawContextKey && rawChatId && isClaudeActive(rawContextKey)) {
+      if (isBusy(rawContextKey)) {
+        await sendBusyReply(ctx);
+        return;
+      }
+      const cachedClaude = lastPromptInput.get(rawContextKey);
+      if (typeof cachedClaude !== "string" || !cachedClaude.trim()) {
+        await safeReply(ctx, escapeHTML("Nothing to retry. Send a message first."), {
+          fallbackText: "Nothing to retry. Send a message first.",
+        });
+        return;
+      }
+      await setReaction(ctx, "👀");
+      startClaudePrompt(ctx, rawContextKey, rawChatId, cachedClaude);
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -5496,7 +5527,20 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
   bot.command(["launch", "launch_profiles"], openLaunchProfilesPicker);
   bot.hears(/^\/launch-profiles(?:@\w+)?$/i, openLaunchProfilesPicker);
-  bot.hears(/^(?:launch|launch_profiles|launch profile)\s+(.+)/i, async (ctx) => {
+  bot.hears(/^(?:launch|launch_profiles|launch profile)\s+(.+)/i, async (ctx, next) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    const requested = (ctx.match[1] ?? "").replace(/\bconfirm\b/gi, "").trim().toLowerCase();
+    const knownProfile = config.launchProfiles.some(
+      (candidate) =>
+        candidate.id.toLowerCase() === requested ||
+        candidate.label.toLowerCase() === requested ||
+        candidate.label.toLowerCase().replace(/\s+/g, "-") === requested,
+    );
+    if (!rawContextKey || isClaudeActive(rawContextKey) || !knownProfile) {
+      // Not a shortcut ("launch the app and test it"): pass through to the agent.
+      await next();
+      return;
+    }
     await setLaunchProfileFromCommand(ctx, ctx.match[1] ?? "");
   });
 
@@ -5707,24 +5751,56 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     outputBuffer.drainWhere(selectedSession.id, (event) => replayedIds.has(event.id));
   });
 
-  bot.hears(/^(?:use|switch)\s+(.+)/i, async (ctx) => {
+  // Plain-text shortcuts ("use 2", "new codetest", "model 5.6") are convenience
+  // aliases, but ordinary chat sentences also start with these words. Each shortcut
+  // therefore only fires when its argument resolves to something real; otherwise the
+  // message falls through to the normal prompt pipeline and reaches the agent.
+  bot.hears(/^(?:use|switch)\s+(.+)/i, async (ctx, next) => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) {
+      await next();
       return;
     }
-    await selectUnifiedAgentSession(ctx, contextKey, ctx.match[1] ?? "");
+    const selection = (ctx.match[1] ?? "").trim();
+    const picks = pendingAgentSessionPicks.get(contextKey)
+      ?? buildRecentProviderSessionPicks(contextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
+    const selectedSessionId = agentSessions.getLane(contextKey)?.selectedSessionId;
+    const resolved = resolveProviderSessionPick(selection, picks, selectedSessionId);
+    if (!resolved && findProviderSessionPickMatches(selection, picks).length === 0) {
+      await next();
+      return;
+    }
+    await selectUnifiedAgentSession(ctx, contextKey, selection);
   });
 
-  bot.hears(/^(?:fork|new thread)\s+(.+)/i, async (ctx) => {
-    await createNewThreadFromWorkspaceText(ctx, ctx.match[1] ?? "");
+  const handleWorkspaceShortcut = async (
+    ctx: Context,
+    rawWorkspace: string,
+    next: () => Promise<void>,
+  ): Promise<void> => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey || isClaudeActive(contextKey)) {
+      await next();
+      return;
+    }
+    const session = registry.get(contextKey) ?? (await getContextSession(ctx, { deferThreadStart: true }))?.session;
+    if (!session || !resolveKnownWorkspaceShortcut(rawWorkspace, session.listWorkspaces(), config.workspace)) {
+      await next();
+      return;
+    }
+    await createNewThreadFromWorkspaceText(ctx, rawWorkspace);
+  };
+
+  bot.hears(/^(?:fork|new thread)\s+(.+)/i, async (ctx, next) => {
+    await handleWorkspaceShortcut(ctx, ctx.match[1] ?? "", next);
   });
 
-  bot.hears(/^(?:workspace|ws)\s+(.+)/i, async (ctx) => {
-    await createNewThreadFromWorkspaceText(ctx, ctx.match[1] ?? "");
+  bot.hears(/^(?:workspace|ws)\s+(.+)/i, async (ctx, next) => {
+    await handleWorkspaceShortcut(ctx, ctx.match[1] ?? "", next);
   });
 
-  bot.hears(/^new\s+(?!from summary$)(.+)/i, async (ctx) => {
-    await createNewThreadFromWorkspaceText(ctx, ctx.match[1] ?? "");
+  bot.hears(/^new\s+(?!from summary$)(.+)/i, async (ctx, next) => {
+    await handleWorkspaceShortcut(ctx, ctx.match[1] ?? "", next);
   });
 
   const createNewFromSummary = async (ctx: Context, rawWorkspace?: string): Promise<void> => {
@@ -6233,27 +6309,33 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     );
   });
 
-  bot.hears(/^model\s+(.+)/i, async (ctx) => {
+  bot.hears(/^model\s+(.+)/i, async (ctx, next) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    if (!rawContextKey || isClaudeActive(rawContextKey)) {
+      await next();
+      return;
+    }
+
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
+      await next();
       return;
     }
 
     const { contextKey, session } = contextSession;
-    if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot change model while a prompt is running."), {
-        fallbackText: "Cannot change model while a prompt is running.",
-      });
-      return;
-    }
-
     const modelArg = (ctx.match[1] ?? "").trim();
     const models = session.listModels();
     const slug = resolveModelSlug(modelArg, models);
     if (!slug) {
-      const available = models.map((m) => m.slug).join(", ");
-      const text = `Unknown model "${modelArg}". Available: ${available}`;
-      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      // Not a known model: treat the message as a normal prompt instead.
+      await next();
+      return;
+    }
+
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot change model while a prompt is running."), {
+        fallbackText: "Cannot change model while a prompt is running.",
+      });
       return;
     }
     try {
@@ -6354,8 +6436,16 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     });
   });
 
-  bot.hears(/^effort\s+(\S+)/i, async (ctx) => {
-    await setEffortFromCommand(ctx, ctx.match[1] ?? "");
+  bot.hears(/^effort\s+(\S+)/i, async (ctx, next) => {
+    const rawContextKey = contextKeyFromCtx(ctx);
+    const level = (ctx.match[1] ?? "").trim().toLowerCase();
+    const validLevels = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+    if (!rawContextKey || isClaudeActive(rawContextKey) || !validLevels.has(level)) {
+      // Not a shortcut: let the message reach the agent as a normal prompt.
+      await next();
+      return;
+    }
+    await setEffortFromCommand(ctx, level);
   });
 
   bot.command([...NATIVE_CODEX_COMMANDS], async (ctx) => {
@@ -8030,6 +8120,43 @@ function resolveWorkspaceArgument(raw: string, workspaces: string[], defaultWork
   );
 }
 
+// Strict resolver for plain-text workspace shortcuts. Unlike resolveWorkspaceArgument
+// it never falls back to treating arbitrary text as a path, so ordinary sentences
+// ("new plan, use the other file") are not mistaken for workspace switches.
+function resolveKnownWorkspaceShortcut(
+  raw: string,
+  workspaces: string[],
+  defaultWorkspace?: string,
+): string | null {
+  const value = raw.trim().replace(/^["']|["']$/g, "");
+  if (!value) {
+    return null;
+  }
+
+  if (/^\d+$/.test(value)) {
+    const numeric = Number.parseInt(value, 10);
+    return numeric >= 1 && numeric <= workspaces.length ? workspaces[numeric - 1] ?? null : null;
+  }
+
+  const lower = value.toLowerCase();
+  if (defaultWorkspace && /^(?:default|configured|config|home)$/.test(lower)) {
+    return defaultWorkspace;
+  }
+
+  const known =
+    workspaces.find((workspace) => workspace === value) ??
+    workspaces.find((workspace) => getWorkspaceShortName(workspace).toLowerCase() === lower);
+  if (known) {
+    return known;
+  }
+
+  if (path.isAbsolute(value) && existsSync(value)) {
+    return value;
+  }
+
+  return null;
+}
+
 function workspaceLabels(workspace: string, currentWorkspace: string, defaultWorkspace?: string): string[] {
   const labels: string[] = [];
   if (sameWorkspace(workspace, currentWorkspace)) {
@@ -8466,7 +8593,11 @@ function looksLikeUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
 }
 
-function resolveProviderSessionPick(rawSelection: string, picks: ProviderSessionPick[]): ProviderSessionPick | undefined {
+function resolveProviderSessionPick(
+  rawSelection: string,
+  picks: ProviderSessionPick[],
+  selectedSessionId?: string,
+): ProviderSessionPick | undefined {
   const value = rawSelection.trim();
   if (!value) {
     return undefined;
@@ -8474,6 +8605,18 @@ function resolveProviderSessionPick(rawSelection: string, picks: ProviderSession
 
   if (value.toLowerCase() === "latest") {
     return picks[0];
+  }
+
+  if (value.toLowerCase() === "previous") {
+    // The most recent session that is not the currently selected one. Picks are
+    // sorted selected-first, then by recency.
+    if (selectedSessionId) {
+      const nonSelected = picks.find((pick) => providerSessionPickAgentId(pick) !== selectedSessionId);
+      if (nonSelected) {
+        return nonSelected;
+      }
+    }
+    return picks[1] ?? picks[0];
   }
 
   const numeric = Number.parseInt(value, 10);

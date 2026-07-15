@@ -801,6 +801,45 @@ describe("Claude bot flow", () => {
     expect(list).toContain("Claude");
   });
 
+  it("passes sentences starting with shortcut words through to Claude", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+
+    await bot.handleUpdate(textUpdate(2, "use the venv python for this script"));
+    await waitFor(() => mockClaude.prompts.includes("use the venv python for this script"));
+
+    await bot.handleUpdate(textUpdate(3, "new plan, check the other file first"));
+    await waitFor(() => mockClaude.prompts.includes("new plan, check the other file first"));
+
+    await bot.handleUpdate(textUpdate(4, "launch the app and test it"));
+    await waitFor(() => mockClaude.prompts.includes("launch the app and test it"));
+
+    // None of these may be answered with a session/workspace/launch error.
+    const texts = sent.map((entry) => entry.text ?? "");
+    expect(texts.some((text) => text.includes("Unknown provider session"))).toBe(false);
+    expect(texts.some((text) => text.includes("Usage: /launch_profiles"))).toBe(false);
+  });
+
+  it("re-sends the last Claude prompt with /retry", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+    await bot.handleUpdate(textUpdate(2, "remember this exact prompt"));
+    await waitFor(() => mockClaude.prompts.includes("remember this exact prompt"));
+
+    await bot.handleUpdate(textUpdate(3, "/retry"));
+    await waitFor(() =>
+      mockClaude.prompts.filter((prompt) => prompt === "remember this exact prompt").length >= 2,
+    );
+
+    expect(sent.map((entry) => entry.text)).not.toContain(
+      "Claude command /retry is not classified yet, so I did not run it.",
+    );
+  });
+
   it("switches sessions with /switch while Claude is active", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
