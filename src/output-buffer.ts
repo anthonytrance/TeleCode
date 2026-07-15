@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 export type OutputBufferEventKind =
   | "assistant"
   | "final"
@@ -127,4 +129,3 @@ export class OutputBuffer {
 function isPriorityKind(kind: OutputBufferEventKind): boolean {
   return kind === "final" || kind === "permission" || kind === "question" || kind === "artifact" || kind === "error";
 }
-import { randomUUID } from "node:crypto";

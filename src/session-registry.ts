@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { createCodexSession, type CodexSessionRuntime } from "./codex-backend.js";
@@ -247,7 +247,7 @@ export class SessionRegistry {
         mkdirSync(dir, { recursive: true });
       }
       const data = [...this.metadata.values()];
-      writeFileSync(this.persistPath, JSON.stringify(data, null, 2), "utf8");
+      writeFileAtomically(this.persistPath, JSON.stringify(data, null, 2));
     } catch (error) {
       console.warn(
         "Failed to persist context metadata:",
@@ -286,7 +286,7 @@ export class SessionRegistry {
         selectedCodexModel: this.selectedCodexModel,
         codexMcpEnabled: isCodexMcpEnabled(),
       };
-      writeFileSync(this.preferencesPath, JSON.stringify(data, null, 2), "utf8");
+      writeFileAtomically(this.preferencesPath, JSON.stringify(data, null, 2));
     } catch (error) {
       console.warn(
         "Failed to persist TeleCode preferences:",
@@ -308,6 +308,14 @@ export class SessionRegistry {
       // Silently ignore load errors.
     }
   }
+}
+
+// A crash between truncate and write would otherwise leave an empty or partial
+// JSON file, silently dropping every persisted context on the next startup.
+function writeFileAtomically(filePath: string, contents: string): void {
+  const tempPath = `${filePath}.tmp`;
+  writeFileSync(tempPath, contents, "utf8");
+  renameSync(tempPath, filePath);
 }
 
 function resolveLaunchProfileId(

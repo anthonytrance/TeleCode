@@ -71,6 +71,14 @@ vi.mock("node:fs", () => ({
     mockFsState.files.set(targetPath, content);
     mockFsState.directories.add(path.dirname(targetPath));
   }),
+  renameSync: vi.fn((fromPath: string, toPath: string) => {
+    const content = mockFsState.files.get(fromPath);
+    if (content === undefined) {
+      throw new Error(`ENOENT: ${fromPath}`);
+    }
+    mockFsState.files.delete(fromPath);
+    mockFsState.files.set(toPath, content);
+  }),
 }));
 
 vi.mock("../src/codex-backend.js", () => ({
