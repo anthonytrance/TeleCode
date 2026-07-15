@@ -18,6 +18,7 @@ const mockClaude = vi.hoisted(() => {
   let createCount = 0;
   let activeModel = "sonnet";
   let activeBackend = "pty";
+  let activeProviderSessionId = "provider-session-1";
   let promptGate: Promise<void> | undefined;
   let releasePromptGate: (() => void) | undefined;
   let nextEvents: Array<Record<string, unknown>> | undefined;
@@ -41,6 +42,10 @@ const mockClaude = vi.hoisted(() => {
       activeBackend = backend;
     },
     getActiveBackend: () => activeBackend,
+    setActiveProviderSessionId: (sessionId: string) => {
+      activeProviderSessionId = sessionId;
+    },
+    getActiveProviderSessionId: () => activeProviderSessionId,
     setNextEvents: (events: Array<Record<string, unknown>>) => {
       nextEvents = events;
     },
@@ -69,6 +74,7 @@ const mockClaude = vi.hoisted(() => {
       createCount = 0;
       activeModel = "sonnet";
       activeBackend = "pty";
+      activeProviderSessionId = "provider-session-1";
       releasePromptGate?.();
       promptGate = undefined;
       releasePromptGate = undefined;
@@ -127,14 +133,19 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
         updatedAt: 1000,
         metadata: options.metadata,
       };
+      mockClaude.setActiveProviderSessionId(descriptor.providerSessionId);
       mockClaude.createSession(options);
       return descriptor;
     }
 
     async resumeSession(session: unknown) {
       const backend = (session as { metadata?: { backend?: string } }).metadata?.backend;
+      const providerSessionId = (session as { providerSessionId?: string }).providerSessionId;
       if (backend) {
         mockClaude.setActiveBackend(backend);
+      }
+      if (providerSessionId) {
+        mockClaude.setActiveProviderSessionId(providerSessionId);
       }
       mockClaude.resumeSession(session);
       return session;
@@ -150,7 +161,7 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
 
     async forkSession(sourceSessionId: string, displayName?: string) {
       const createCount = mockClaude.nextCreateCount();
-      return {
+      const descriptor = {
         id: `claude-fork-${createCount}`,
         provider: "claude",
         workspace: "C:\\workspace",
@@ -162,15 +173,17 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
         updatedAt: 2000,
         metadata: { model: mockClaude.getActiveModel(), backend: "pty" },
       };
+      mockClaude.setActiveProviderSessionId(descriptor.providerSessionId);
+      return descriptor;
     }
 
-    async getSessionInfo() {
+    async getSessionInfo(sessionId: string) {
       const descriptor = {
-        id: "claude-provider-1",
+        id: sessionId,
         provider: "claude",
         workspace: "C:\\workspace",
         displayName: "Mock Claude",
-        providerSessionId: "provider-session-1",
+        providerSessionId: mockClaude.getActiveProviderSessionId(),
         status: "idle",
         capabilities: this.capabilities,
         createdAt: 1000,
@@ -832,6 +845,28 @@ describe("Claude bot flow", () => {
     expect(list).toContain("my experiment");
     // The original session must still be listed alongside the selected fork.
     expect((list?.match(/^\d+\. Claude/gm) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("repeats the last reply from the selected provider session", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude first conversation"));
+    await waitFor(() => mockClaude.prompts.includes("first conversation"));
+    await bot.handleUpdate(textUpdate(2, "/fork second conversation"));
+    await bot.handleUpdate(textUpdate(3, "reply on the fork"));
+    await waitFor(() => mockClaude.prompts.includes("reply on the fork"));
+
+    await bot.handleUpdate(textUpdate(4, "/sessions"));
+    const sessionList = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Recent provider sessions")).at(-1);
+    const originalLine = sessionList?.split("\n").find((line) =>
+      /^\d+\. Claude/u.test(line) && !line.includes(", selected") && !line.includes(", old"),
+    );
+    const originalNumber = originalLine?.match(/^(\d+)\./u)?.[1];
+    expect(originalNumber).toBeDefined();
+    await bot.handleUpdate(textUpdate(5, `/switch ${originalNumber}`));
+    await bot.handleUpdate(textUpdate(6, "/last"));
+
+    expect(sent.map((entry) => entry.text).at(-1)).toBe("mock reply to first conversation");
   });
 
   it("switches the Claude engine with /backend while Claude is active", async () => {

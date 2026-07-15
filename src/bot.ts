@@ -323,7 +323,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const inspectedThreads = new Map<TelegramContextKey, { threadId: string; parentThreadId?: string }>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
-  const lastAssistantReply = new Map<TelegramContextKey, string>();
+  const lastAssistantReplyBySessionId = new Map<string, string>();
   const queuedPrompts = new Map<TelegramContextKey, QueuedPrompt>();
   const queuedClaudePrompts = new ClaudePromptQueue(claudePromptQueuePath(config.workspace));
   const liveQueuedClaudeContexts = new Map<string, Context>();
@@ -606,7 +606,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     pendingUnsafeLaunchConfirmations.delete(key);
     inspectedThreads.delete(key);
     lastPromptInput.delete(key);
-    lastAssistantReply.delete(key);
+    for (const session of agentSessions.listLaneSessions(key)) {
+      lastAssistantReplyBySessionId.delete(session.id);
+    }
     queuedPrompts.delete(key);
     for (const entry of queuedClaudePrompts.list(key)) {
       liveQueuedClaudeContexts.delete(entry.id);
@@ -741,6 +743,30 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     });
     persistAgentSessionState();
     return created;
+  };
+
+  const getFocusedAgentSession = (contextKey: TelegramContextKey): AgentSessionRecord | undefined => {
+    const activeProvider = registry.getActiveProvider(contextKey);
+    const selected = agentSessions.getSelectedSession(contextKey);
+    if (selected?.provider === activeProvider) {
+      return selected;
+    }
+
+    const providerSessionId = activeProvider === "claude"
+      ? claudeSessions.get(contextKey)?.providerSessionId ?? claudeState?.get(contextKey)?.sessionId
+      : registry.get(contextKey)?.getInfo().threadId;
+    if (!providerSessionId) {
+      return undefined;
+    }
+
+    return agentSessions.listLaneSessions(contextKey).find((session) =>
+      session.provider === activeProvider && session.providerSessionId === providerSessionId,
+    );
+  };
+
+  const getFocusedAssistantReply = (contextKey: TelegramContextKey): string | undefined => {
+    const focusedSession = getFocusedAgentSession(contextKey);
+    return focusedSession ? lastAssistantReplyBySessionId.get(focusedSession.id) : undefined;
   };
 
   const startAgentJob = (sessionId: string, jobId: string): void => {
@@ -2002,7 +2028,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
       const finalSourceText = finalAnswerText.trim() ? finalAnswerText : pendingStreamText;
       const rememberedText = finalAnswerText.trim() ? finalAnswerText : accumulatedText;
-      lastAssistantReply.set(contextKey, buildFinalResponseText(rememberedText));
+      if (codexAgentSession) {
+        lastAssistantReplyBySessionId.set(codexAgentSession.id, buildFinalResponseText(rememberedText));
+      }
       const finalUndeliveredText = buildFinalResponseText(finalSourceText);
       if (finalUndeliveredText) {
         pendingStreamText = "";
@@ -2319,7 +2347,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
       updateSessionMetadata(contextKey, session);
       await requestFinalization();
-      backgroundCompletionText = lastAssistantReply.get(contextKey) ?? "Codex finished.";
+      backgroundCompletionText = codexAgentSession
+        ? lastAssistantReplyBySessionId.get(codexAgentSession.id) ?? "Codex finished."
+        : "Codex finished.";
       completedSuccessfully = true;
     } catch (error) {
       stopTyping();
@@ -2824,8 +2854,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
 
       finalText = finalText.trim() || (sentAssistantProgress ? "" : streamedText.trim());
-      if (finalText) {
-        lastAssistantReply.set(contextKey, finalText);
+      if (finalText && claudeAgentSession) {
+        lastAssistantReplyBySessionId.set(claudeAgentSession.id, finalText);
       }
       // Decide what still needs delivering. When interim narration was streamed as its own
       // messages, every block but the last was already sent; only the held final block
@@ -3313,9 +3343,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
 
     if (commandName === "copy" || commandName === "last" || commandName === "repeat") {
-      const reply = lastAssistantReply.get(contextKey);
+      const reply = getFocusedAssistantReply(contextKey);
       if (!reply) {
-        const message = "No assistant reply is available to copy yet.";
+        const message = "No assistant reply is available for the selected provider session yet.";
         await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
         return;
       }
@@ -4888,10 +4918,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
 
-    const reply = lastAssistantReply.get(contextKey);
+    const reply = getFocusedAssistantReply(contextKey);
     if (!reply) {
-      await safeReply(ctx, escapeHTML("No assistant reply has been captured for this context yet."), {
-        fallbackText: "No assistant reply has been captured for this context yet.",
+      await safeReply(ctx, escapeHTML("No assistant reply has been captured for the selected provider session yet."), {
+        fallbackText: "No assistant reply has been captured for the selected provider session yet.",
       });
       return;
     }

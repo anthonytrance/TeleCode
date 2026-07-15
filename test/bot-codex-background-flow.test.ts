@@ -108,6 +108,7 @@ describe("Codex background completion flow", () => {
     await waitFor(() => sent.some((text) => text.includes("CODEX_BACKGROUND_COMMENTARY")));
     expect(sent.some((text) => text.includes("Buffered Codex output"))).toBe(true);
 
+    registry.setActiveProvider("123", "codex");
     const finalCopiesBefore = sent.filter((text) => text === "CODEX_COMPLETE_FINAL").length;
     await bot.handleUpdate(textUpdate(3, "/last"));
     await bot.handleUpdate(textUpdate(4, "/repeat"));
