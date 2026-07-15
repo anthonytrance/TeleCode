@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn as spawnProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -7104,6 +7104,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     busyState.transcribing = true;
     let tempFilePath: string | undefined;
     let transcript: string | undefined;
+    let keptAudioPath: string | undefined;
 
     try {
       await ctx.api.sendChatAction(chatId, "typing");
@@ -7118,6 +7119,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
 
+      // Keep the audio for a while: a transcript can turn out to be wrong or the
+      // audio itself can be the content (sung melodies transcribe as gibberish).
+      keptAudioPath = await archiveVoiceAudio(config.workspace, tempFilePath);
+
       // Forward voice notes as prompts without a separate transcription echo.
     } catch (error) {
       const note = "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.";
@@ -7127,7 +7132,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     } finally {
       busyState.transcribing = false;
-      if (tempFilePath) {
+      if (tempFilePath && !keptAudioPath) {
         await unlink(tempFilePath).catch(() => {});
       }
     }
@@ -7136,18 +7141,24 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
 
+    let promptText = transcript;
+    if (keptAudioPath) {
+      const hint = degenerateTranscriptHint(transcript);
+      promptText += `\n\n[Voice message audio saved at: ${keptAudioPath}${hint ? `. ${hint}` : ""}]`;
+    }
+
     lastPromptInput.set(contextKey, transcript);
     if (isClaudeActive(contextKey)) {
       // handleClaudePrompt queues internally when the Claude lane is busy.
       await setReaction(ctx, "👀");
-      startClaudePrompt(ctx, contextKey, chatId, transcript);
+      startClaudePrompt(ctx, contextKey, chatId, promptText);
     } else if (session) {
       if (isBusy(contextKey)) {
-        await queuePromptReply(ctx, contextKey, chatId, session, transcript);
+        await queuePromptReply(ctx, contextKey, chatId, session, promptText);
         return;
       }
       await setReaction(ctx, "👀");
-      startUserPrompt(ctx, contextKey, chatId, session, transcript);
+      startUserPrompt(ctx, contextKey, chatId, session, promptText);
     }
   });
 
@@ -7895,6 +7906,64 @@ async function safeEditMessage(
 
     throw error;
   }
+}
+
+const VOICE_ARCHIVE_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+const VOICE_ARCHIVE_MAX_FILES = 50;
+
+/** Move a transcribed voice note into a rolling archive so the audio itself
+ * stays reachable after transcription. Returns undefined when archiving fails,
+ * in which case the caller falls back to deleting the temp file. */
+async function archiveVoiceAudio(workspace: string, tempPath: string): Promise<string | undefined> {
+  try {
+    const dir = path.join(workspace, ".telecode", "voice");
+    await mkdir(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const target = path.join(dir, `voice-${stamp}${path.extname(tempPath) || ".oga"}`);
+    try {
+      await rename(tempPath, target);
+    } catch {
+      await copyFile(tempPath, target);
+      await unlink(tempPath).catch(() => {});
+    }
+    void pruneVoiceArchive(dir).catch(() => {});
+    return target;
+  } catch {
+    return undefined;
+  }
+}
+
+async function pruneVoiceArchive(dir: string): Promise<void> {
+  const entries = await readdir(dir);
+  const files: Array<{ p: string; mtime: number }> = [];
+  for (const entry of entries) {
+    const p = path.join(dir, entry);
+    const s = await stat(p).catch(() => null);
+    if (s?.isFile()) {
+      files.push({ p, mtime: s.mtimeMs });
+    }
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  const cutoff = Date.now() - VOICE_ARCHIVE_MAX_AGE_MS;
+  for (const [index, file] of files.entries()) {
+    if (index >= VOICE_ARCHIVE_MAX_FILES || file.mtime < cutoff) {
+      await unlink(file.p).catch(() => {});
+    }
+  }
+}
+
+/** A transcript made of a handful of words repeated many times is almost always
+ * Whisper hallucinating over non-speech audio (singing, humming, music). */
+export function degenerateTranscriptHint(transcript: string): string | undefined {
+  const words = transcript.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length < 12) {
+    return undefined;
+  }
+  const unique = new Set(words);
+  if (unique.size <= Math.max(2, Math.floor(words.length * 0.15))) {
+    return "The transcript is highly repetitive, so the audio is likely singing, humming, or music rather than speech. Analyze the saved audio file instead of trusting the transcript";
+  }
+  return undefined;
 }
 
 async function downloadTelegramFile(
