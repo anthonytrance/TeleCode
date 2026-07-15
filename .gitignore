@@ -20,6 +20,9 @@ workspace/
 # Agent tooling (local dev only)
 agent-tools/
 
+# Local working notes (never published)
+docs-internal/
+
 # macOS
 .DS_Store
 
