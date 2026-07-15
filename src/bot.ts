@@ -26,7 +26,9 @@ import {
   buildFileInstructions,
   cleanupInbox,
   outboxPath,
+  outputFilesInstruction,
   stageFile,
+  stripOutputFilesInstruction,
   type StagedFile,
 } from "./attachments.js";
 import { collectArtifactReport, ensureOutDir, formatArtifactSummary, pruneOldTurnDirectories } from "./artifacts.js";
@@ -2599,6 +2601,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       kind: BufferedOutputEvent["kind"],
       outputText: string,
       priority?: boolean,
+      artifactPath?: string,
     ): void => {
       if (!descriptor || !outputText.trim()) {
         return;
@@ -2607,8 +2610,54 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         kind,
         text: outputText,
         priority,
+        artifactPath,
         metadata: { provider: "claude" },
       });
+    };
+
+    // Per-turn outbox for generated files, mirroring the Codex artifact flow: the
+    // prompt tells Claude where to write user-facing files, and the turn's finally
+    // block delivers whatever landed there. Undefined for slash-command turns.
+    let claudeArtifactOutDir: string | undefined;
+
+    const deliverClaudeArtifacts = async (): Promise<void> => {
+      if (!claudeArtifactOutDir) {
+        return;
+      }
+      const { artifacts, skippedCount } = await collectArtifactReport(claudeArtifactOutDir);
+      if (artifacts.length === 0 && skippedCount === 0) {
+        return;
+      }
+      if (!isProviderForeground(contextKey, "claude")) {
+        const summary = formatArtifactSummary(artifacts, skippedCount);
+        if (summary) {
+          bufferClaudeOutput("status", summary, artifacts.length > 0 || skippedCount > 0);
+        }
+        for (const artifact of artifacts) {
+          bufferClaudeOutput("artifact", artifact.name, true, artifact.localPath);
+        }
+        return;
+      }
+      await bot.api
+        .sendChatAction(source.chatId, "upload_document", {
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        })
+        .catch(() => {});
+      let failedCount = 0;
+      for (const artifact of artifacts) {
+        try {
+          await bot.api.sendDocument(source.chatId, new InputFile(artifact.localPath, artifact.name), {
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          });
+        } catch (error) {
+          failedCount += 1;
+          console.error(`Failed to send Claude artifact ${artifact.name}:`, error);
+        }
+      }
+      const summary = formatArtifactSummary(artifacts, skippedCount + failedCount);
+      if (summary) {
+        await replyToClaudeRunSource(source, escapeHTML(summary), { fallbackText: summary, messageThreadId });
+      }
     };
 
     // Deliver one Claude narration line, matching the Codex progress pipeline so both
@@ -2747,10 +2796,17 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
       agentJobId = jobId;
       startAgentJob(agentSession.id, jobId);
+      let promptText = text;
+      if (!text.trimStart().startsWith("/")) {
+        const turnId = randomUUID().slice(0, 12);
+        claudeArtifactOutDir = outboxPath(descriptor.workspace, turnId);
+        await ensureOutDir(claudeArtifactOutDir);
+        promptText = `${text}\n\n${outputFilesInstruction(claudeArtifactOutDir)}`;
+      }
       for await (const event of claudeAdapter.sendPrompt({
         sessionId: descriptor.id,
         jobId,
-        input: { text },
+        input: { text: promptText },
       })) {
         switch (event.type) {
           case "assistant_text_delta": {
@@ -2926,7 +2982,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       console.error("Claude prompt failed:", error);
       bridgeLog("error", `claude turn failed lane=${contextKey}: ${String(error)}`);
       if (error instanceof PromptNotDeliveredError) {
-        enqueueClaudePromptFromSource(source, contextKey, error.promptText, { front: true });
+        // Requeue the user's text, not the delivered prompt: the delivered prompt carries
+        // this turn's outbox instruction, and the retry turn appends its own.
+        enqueueClaudePromptFromSource(source, contextKey, stripOutputFilesInstruction(error.promptText), { front: true });
         deferQueuedDispatch = true;
         const queuedMessage = "Claude did not accept the message yet. I put it back at the front of the Claude queue and will retry after the current session becomes idle.";
         await replyToClaudeRunSource(source, escapeHTML(queuedMessage), {
@@ -2964,6 +3022,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     } finally {
       clearInterval(typingInterval);
       clearNarrationIdleTimer();
+      try {
+        await deliverClaudeArtifacts();
+      } catch (artifactError) {
+        console.error("Failed to deliver Claude artifacts:", artifactError);
+      }
       if (agentJobId) {
         finishAgentJob(agentJobId, completedSuccessfully ? "completed" : "failed");
       }
@@ -7970,7 +8033,7 @@ function userInputHasOutputInstructions(input: CodexPromptInput): boolean {
 }
 
 function addOutputInstructions(input: CodexPromptInput, outDir: string): CodexPromptInput {
-  const stagedFileInstructions = `Output files: write any files the user should receive to ${outDir}`;
+  const stagedFileInstructions = outputFilesInstruction(outDir);
   if (typeof input === "string") {
     return { text: input, stagedFileInstructions };
   }

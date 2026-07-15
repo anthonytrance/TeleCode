@@ -53,7 +53,7 @@ const CLAUDE_CAPABILITIES: AgentProviderCapabilities = {
   slashCommands: true,
   permissions: false,
   userQuestions: false,
-  artifacts: false,
+  artifacts: true,
 };
 
 export type ClaudeBackend = "pty" | "sdk";

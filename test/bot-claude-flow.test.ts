@@ -10,6 +10,7 @@ import { SessionRegistry } from "../src/session-registry.js";
 
 const mockClaude = vi.hoisted(() => {
   const prompts: string[] = [];
+  const rawPrompts: string[] = [];
   const steers: string[] = [];
   const createSession = vi.fn();
   const resumeSession = vi.fn();
@@ -22,10 +23,16 @@ const mockClaude = vi.hoisted(() => {
   let promptGate: Promise<void> | undefined;
   let releasePromptGate: (() => void) | undefined;
   let nextEvents: Array<Record<string, unknown>> | undefined;
+  let artifactFileName: string | undefined;
 
   return {
     prompts,
+    rawPrompts,
     steers,
+    setArtifactFileName: (name: string | undefined) => {
+      artifactFileName = name;
+    },
+    getArtifactFileName: () => artifactFileName,
     createSession,
     resumeSession,
     getSessionInfo,
@@ -70,6 +77,7 @@ const mockClaude = vi.hoisted(() => {
     },
     reset: () => {
       prompts.length = 0;
+      rawPrompts.length = 0;
       steers.length = 0;
       createCount = 0;
       activeModel = "sonnet";
@@ -79,6 +87,7 @@ const mockClaude = vi.hoisted(() => {
       promptGate = undefined;
       releasePromptGate = undefined;
       nextEvents = undefined;
+      artifactFileName = undefined;
       createSession.mockReset();
       resumeSession.mockReset();
       getSessionInfo.mockReset();
@@ -87,7 +96,11 @@ const mockClaude = vi.hoisted(() => {
   };
 });
 
-vi.mock("../src/providers/claude-adapter.js", () => ({
+vi.mock("../src/providers/claude-adapter.js", async () => {
+  const { stripOutputFilesInstruction, extractOutputFilesDir } = await import("../src/attachments.js");
+  const fs = await import("node:fs");
+  const nodePath = await import("node:path");
+  return {
   PromptNotDeliveredError: class PromptNotDeliveredError extends Error {
     constructor(
       readonly promptText: string,
@@ -110,7 +123,7 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
       slashCommands: true,
       permissions: false,
       userQuestions: false,
-      artifacts: false,
+      artifacts: true,
     };
 
     async createSession(options: { workspace?: string; displayName?: string; metadata?: Record<string, unknown> }) {
@@ -199,8 +212,19 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
     }
 
     async *sendPrompt(options: { sessionId: string; jobId: string; input: { text?: string } }) {
-      const text = options.input.text ?? "";
+      const rawText = options.input.text ?? "";
+      // The bridge appends a per-turn outbox instruction to normal prompts; tests
+      // assert on the user's text, so strip it here and honor it when a test asks
+      // for an artifact to be produced.
+      const text = stripOutputFilesInstruction(rawText);
       mockClaude.prompts.push(text);
+      mockClaude.rawPrompts.push(rawText);
+      const artifactFileName = mockClaude.getArtifactFileName();
+      const outDir = extractOutputFilesDir(rawText);
+      if (artifactFileName && outDir) {
+        fs.mkdirSync(outDir, { recursive: true });
+        fs.writeFileSync(nodePath.join(outDir, artifactFileName), "mock artifact content");
+      }
       const modelMatch = text.match(/^\/model\s+(.+)$/u);
       if (modelMatch?.[1]) {
         mockClaude.setActiveModel(modelMatch[1].trim());
@@ -272,7 +296,8 @@ vi.mock("../src/providers/claude-adapter.js", () => ({
       mockClaude.dispose(sessionId);
     }
   },
-}));
+  };
+});
 
 vi.mock("../src/codex-backend.js", () => ({
   createCodexSession: vi.fn(() => {
@@ -940,6 +965,32 @@ describe("Claude bot flow", () => {
     expect(diagnostics).toContain("Legacy Claude Telegram plugin processes: 0");
   });
 
+  it("delivers files Claude writes to the turn outbox", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    mockClaude.setArtifactFileName("result.txt");
+    await bot.handleUpdate(textUpdate(2, "make me a file"));
+
+    await waitFor(() => mockClaude.prompts.includes("make me a file"));
+    await waitFor(() => sent.some((entry) => entry.method === "sendDocument" && entry.text === "result.txt"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("1 artifact generated")));
+  });
+
+  it("appends outbox instructions to normal prompts but not slash commands", async () => {
+    const { bot } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude"));
+    await bot.handleUpdate(textUpdate(2, "hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+    await bot.handleUpdate(textUpdate(3, "/model opus"));
+    await waitFor(() => mockClaude.prompts.includes("/model opus"));
+
+    const helloRaw = mockClaude.rawPrompts.find((raw) => raw.startsWith("hello"));
+    expect(helloRaw).toContain("Output files: write any files the user should receive to ");
+    expect(mockClaude.rawPrompts).toContain("/model opus");
+  });
+
   it("exposes a shutdown hook that disposes all integrated Claude runtimes", async () => {
     const { bot } = await createTestBot(tempDir);
 
@@ -970,6 +1021,11 @@ async function createTestBot(workspace: string, overrides: Partial<TeleCodeConfi
     if (method === "sendChatAction" || method === "answerCallbackQuery" || method === "setMessageReaction") {
       sent.push({ method });
       return { ok: true, result: true };
+    }
+    if (method === "sendDocument") {
+      const document = (payload as { document?: { filename?: string } }).document;
+      sent.push({ method, text: document?.filename });
+      return { ok: true, result: textMessage(messageId++, "") };
     }
     throw new Error(`Unhandled Telegram API method in test: ${method}`);
   });

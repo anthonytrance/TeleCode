@@ -33,6 +33,28 @@ export function inboxPath(workspace: string, turnId: string): string {
   return path.join(workspace, ".telecode", "inbox", turnId);
 }
 
+export const OUTPUT_FILES_INSTRUCTION_PREFIX = "Output files: write any files the user should receive to ";
+
+export function outputFilesInstruction(outDir: string): string {
+  return `${OUTPUT_FILES_INSTRUCTION_PREFIX}${outDir}`;
+}
+
+export function stripOutputFilesInstruction(text: string): string {
+  const marker = `\n\n${OUTPUT_FILES_INSTRUCTION_PREFIX}`;
+  const index = text.lastIndexOf(marker);
+  return index === -1 ? text : text.slice(0, index);
+}
+
+export function extractOutputFilesDir(text: string): string | undefined {
+  const marker = `\n\n${OUTPUT_FILES_INSTRUCTION_PREFIX}`;
+  const index = text.lastIndexOf(marker);
+  if (index === -1) {
+    return undefined;
+  }
+  const dir = text.slice(index + marker.length).trim();
+  return dir || undefined;
+}
+
 export function outboxPath(workspace: string, turnId: string): string {
   return path.join(workspace, ".telecode", "turns", turnId, "out");
 }
