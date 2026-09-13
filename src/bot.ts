@@ -337,7 +337,9 @@ export interface TeleCodeBot extends Bot<Context> {
 
 export function createBot(config: TeleCodeConfig, registry: SessionRegistry): TeleCodeBot {
   const bot = new Bot<Context>(config.telegramBotToken) as TeleCodeBot;
-  bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
+  // Telegram answers a burst with retry_after values well above 10s; giving up
+  // there dropped narration blocks on the floor with nothing in the log.
+  bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 60 }));
   const startedAt = Date.now();
   initBridgeLog(config.workspace);
   bridgeLog("startup", `bridge starting; workspace=${config.workspace} claudeProvider=${config.enableClaudeProvider}`);
@@ -3024,6 +3026,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     // answer not yet delivered, so it becomes the final delivery instead of re-posting the
     // whole answer on top of the narration.
     let finalAssistantBlock = "";
+    // Narration blocks Telegram refused even after retries. Folded into the final
+    // delivery so a rate limit can no longer eat them silently.
+    const undeliveredNarration: string[] = [];
     let progressMessageId: number | undefined;
     // Rolling window of recent Claude narration lines, mirroring the Codex progress buffer.
     const recentClaudeProgress: string[] = [];
@@ -3131,6 +3136,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           });
         }
         sentAssistantProgress = true;
+        bridgeLog("deliver", `narration lane=${contextKey} chars=${trimmed.length} mode=${mode} oversized=true`);
         return;
       }
 
@@ -3164,6 +3170,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         }
       }
       sentAssistantProgress = true;
+      bridgeLog("deliver", `narration lane=${contextKey} chars=${trimmed.length} mode=${mode}`);
     };
 
     let narrationIdleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3183,7 +3190,12 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       // can never deliver the same block twice.
       pendingAssistantProgressText = "";
       clearNarrationIdleTimer();
-      await deliverClaudeAssistantProgress(pending);
+      try {
+        await deliverClaudeAssistantProgress(pending);
+      } catch (error) {
+        bridgeLog("deliver", `narration send failed lane=${contextKey} chars=${pending.length}: ${String(error)}`);
+        undeliveredNarration.push(pending);
+      }
     };
 
     // A held narration line would otherwise wait for Claude's next block before appearing.
@@ -3373,6 +3385,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       // remains, so deliver just that and never re-post the whole answer. Otherwise (edit
       // or none delivery, or a single-block turn) deliver the full answer.
       let finalTextToDeliver = sentAssistantProgress ? finalAssistantBlock.trim() : finalText;
+      if (undeliveredNarration.length > 0) {
+        finalTextToDeliver = [...undeliveredNarration, finalTextToDeliver].filter((part) => part.trim()).join("\n\n");
+        undeliveredNarration.length = 0;
+      }
       if (!finalTextToDeliver && !sentAssistantProgress) {
         finalText = "Claude finished without text.";
         finalTextToDeliver = finalText;
@@ -3386,6 +3402,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             messageThreadId,
           });
         }
+        bridgeLog("deliver", `final lane=${contextKey} chars=${outputText.length}`);
       };
 
       let finalDelivered = false;
@@ -4013,6 +4030,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
 
     try {
+      bridgeLog("abort", `/stop lane=${contextKey} working=${isClaudeWorking(contextKey)} processing=${getBusyState(contextKey).processing}`);
       await claudeAdapter.abort(descriptor.id);
       await safeReply(ctx, escapeHTML("Abort sent to Claude."), {
         fallbackText: "Abort sent to Claude.",
@@ -5099,6 +5117,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
       try {
+        bridgeLog("abort", `/stop lane=${rawContextKey} working=${isClaudeWorking(rawContextKey)} processing=${getBusyState(rawContextKey).processing}`);
         await claudeAdapter.abort(descriptor.id);
         await safeReply(ctx, escapeHTML("Abort sent to Claude."), {
           fallbackText: "Abort sent to Claude.",

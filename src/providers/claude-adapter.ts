@@ -400,6 +400,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
   async abort(sessionId: string): Promise<void> {
     const runtime = this.requireRuntime(sessionId);
+    bridgeLog("abort", `abort requested session=${runtime.providerSessionId} busy=${runtime.busy} parkActive=${runtime.parkedQuery?.isActive === true}`);
     runtime.abortRequested = true;
     runtime.sdkAbortController?.abort();
     // An aborted session should not leave a parked query running in the background.
@@ -521,7 +522,28 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       runtime.model = model;
       runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model };
       runtime.descriptor.updatedAt = Date.now();
-      const text = `Claude model set to ${model} for the next turn (sdk backend).`;
+      let parkNote = "";
+      const parked = runtime.parkedQuery;
+      if (parked && !parked.isClosed) {
+        // The park is the CLI that will answer the next prompt (adoption), so the
+        // switch must land inside it now. Otherwise the next turn runs on the old
+        // model and its observed model overwrites this choice again.
+        let switched = false;
+        try {
+          switched = await parked.setModel(shouldPassClaudeModel(model) ? model : undefined);
+        } catch (error) {
+          bridgeLog("model", `parked query refused model switch: ${error instanceof Error ? error.message : String(error)} session=${runtime.providerSessionId}`);
+        }
+        if (switched) {
+          bridgeLog("model", `model switched inside parked query to ${model} session=${runtime.providerSessionId}`);
+        } else {
+          parked.close();
+          runtime.parkedQuery = undefined;
+          parkNote = " The idle background query was closed so the switch takes effect.";
+          bridgeLog("model", `closed parked query for model switch to ${model} session=${runtime.providerSessionId}`);
+        }
+      }
+      const text = `Claude model set to ${model} for the next turn (sdk backend).${parkNote}`;
       yield { type: "assistant_text_delta", sessionId: runtime.descriptor.id, jobId, text };
       yield { type: "assistant_message_complete", sessionId: runtime.descriptor.id, jobId, text };
       return;
@@ -623,6 +645,12 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
             };
           }
         } else if (event.type === "error") {
+          if (abortController.signal.aborted) {
+            // /stop closed the live query; report the abort, not the stream error.
+            const text = partialText.trim() ? `${partialText.trim()}\n\nTurn aborted.` : "Turn aborted.";
+            yield { type: "assistant_message_complete", sessionId: runtime.descriptor.id, jobId, text };
+            return;
+          }
           // Mirror the PTY path: salvage streamed partial text into a completion,
           // otherwise fail the turn.
           if (partialText.trim()) {

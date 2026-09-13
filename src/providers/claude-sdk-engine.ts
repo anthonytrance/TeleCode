@@ -87,6 +87,7 @@ export interface ClaudeSdkTurnOptions {
     options: Record<string, unknown>;
   }) => AsyncIterable<SdkMessageLike> & {
     close?: () => void;
+    setModel?: (model?: string) => Promise<void>;
     streamInput?: (stream: AsyncIterable<SdkUserMessageLike>) => Promise<void>;
   };
 }
@@ -353,6 +354,8 @@ const TASK_ID_OPEN = "<task-id>";
 const TASK_ID_CLOSE = "</task-id>";
 const BACKGROUND_TASK_MARKER = "running in background with ID: ";
 const TASK_ID_TERMINATORS = [" ", "\n", "\r", "\t", ".", ","];
+/** The CLI's synthetic answer to its own injected rescue prompt; never user-facing. */
+const SYNTHETIC_BOILERPLATE = new Set(["No response requested."]);
 
 /**
  * A live SDK query that outlives the turn that opened it. Two readers take turns
@@ -376,7 +379,10 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
   private resolveDrainFinished?: () => void;
 
   constructor(
-    private readonly query: AsyncIterable<SdkMessageLike> & { close?: () => void },
+    private readonly query: AsyncIterable<SdkMessageLike> & {
+      close?: () => void;
+      setModel?: (model?: string) => Promise<void>;
+    },
     readonly inputController: ClaudeSdkInputController | undefined,
     public providerSessionId: string | undefined,
   ) {
@@ -561,6 +567,22 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
     return true;
   }
 
+  /**
+   * Switch the model of the live CLI behind this park. A park is the process
+   * that answers the next prompt (adoption), so a /model while it is alive must
+   * reach it now; otherwise the next turn runs on the old model and the observed
+   * model then overwrites the user's choice. Returns false when the query has no
+   * control channel (or is already closed) so the caller can close the park and
+   * let the next turn open fresh on the new model instead.
+   */
+  async setModel(model: string | undefined): Promise<boolean> {
+    if (this.closed || typeof this.query.setModel !== "function") {
+      return false;
+    }
+    await this.query.setModel(model);
+    return true;
+  }
+
   close(): void {
     if (this.closed) {
       return;
@@ -724,11 +746,19 @@ async function drainParkedSdkQuery(args: {
       }
       if (message.type === "assistant") {
         const model = message.message?.model;
-        if (!model || model === "<synthetic>") {
+        if (!model) {
           continue;
         }
+        // The CLI's own notices (spend limit, refusals) arrive as synthetic
+        // assistant messages. Inside a park they used to be dropped, so a limit hit
+        // looked like Claude simply going quiet. Deliver them; only the boilerplate
+        // reply to an injected rescue prompt stays out.
+        const synthetic = model === "<synthetic>";
         for (const block of message.message?.content ?? []) {
           const blockType = typeof block.type === "string" ? block.type : "";
+          if (synthetic && (blockType !== "text" || typeof block.text !== "string" || SYNTHETIC_BOILERPLATE.has(block.text.trim()))) {
+            continue;
+          }
           if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
             bufferedText += `${bufferedText ? "\n\n" : ""}${block.text.trim()}`;
             flushDeadline = Date.now() + flushDebounceMs;
@@ -760,7 +790,11 @@ async function drainParkedSdkQuery(args: {
       }
       if (message.type === "result") {
         if (message.subtype !== "success") {
-          bridgeLog("park", `parked sdk turn ended: ${message.subtype ?? "?"} session=${sessionLabel}`);
+          const detail = message.result?.trim() || describeSdkErrors(message.errors) || message.subtype || "unknown error";
+          bridgeLog("park", `parked sdk turn ended: ${detail} session=${sessionLabel}`);
+          // The user must hear this, not just the log: a park dying on a spend
+          // limit or API error otherwise looks like Claude losing its track.
+          bufferedText += `${bufferedText ? "\n\n" : ""}Claude's background turn ended with an error: ${detail}`;
           break;
         }
         // A result closes an injected turn and repeats the assistant text it
@@ -815,6 +849,22 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
   // early consumer return, throw) or the query and its CLI process would leak.
   let parked = false;
   let activeQuery: ParkedQuery | undefined;
+  // /stop must reach the query that is actually live. An adopted park was opened
+  // by an earlier turn under a different AbortController, so the SDK never sees
+  // this turn's abort and the CLI kept running. Close the live query ourselves
+  // whenever the signal fires; the SDK's own abort handling covers fresh queries
+  // too, but this path is the one that works for both.
+  const abortSignal = options.abortController?.signal;
+  const onAbort = (): void => {
+    bridgeLog("abort", `closing live sdk query session=${activeProviderSessionId ?? sessionId}`);
+    activeQuery?.close();
+    inputController?.close();
+  };
+  if (abortSignal?.aborted) {
+    onAbort();
+  } else {
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+  }
   let adoptedQuery = inputController ? options.adoptedQuery : undefined;
   // Set when an adopted query died before answering: attempt 1 must then re-send
   // the user's own prompt to a fresh CLI, not the "you produced no response" nudge,
@@ -1129,6 +1179,12 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         }
       }
 
+      if (abortSignal?.aborted) {
+        // The stream ended because /stop closed it. Neither retry nor replay:
+        // the user asked for silence, not a second run of the same prompt.
+        yield { type: "error", sessionId, jobId, message: "Claude turn aborted." };
+        return;
+      }
       if (!sawResult) {
         if (adopting && attempt === 0) {
           // The park looked alive but its CLI was already gone, so the steer went
@@ -1180,6 +1236,7 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
       }
     }
   } finally {
+    abortSignal?.removeEventListener("abort", onAbort);
     if (parked && activeQuery) {
       // Single launch site for the parked drain: every exit path funnels here,
       // so the query can never be parked without a reader and never leaked.

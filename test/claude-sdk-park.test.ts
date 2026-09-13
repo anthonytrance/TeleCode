@@ -864,3 +864,175 @@ describe("parked drain background tasks", () => {
     );
   });
 });
+
+/**
+ * /stop and /model against the query that is actually live. A turn that adopts a
+ * park keeps the earlier turn's AbortController, so the SDK never sees the new
+ * turn's abort; the engine must close the live query itself. A model switch while
+ * a park is alive must reach that park, or the next adopted turn keeps the old
+ * model and then writes it back over the user's choice.
+ */
+describe("stop and model switch against a live or adopted query", () => {
+  const parkOptions = {
+    ...baseOptions,
+    parkIdleMs: 60_000,
+    parkHardCapMs: 120_000,
+  };
+
+  async function parkFirstTurn(
+    controlled: ReturnType<typeof controlledQuery>,
+    options: { adopt: boolean; parkIdleMs?: number },
+  ): Promise<{ inputController: ClaudeSdkInputController; handle: ParkedQuery; parkedEvents: AgentProviderEvent[] }> {
+    const inputController = new ClaudeSdkInputController();
+    const parkedEvents: AgentProviderEvent[] = [];
+    let handle: ParkedQuery | undefined;
+    controlled.push(initMessage);
+    controlled.push(textMessage("FIRST"));
+    controlled.push(successResult("FIRST"));
+    await collect(
+      runClaudeSdkTurn({
+        ...parkOptions,
+        parkIdleMs: options.parkIdleMs ?? parkOptions.parkIdleMs,
+        parkFlushDebounceMs: 20,
+        queryFn: controlled.queryFn,
+        inputController,
+        onParkedEvent: (event) => parkedEvents.push(event),
+        onParkStateChanged: (parked, query) => {
+          if (parked) {
+            handle = query;
+          }
+        },
+      }),
+    );
+    if (!handle) {
+      throw new Error("first turn did not park");
+    }
+    if (options.adopt && !(await handle.takeOver())) {
+      throw new Error("park was not adoptable");
+    }
+    return { inputController, handle, parkedEvents };
+  }
+
+  it("aborting a turn that adopted a park closes that query and does not retry", async () => {
+    const controlled = controlledQuery();
+    const { inputController, handle } = await parkFirstTurn(controlled, { adopt: true });
+    const abortController = new AbortController();
+    const events: AgentProviderEvent[] = [];
+    const turn = (async () => {
+      for await (const event of runClaudeSdkTurn({
+        ...parkOptions,
+        promptText: "the follow-up question",
+        queryFn: controlled.queryFn,
+        inputController,
+        adoptedQuery: handle,
+        abortController,
+        onParkedEvent: () => {},
+        onParkStateChanged: () => {},
+      })) {
+        events.push(event);
+      }
+    })();
+
+    await waitUntil(() => controlled.deliveredPrompts.length === 2);
+    expect(controlled.isClosed()).toBe(false);
+
+    abortController.abort();
+    await turn;
+
+    // The CLI behind the adopted park is gone, no fresh query was opened in its
+    // place, and nothing was passed off as a finished answer.
+    expect(controlled.isClosed()).toBe(true);
+    expect(controlled.seen).toHaveLength(1);
+    expect(events.some((event) => event.type === "assistant_message_complete")).toBe(false);
+    expect(events.some((event) => event.type === "error")).toBe(true);
+  });
+
+  it("aborting a fresh query closes it and does not retry", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    const abortController = new AbortController();
+    const events: AgentProviderEvent[] = [];
+    const turn = (async () => {
+      for await (const event of runClaudeSdkTurn({
+        ...parkOptions,
+        queryFn: controlled.queryFn,
+        abortController,
+        onParkedEvent: () => {},
+        onParkStateChanged: () => {},
+      })) {
+        events.push(event);
+      }
+    })();
+
+    await waitUntil(() => controlled.waitingReaders() === 1);
+    abortController.abort();
+    await turn;
+
+    expect(controlled.isClosed()).toBe(true);
+    expect(controlled.seen).toHaveLength(1);
+    expect(events.some((event) => event.type === "assistant_message_complete")).toBe(false);
+  });
+
+  it("ParkedQuery.setModel reaches the query's control request and reports when unsupported", async () => {
+    const calls: Array<string | undefined> = [];
+    const empty = { [Symbol.asyncIterator]: () => ({ next: async () => ({ value: undefined, done: true as const }) }) };
+    const capable = new ParkedQuery(
+      { ...empty, setModel: async (model?: string) => { calls.push(model); } },
+      undefined,
+      "s1",
+    );
+    await expect(capable.setModel("claude-fable-5-1")).resolves.toBe(true);
+    expect(calls).toEqual(["claude-fable-5-1"]);
+
+    const plain = new ParkedQuery(empty, undefined, "s2");
+    await expect(plain.setModel("claude-fable-5-1")).resolves.toBe(false);
+
+    capable.close();
+    await expect(capable.setModel("claude-opus-5")).resolves.toBe(false);
+    expect(calls).toEqual(["claude-fable-5-1"]);
+  });
+
+  it("delivers the CLI's synthetic notice during a park but not the rescue boilerplate", async () => {
+    const controlled = controlledQuery();
+    const { parkedEvents } = await parkFirstTurn(controlled, { adopt: false, parkIdleMs: 300 });
+
+    controlled.push({
+      type: "assistant",
+      message: { model: "<synthetic>", content: [{ type: "text", text: "No response requested." }] },
+    });
+    controlled.push(successResult(""));
+    controlled.push({
+      type: "assistant",
+      message: { model: "<synthetic>", content: [{ type: "text", text: "You've hit your monthly spend limit" }] },
+    });
+    controlled.push(successResult(""));
+
+    await waitUntil(() =>
+      parkedEvents.some(
+        (event) => event.type === "assistant_message_complete" && (event.text ?? "").includes("monthly spend limit"),
+      ),
+    );
+    expect(
+      parkedEvents.some(
+        (event) => event.type === "assistant_message_complete" && (event.text ?? "").includes("No response requested."),
+      ),
+    ).toBe(false);
+  });
+
+  it("reports a parked turn that ends in an error instead of only logging it", async () => {
+    const controlled = controlledQuery();
+    const { parkedEvents } = await parkFirstTurn(controlled, { adopt: false, parkIdleMs: 300 });
+
+    controlled.push(textMessage("PARTIAL"));
+    controlled.push({ type: "result", subtype: "error_during_execution", result: "boom", errors: [] });
+
+    await waitUntil(() =>
+      parkedEvents.some(
+        (event) =>
+          event.type === "assistant_message_complete" &&
+          (event.text ?? "").includes("PARTIAL") &&
+          (event.text ?? "").includes("boom"),
+      ),
+    );
+  });
+});
