@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn as spawnProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { readTranscriptWindow, type TranscriptWindow } from "./transcript-window.js";
 import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -858,6 +859,30 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   const claudeParkActiveSessions = new Set<string>();
 
   /**
+   * Claude sessions the user switched away from while their parked query was
+   * still alive. Disposing them killed the CLI mid-flight: a background task it
+   * was waiting on never reported back and queued work was lost. They stay
+   * alive here, unselected, until the park ends on its own or the user switches
+   * back and the lane adopts them again.
+   */
+  const backgroundClaudeSessions = new Map<
+    string,
+    { contextKey: TelegramContextKey; descriptor: AgentSessionDescriptor }
+  >();
+
+  const retireClaudeDescriptor = async (
+    contextKey: TelegramContextKey,
+    previous: AgentSessionDescriptor,
+  ): Promise<void> => {
+    if (claudeAdapter && typeof claudeAdapter.isParked === "function" && claudeAdapter.isParked(previous.id)) {
+      backgroundClaudeSessions.set(previous.id, { contextKey, descriptor: previous });
+      bridgeLog("park", `park kept alive in background session=${previous.id} lane=${contextKey}`);
+      return;
+    }
+    await disposeClaudeDescriptor(previous);
+  };
+
+  /**
    * Claude is working on this lane: a turn is running, or a parked query is
    * mid-turn. Both must hold the user's next plain message and offer the steer,
    * exactly as Codex does. Dispatching a turn into an active park instead steers
@@ -907,13 +932,14 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   // is running. Everything but finished text stays in the transcript.
   const findClaudeLaneBySessionId = (
     sessionId: string,
-  ): { contextKey: TelegramContextKey; descriptor: AgentSessionDescriptor } | undefined => {
+  ): { contextKey: TelegramContextKey; descriptor: AgentSessionDescriptor; background: boolean } | undefined => {
     for (const [contextKey, descriptor] of claudeSessions) {
       if (descriptor.id === sessionId) {
-        return { contextKey, descriptor };
+        return { contextKey, descriptor, background: false };
       }
     }
-    return undefined;
+    const background = backgroundClaudeSessions.get(sessionId);
+    return background ? { ...background, background: true } : undefined;
   };
 
   const deliverParkedClaudeEvent = (sessionId: string, event: AgentProviderEvent): void => {
@@ -929,6 +955,27 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
     const { contextKey, descriptor } = lane;
+    if (lane.background) {
+      // Output from a session the user switched away from. It is not the selected
+      // conversation, so it goes out live with the session named in front, never
+      // buffered behind whatever the selected session is doing.
+      const parsedBackground = parseContextKey(contextKey);
+      const labeled = `${formatBackgroundClaudeLabel(descriptor)}\n\n${text}`;
+      void (async () => {
+        for (const chunk of splitMarkdownForTelegram(labeled)) {
+          await sendTextMessage(bot.api, parsedBackground.chatId, chunk.text, {
+            parseMode: chunk.parseMode,
+            fallbackText: chunk.fallbackText,
+            messageThreadId: parsedBackground.messageThreadId,
+          });
+        }
+        bridgeLog("park", `delivered background claude output session=${sessionId} chars=${text.length}`);
+      })().catch((error) => {
+        console.warn("Failed to deliver background Claude output", error);
+        bridgeLog("park", `failed to deliver background claude output session=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      return;
+    }
     if (isProviderBusy(contextKey, "claude")) {
       // Buffer under the AGENT SESSION id, not the provider descriptor id: those
       // are different namespaces and /replay drains by the former, so keying this
@@ -1009,11 +1056,31 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         "park",
         `parked claude turn ${active ? "started" : "finished"} session=${sessionId} lane=${lane?.contextKey ?? "unknown"}`,
       );
-      if (!lane || active) {
+      if (!lane || active || lane.background) {
         return;
       }
       // Anything the user parked in the queue while the CLI was working runs now.
       dispatchNextQueuedClaudePrompt(lane.contextKey);
+    });
+  }
+
+  if (typeof claudeAdapter?.setParkStateHandler === "function") {
+    claudeAdapter.setParkStateHandler((sessionId, parked) => {
+      if (parked) {
+        return;
+      }
+      const background = backgroundClaudeSessions.get(sessionId);
+      if (!background) {
+        return;
+      }
+      // The park the user left behind has run out on its own. Nothing is
+      // selected on it, so the runtime can go now.
+      backgroundClaudeSessions.delete(sessionId);
+      claudeParkActiveSessions.delete(sessionId);
+      bridgeLog("park", `background park ended, disposing session=${sessionId} lane=${background.contextKey}`);
+      void disposeClaudeDescriptor(background.descriptor).catch((error) => {
+        bridgeLog("park", `failed to dispose background session=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
     });
   }
 
@@ -1274,7 +1341,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       },
     });
     if (previous && previous.id !== descriptor.id) {
-      await disposeClaudeDescriptor(previous);
+      await retireClaudeDescriptor(contextKey, previous);
+    }
+    if (backgroundClaudeSessions.delete(descriptor.id)) {
+      bridgeLog("park", `background park adopted back by lane session=${descriptor.id} lane=${contextKey}`);
     }
     claudeSessions.set(contextKey, descriptor);
     persistClaudeSession(contextKey, descriptor);
@@ -1390,7 +1460,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       metadata: { ...session.metadata, backend: getClaudeBackend(contextKey) },
     });
     if (previous && previous.id !== descriptor.id) {
-      await disposeClaudeDescriptor(previous);
+      await retireClaudeDescriptor(contextKey, previous);
+    }
+    if (backgroundClaudeSessions.delete(descriptor.id)) {
+      bridgeLog("park", `background park adopted back by lane session=${descriptor.id} lane=${contextKey}`);
     }
     claudeSessions.set(contextKey, descriptor);
     persistClaudeSession(contextKey, descriptor);
@@ -10117,12 +10190,81 @@ type ClaudeTranscriptSessionSummary = {
   updatedAt: number;
 };
 
+function formatBackgroundClaudeLabel(descriptor: AgentSessionDescriptor): string {
+  const raw = (descriptor.displayName ?? "").trim()
+    || `Claude ${descriptor.providerSessionId?.slice(0, 8) ?? descriptor.id}`;
+  const title = raw.length > 60 ? `${raw.slice(0, 57).trimEnd()}...` : raw;
+  return `From "${title}":`;
+}
+
+// Summaries keyed by transcript path, reused until the file's size or mtime
+// moves. /sessions used to re-read and re-parse every transcript on each call.
+const claudeTranscriptSummaryCache = new Map<
+  string,
+  { mtimeMs: number; size: number; summary: ClaudeTranscriptSessionSummary }
+>();
+
+type ClaudeTranscriptScan = {
+  workspace: string;
+  topicWorkspace: string;
+  explicitTitle: string;
+  fallbackTitle: string;
+};
+
+function scanClaudeTranscriptLines(
+  text: string,
+  scan: ClaudeTranscriptScan,
+  options: { earlyBreak: boolean; allowFallbackTitle: boolean },
+): void {
+  let inspectedLines = 0;
+  for (const line of text.split(/\r?\n/)) {
+    inspectedLines += 1;
+    if (!line.trim()) {
+      continue;
+    }
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+
+    if (typeof entry.cwd === "string" && entry.cwd.trim()) {
+      scan.workspace ||= entry.cwd;
+      scan.topicWorkspace = entry.cwd;
+    }
+
+    if (entry.type === "ai-title" && typeof entry.aiTitle === "string" && entry.aiTitle.trim()) {
+      scan.explicitTitle = cleanProviderSessionTitle(entry.aiTitle);
+    }
+
+    if (entry.type === "custom-title" && typeof entry.customTitle === "string") {
+      const candidate = cleanProviderSessionTitle(entry.customTitle);
+      if (!isGenericClaudeTranscriptTitle(candidate)) {
+        scan.explicitTitle = candidate;
+      }
+    }
+
+    if (options.allowFallbackTitle && !scan.fallbackTitle && entry.type === "user") {
+      const rawCandidate = extractClaudeUserText(entry);
+      const candidate = deriveSessionTitle(cleanProviderSessionTitle(rawCandidate));
+      if (isUsefulClaudeSessionTitle(candidate, rawCandidate)) {
+        scan.fallbackTitle = candidate;
+      }
+    }
+
+    if (options.earlyBreak && scan.workspace && (scan.explicitTitle || scan.fallbackTitle) && inspectedLines >= 200) {
+      break;
+    }
+  }
+}
+
 function listClaudeTranscriptSessions(limit: number, projectsDir: string): ClaudeTranscriptSessionSummary[] {
   if (!existsSync(projectsDir)) {
     return [];
   }
 
-  const files: Array<{ path: string; sessionId: string; updatedAt: number }> = [];
+  const files: Array<{ path: string; sessionId: string; updatedAt: number; size: number }> = [];
   const visit = (dir: string): void => {
     let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
     try {
@@ -10150,6 +10292,7 @@ function listClaudeTranscriptSessions(limit: number, projectsDir: string): Claud
           path: fullPath,
           sessionId: path.basename(entry.name, ".jsonl"),
           updatedAt: stat.mtimeMs,
+          size: stat.size,
         });
       } catch {
         // Ignore unreadable transcript candidates.
@@ -10165,73 +10308,44 @@ function listClaudeTranscriptSessions(limit: number, projectsDir: string): Claud
     .filter((summary): summary is ClaudeTranscriptSessionSummary => Boolean(summary));
 }
 
-function readClaudeTranscriptSummary(file: { path: string; sessionId: string; updatedAt: number }): ClaudeTranscriptSessionSummary | undefined {
-  let text: string;
+function readClaudeTranscriptSummary(
+  file: { path: string; sessionId: string; updatedAt: number; size?: number },
+): ClaudeTranscriptSessionSummary | undefined {
+  const cached = claudeTranscriptSummaryCache.get(file.path);
+  if (cached && cached.mtimeMs === file.updatedAt && (file.size === undefined || cached.size === file.size)) {
+    return cached.summary;
+  }
+
+  let window: TranscriptWindow;
   try {
-    text = readFileSync(file.path, "utf8");
+    window = readTranscriptWindow(file.path);
   } catch {
     return undefined;
   }
 
-  let workspace = "";
-  let topicWorkspace = "";
-  let explicitTitle = "";
-  let fallbackTitle = "";
-  let inspectedLines = 0;
-  for (const line of text.split(/\r?\n/)) {
-    inspectedLines += 1;
-    if (!line.trim()) {
-      continue;
-    }
-    let entry: Record<string, unknown>;
-    try {
-      entry = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-
-    if (typeof entry.cwd === "string" && entry.cwd.trim()) {
-      workspace ||= entry.cwd;
-      topicWorkspace = entry.cwd;
-    }
-
-    if (entry.type === "ai-title" && typeof entry.aiTitle === "string" && entry.aiTitle.trim()) {
-      explicitTitle = cleanProviderSessionTitle(entry.aiTitle);
-    }
-
-    if (entry.type === "custom-title" && typeof entry.customTitle === "string") {
-      const candidate = cleanProviderSessionTitle(entry.customTitle);
-      if (!isGenericClaudeTranscriptTitle(candidate)) {
-        explicitTitle = candidate;
-      }
-    }
-
-    if (!fallbackTitle && entry.type === "user") {
-      const rawCandidate = extractClaudeUserText(entry);
-      const candidate = deriveSessionTitle(cleanProviderSessionTitle(rawCandidate));
-      if (isUsefulClaudeSessionTitle(candidate, rawCandidate)) {
-        fallbackTitle = candidate;
-      }
-    }
-
-    if (workspace && (explicitTitle || fallbackTitle) && inspectedLines >= 200) {
-      break;
-    }
+  const scan: ClaudeTranscriptScan = { workspace: "", topicWorkspace: "", explicitTitle: "", fallbackTitle: "" };
+  scanClaudeTranscriptLines(window.head, scan, { earlyBreak: true, allowFallbackTitle: true });
+  if (window.tail !== undefined) {
+    // The latest title and cwd live at the end of a long transcript; the first
+    // user prompt does not, so the tail never supplies the fallback title.
+    scanClaudeTranscriptLines(window.tail, scan, { earlyBreak: false, allowFallbackTitle: false });
   }
 
   // A Claude turn may cd into a project subfolder. That is useful as a topic
   // hint, but it does not replace the provider session's original workspace.
   const resolvedFallbackTitle = resolveClaudeTranscriptFallbackTitle(
-    fallbackTitle,
-    topicWorkspace || workspace,
+    scan.fallbackTitle,
+    scan.topicWorkspace || scan.workspace,
   );
 
-  return {
+  const summary: ClaudeTranscriptSessionSummary = {
     sessionId: file.sessionId,
-    workspace: workspace || path.dirname(file.path),
-    title: explicitTitle || resolvedFallbackTitle || `Claude session ${file.sessionId.slice(0, 8)}`,
+    workspace: scan.workspace || path.dirname(file.path),
+    title: scan.explicitTitle || resolvedFallbackTitle || `Claude session ${file.sessionId.slice(0, 8)}`,
     updatedAt: file.updatedAt,
   };
+  claudeTranscriptSummaryCache.set(file.path, { mtimeMs: file.updatedAt, size: window.size, summary });
+  return summary;
 }
 
 function extractClaudeUserText(entry: Record<string, unknown>): string {

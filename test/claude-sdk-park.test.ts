@@ -809,6 +809,75 @@ describe("parked drain background tasks", () => {
     );
   });
 
+  async function adoptParkedTurn(
+    controlled: ReturnType<typeof controlledQuery>,
+    launchTaskId: string | undefined,
+  ): Promise<AgentProviderEvent[]> {
+    const inputController = new ClaudeSdkInputController();
+    let handle: ParkedQuery | undefined;
+    controlled.push(initMessage);
+    if (launchTaskId) {
+      controlled.push(backgroundLaunch(launchTaskId));
+    }
+    controlled.push(textMessage("FIRST"));
+    controlled.push(successResult("FIRST"));
+    await collect(
+      runClaudeSdkTurn({
+        ...taskParkOptions,
+        queryFn: controlled.queryFn,
+        inputController,
+        onParkedEvent: () => {},
+        onParkStateChanged: (parked, query) => {
+          if (parked) {
+            handle = query;
+          }
+        },
+      }),
+    );
+    if (!handle || !(await handle.takeOver())) {
+      throw new Error("first turn did not leave an adoptable park");
+    }
+    const events: AgentProviderEvent[] = [];
+    const turn = (async () => {
+      for await (const event of runClaudeSdkTurn({
+        ...taskParkOptions,
+        promptText: "the follow-up question",
+        queryFn: controlled.queryFn,
+        inputController,
+        adoptedQuery: handle,
+        onParkedEvent: () => {},
+        onParkStateChanged: () => {},
+      })) {
+        events.push(event);
+      }
+    })();
+    await waitUntil(() => controlled.deliveredPrompts.length === 2);
+    controlled.push(successResult(""));
+    controlled.push(textMessage("SECOND"));
+    controlled.push(successResult("SECOND"));
+    await turn;
+    return events;
+  }
+
+  it("tells the user when their prompt was steered into a park still waiting on a task", async () => {
+    const controlled = controlledQuery();
+    const events = await adoptParkedTurn(controlled, "task7pend1");
+
+    const notice = events.find((event) => event.type === "status_message");
+    expect(notice).toBeDefined();
+    expect(notice?.type === "status_message" && notice.priority).toBe(true);
+    expect(notice?.type === "status_message" && notice.text).toContain("still waiting on a background task");
+    expect(events.some((event) => event.type === "assistant_message_complete" && event.text === "SECOND")).toBe(true);
+  });
+
+  it("stays quiet when the adopted park owes nothing", async () => {
+    const controlled = controlledQuery();
+    const events = await adoptParkedTurn(controlled, undefined);
+
+    expect(events.some((event) => event.type === "status_message")).toBe(false);
+    expect(events.some((event) => event.type === "assistant_message_complete" && event.text === "SECOND")).toBe(true);
+  });
+
   it("closes on the idle timer again once the task has reported back", async () => {
     const controlled = controlledQuery();
     controlled.push(initMessage);

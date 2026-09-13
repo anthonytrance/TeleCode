@@ -915,6 +915,22 @@ export async function* runClaudeSdkTurn(options: ClaudeSdkTurnOptions): AsyncIte
         }
         adoptedQuery = undefined;
       }
+      if (adopting && query && query.pendingTaskCount > 0) {
+        // The park only stayed alive because a background task has not reported
+        // back yet. The prompt was steered into it silently; say so, or the user
+        // cannot tell a steer into live work from a fresh turn.
+        bridgeLog(
+          "park",
+          `adopted park still awaits ${query.pendingTaskCount} background task(s) session=${activeProviderSessionId ?? sessionId}`,
+        );
+        yield {
+          type: "status_message",
+          sessionId,
+          jobId,
+          text: "Your message went into the live session, which is still waiting on a background task.",
+          priority: true,
+        };
+      }
       if (!query) {
         inputController?.reopen();
         const sdkPrompt = inputController

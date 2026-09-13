@@ -139,6 +139,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
    */
   private outOfBandHandler?: (sessionId: string, event: AgentProviderEvent) => void;
   private parkActivityHandler?: (sessionId: string, active: boolean) => void;
+  private parkStateHandler?: (sessionId: string, parked: boolean) => void;
 
   constructor(private readonly config: TeleCodeConfig) {
     this.processRegistry = new ClaudeProcessRegistry(claudeProcessRegistryPath(config.workspace));
@@ -161,6 +162,21 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   /** True while this session has a parked query whose CLI is mid-turn. */
   isParkActive(sessionId: string): boolean {
     return this.sessions.get(sessionId)?.parkedQuery?.isActive === true;
+  }
+
+  /**
+   * Told when a session's parked query begins or ends. The bridge keeps a park
+   * alive in the background across session switches and needs to hear when it
+   * finally ends so the runtime can be dropped.
+   */
+  setParkStateHandler(handler: (sessionId: string, parked: boolean) => void): void {
+    this.parkStateHandler = handler;
+  }
+
+  /** True while this session holds a live (not yet closed) parked query. */
+  isParked(sessionId: string): boolean {
+    const parked = this.sessions.get(sessionId)?.parkedQuery;
+    return parked !== undefined && !parked.isClosed;
   }
 
   async createSession(
@@ -203,6 +219,24 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     onStartupStatus?: StartupStatusCallback,
   ): Promise<AgentSessionDescriptor> {
     this.validateEnabled();
+    const existing = this.sessions.get(session.id);
+    const requestedBackend = asClaudeBackend(session.metadata?.backend) || this.config.claudeBackend;
+    if (
+      existing &&
+      existing.backend === "sdk" &&
+      requestedBackend === "sdk" &&
+      existing.providerSessionId === session.providerSessionId &&
+      existing.parkedQuery &&
+      !existing.parkedQuery.isClosed
+    ) {
+      // A park kept alive across a session switch. Keep the live runtime rather
+      // than replacing it with a cold one and orphaning the CLI still working.
+      existing.hasLiveProviderSession = true;
+      existing.descriptor.displayName = session.displayName ?? existing.descriptor.displayName;
+      existing.descriptor.updatedAt = Math.max(existing.descriptor.updatedAt, session.updatedAt);
+      bridgeLog("park", `resume kept the live parked runtime session=${existing.providerSessionId}`);
+      return { ...existing.descriptor };
+    }
     const runtime = this.runtimeFromDescriptor(session);
     runtime.hasLiveProviderSession = true;
     this.sessions.set(session.id, runtime);
@@ -601,7 +635,11 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
             parkOwnsController = true;
           } else if (runtime.parkedQuery === query) {
             runtime.parkedQuery = undefined;
+          } else {
+            // A stale park ending after a newer one replaced it: not a state change.
+            return;
           }
+          this.parkStateHandler?.(runtime.descriptor.id, isParked);
         },
         onProviderSessionId: (providerSessionId) => {
           runtime.forkSourceSessionId = undefined;

@@ -47,6 +47,8 @@ const mockClaude = vi.hoisted(() => {
   let artifactFileName: string | undefined;
   let outOfBandHandler: ((sessionId: string, event: Record<string, unknown>) => void) | undefined;
   let parkActivityHandler: ((sessionId: string, active: boolean) => void) | undefined;
+  let parkStateHandler: ((sessionId: string, parked: boolean) => void) | undefined;
+  const parkedSessions = new Set<string>();
 
   return {
     prompts,
@@ -69,6 +71,20 @@ const mockClaude = vi.hoisted(() => {
     emitParkActivity: (sessionId: string, active: boolean): void => {
       parkActivityHandler?.(sessionId, active);
     },
+    setParkStateHandler: (handler: ((sessionId: string, parked: boolean) => void) | undefined) => {
+      parkStateHandler = handler;
+    },
+    emitParkState: (sessionId: string, parked: boolean): void => {
+      parkStateHandler?.(sessionId, parked);
+    },
+    setParked: (sessionId: string, parked: boolean): void => {
+      if (parked) {
+        parkedSessions.add(sessionId);
+      } else {
+        parkedSessions.delete(sessionId);
+      }
+    },
+    isParked: (sessionId: string): boolean => parkedSessions.has(sessionId),
     createSession,
     resumeSession,
     getSessionInfo,
@@ -133,6 +149,7 @@ const mockClaude = vi.hoisted(() => {
       rawPrompts.length = 0;
       promptSessionIds.length = 0;
       steers.length = 0;
+      parkedSessions.clear();
       createCount = 0;
       activeModel = "sonnet";
       activeBackend = "pty";
@@ -217,6 +234,14 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
 
     setParkActivityHandler(handler: (sessionId: string, active: boolean) => void) {
       mockClaude.setParkActivityHandler(handler);
+    }
+
+    setParkStateHandler(handler: (sessionId: string, parked: boolean) => void) {
+      mockClaude.setParkStateHandler(handler);
+    }
+
+    isParked(sessionId: string) {
+      return mockClaude.isParked(sessionId);
     }
 
     async resumeSession(session: unknown) {
@@ -1580,6 +1605,52 @@ describe("Claude bot flow", () => {
     await waitFor(() => mockClaude.steers.includes("stop and check the log"));
     expect(sent.some((entry) => entry.text?.includes("Steer sent to the active Claude turn"))).toBe(true);
     expect(mockClaude.prompts).not.toContain("stop and check the log");
+  });
+
+  it("keeps a parked Claude session alive across /switch and labels its later output", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude first conversation"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to first conversation"));
+    await waitForAgentSessionsIdle(tempDir);
+    await bot.handleUpdate(textUpdate(2, "/fork second conversation"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Forked this conversation")));
+    await bot.handleUpdate(textUpdate(3, "reply on the fork"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to reply on the fork"));
+    await waitForAgentSessionsIdle(tempDir);
+    const forkSessionId = mockClaude.promptSessionIds.at(-1);
+    expect(forkSessionId).toBeDefined();
+
+    // The fork's CLI is still alive in a park when the user switches back.
+    mockClaude.setParked(forkSessionId ?? "", true);
+    await bot.handleUpdate(textUpdate(4, "/sessions"));
+    const sessionList = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Recent provider sessions")).at(-1);
+    const originalLine = sessionList?.split("\n").find((line) =>
+      /^\d+\. Claude/u.test(line) && !line.includes(", selected") && !line.includes(", old"),
+    );
+    const originalNumber = originalLine?.match(/^(\d+)\./u)?.[1];
+    expect(originalNumber).toBeDefined();
+    await bot.handleUpdate(textUpdate(5, `/switch ${originalNumber}`));
+    await waitFor(() => sent.some((entry) => entry.text?.includes(`Selected #${originalNumber}`)));
+
+    // Switching away no longer kills the park.
+    expect(mockClaude.dispose).not.toHaveBeenCalledWith(forkSessionId);
+
+    // Its later output reaches the chat live, labeled with the session it came from.
+    mockClaude.emitOutOfBand(forkSessionId ?? "", {
+      type: "assistant_message_complete",
+      sessionId: forkSessionId,
+      jobId: "parked-job",
+      text: "FORK FINISHED LATER",
+    });
+    await waitFor(() => sent.some((entry) => entry.text?.includes("FORK FINISHED LATER")));
+    const labeled = sent.find((entry) => entry.text?.includes("FORK FINISHED LATER"))?.text ?? "";
+    expect(labeled).toContain("From ");
+    expect(labeled).toContain("second conversation");
+
+    // Once the background park ends on its own, the runtime is dropped.
+    mockClaude.emitParkState(forkSessionId ?? "", false);
+    await waitFor(() => mockClaude.dispose.mock.calls.some((call) => call[0] === forkSessionId));
   });
 
   it("drops parked output for a session the lane does not know", async () => {
