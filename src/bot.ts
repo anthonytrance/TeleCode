@@ -909,6 +909,30 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
   const maxParallelClaudeTurns = Math.max(1, config.claudeMaxParallelTurns ?? 3);
 
+  /** The Codex turn each lane is running in its registry runtime, once its thread is known. */
+  const runningCodexTurnByLane = new Map<
+    TelegramContextKey,
+    { runtime: CodexSessionRuntime; agentSessionId: string; startedAt: number }
+  >();
+
+  /**
+   * Codex turns still running in sessions the user switched away from. Each keeps
+   * its own runtime, detached from the registry, and the lane gets a fresh one.
+   * The turn disposes its runtime when it ends, unless the lane adopted it back.
+   */
+  const backgroundCodexTurns = new Map<
+    CodexSessionRuntime,
+    { contextKey: TelegramContextKey; agentSessionId: string; threadId: string | null; startedAt: number }
+  >();
+
+  const maxParallelCodexTurns = Math.max(1, config.codexMaxParallelTurns ?? 3);
+
+  /**
+   * Called when a turn moves to the background. Its Abort button targets the lane,
+   * which now runs another session, so the turn removes the button and its typing.
+   */
+  const codexTurnBackgroundHooks = new Map<CodexSessionRuntime, () => void>();
+
   const retireClaudeDescriptor = async (
     contextKey: TelegramContextKey,
     previous: AgentSessionDescriptor,
@@ -1981,7 +2005,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       finalizeOnAgentEnd?: boolean;
       addOutputInstructions?: boolean;
     } = {},
-  ): Promise<void> => {
+  ): Promise<boolean | void> => {
     const parsed = parseContextKey(contextKey);
     const messageThreadId = parsed.messageThreadId;
     const getProgressDelivery = (): ProgressDelivery => registry.getProgressDelivery(contextKey);
@@ -2036,7 +2060,25 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     let backgroundCompletionText: string | undefined;
     const finalDelivery = { disposition: "none" as "none" | "foreground" | "buffered" };
 
-    const isCodexForeground = (): boolean => isProviderForeground(contextKey, "codex");
+    const turnStartedAt = Date.now();
+    let finishedInBackground = false;
+    // The user switched to another session while this turn ran; its runtime left
+    // the registry and the turn now reports back under its session's name.
+    const turnBackgrounded = (): boolean => backgroundCodexTurns.has(session);
+    const isCodexForeground = (): boolean => isProviderForeground(contextKey, "codex") && !turnBackgrounded();
+    const backgroundTurnLabel = (): string => {
+      const turn = backgroundCodexTurns.get(session);
+      return turn ? describeBackgroundCodexTurn(contextKey, turn) : "Background Codex session";
+    };
+    const sendBackgroundTurnText = async (outputText: string): Promise<void> => {
+      for (const chunk of splitMarkdownForTelegram(outputText)) {
+        await sendTextMessage(bot.api, chatId, chunk.text, {
+          parseMode: chunk.parseMode,
+          fallbackText: chunk.fallbackText,
+          messageThreadId,
+        });
+      }
+    };
     const bufferCodexOutput = (
       kind: BufferedOutputEvent["kind"],
       outputText: string,
@@ -2044,6 +2086,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       artifactPath?: string,
     ): void => {
       if (!codexAgentSession || (!outputText.trim() && !artifactPath)) {
+        return;
+      }
+      if (priority && turnBackgrounded() && (kind === "status" || kind === "tool")) {
+        // Errors and priority notices of a background turn go out at once, named.
+        void sendBackgroundTurnText(`${backgroundTurnLabel()}:\n\n${outputText.trim()}`).catch((error) => {
+          console.error("Failed to send a background Codex notice", error);
+        });
         return;
       }
 
@@ -2423,6 +2472,12 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
     };
 
+    const onMovedToBackground = (): void => {
+      stopTyping();
+      void removeAbortKeyboard();
+    };
+    codexTurnBackgroundHooks.set(session, onMovedToBackground);
+
     const deliverRenderedChunks = async (
       chunks: RenderedChunk[],
       kind: BufferedOutputEvent["kind"] = "assistant",
@@ -2602,6 +2657,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
 
       if (!sentResponseText) {
+        if (turnBackgrounded()) {
+          // The finish notice says so, with the session named.
+          return;
+        }
         if (!isCodexForeground()) {
           bufferCodexOutput("status", "Codex finished without text.", true);
           return;
@@ -2891,13 +2950,18 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       codexAgentSession = agentSession;
       agentJobId = `codex-job-${randomUUID().slice(0, 12)}`;
       startAgentJob(agentSession.id, agentJobId);
+      if (registry.get(contextKey) === session) {
+        runningCodexTurnByLane.set(contextKey, { runtime: session, agentSessionId: agentSession.id, startedAt: turnStartedAt });
+      }
 
       if (options.execute) {
         await options.execute(callbacks);
       } else {
         await session.prompt(promptInput, callbacks);
       }
-      updateSessionMetadata(contextKey, session);
+      if (!turnBackgrounded()) {
+        updateSessionMetadata(contextKey, session);
+      }
       await requestFinalization();
       backgroundCompletionText = codexAgentSession
         ? lastAssistantReplyBySessionId.get(codexAgentSession.id) ?? "Codex finished."
@@ -2933,7 +2997,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       clearFlushTimer();
       if (autoArtifactOutDir) {
         try {
-          if (isCodexForeground()) {
+          if (turnBackgrounded()) {
+            const { artifacts } = await collectArtifactReport(autoArtifactOutDir);
+            if (artifacts.length > 0) {
+              await sendBackgroundTurnText(`${backgroundTurnLabel()} sent files:`);
+            }
+            await deliverArtifacts(ctx, chatId, autoArtifactOutDir, messageThreadId);
+          } else if (isCodexForeground()) {
             await deliverArtifacts(ctx, chatId, autoArtifactOutDir, messageThreadId);
           } else {
             const { artifacts, skippedCount } = await collectArtifactReport(autoArtifactOutDir);
@@ -2952,7 +3022,23 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           console.error("Failed to deliver artifacts:", artifactError);
         }
       }
-      if (codexAgentSession && backgroundCompletionText && finalDelivery.disposition === "buffered") {
+      if (turnBackgrounded()) {
+        const elapsed = formatDuration(Date.now() - turnStartedAt);
+        const header = completedSuccessfully
+          ? `${backgroundTurnLabel()}, finished after ${elapsed}.`
+          : `${backgroundTurnLabel()}, stopped after ${elapsed}.`;
+        const body = backgroundCompletionText && finalDelivery.disposition === "buffered"
+          ? backgroundCompletionText
+          : "No further text. /replay with its session selected shows what it did.";
+        try {
+          await sendBackgroundTurnText(`${header}\n\n${body}`);
+          if (codexAgentSession && backgroundCompletionText) {
+            clearDeliveredCompletionFromBuffer(codexAgentSession.id, backgroundCompletionText);
+          }
+        } catch (noticeError) {
+          console.error("Failed to send the background Codex answer:", noticeError);
+        }
+      } else if (codexAgentSession && backgroundCompletionText && finalDelivery.disposition === "buffered") {
         try {
           const delivered = isCodexForeground()
             ? await (async (): Promise<boolean> => {
@@ -2979,13 +3065,30 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       } else if (codexAgentSession && backgroundCompletionText && finalDelivery.disposition === "foreground") {
         clearDeliveredCompletionFromBuffer(codexAgentSession.id, backgroundCompletionText);
       }
-      activeProgressRefreshers.delete(contextKey);
+      if (codexTurnBackgroundHooks.get(session) === onMovedToBackground) {
+        codexTurnBackgroundHooks.delete(session);
+      }
+      if (activeProgressRefreshers.get(contextKey) === refreshAssistantProgress) {
+        activeProgressRefreshers.delete(contextKey);
+      }
       if (agentJobId) {
         finishAgentJob(agentJobId, completedSuccessfully ? "completed" : "failed");
       }
-      markProviderBusy(contextKey, "codex", false);
-      busyState.processing = false;
+      if (turnBackgrounded()) {
+        // The lane moved on; only this turn's own runtime is left to clean up.
+        backgroundCodexTurns.delete(session);
+        registry.disposeDetached(session);
+        finishedInBackground = true;
+        bridgeLog("background", `background codex turn ended lane=${contextKey} ok=${completedSuccessfully}`);
+      } else {
+        if (runningCodexTurnByLane.get(contextKey)?.runtime === session) {
+          runningCodexTurnByLane.delete(contextKey);
+        }
+        markProviderBusy(contextKey, "codex", false);
+        busyState.processing = false;
+      }
     }
+    return finishedInBackground;
   };
 
   const startUserPrompt = (
@@ -3005,12 +3108,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const setSuccessReaction = options.setSuccessReaction ?? true;
 
     void (async () => {
+      let finishedInBackground = false;
       try {
-        await handleUserPrompt(ctx, contextKey, chatId, session, userInput, {
+        finishedInBackground = (await handleUserPrompt(ctx, contextKey, chatId, session, userInput, {
           execute: options.execute,
           finalizeOnAgentEnd: options.finalizeOnAgentEnd,
           addOutputInstructions: options.addOutputInstructions,
-        });
+        })) === true;
         if (setSuccessReaction) {
           await setReaction(ctx, "👍");
         }
@@ -3026,7 +3130,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           }
         }
 
-        const queued = queuedPrompts.get(contextKey);
+        // A turn that finished in the background leaves the lane's queue to the
+        // turn running there now.
+        const queued = finishedInBackground ? undefined : queuedPrompts.get(contextKey);
         if (queued) {
           queuedPrompts.delete(contextKey);
           clearQueuedPromptAction(contextKey);
@@ -4540,11 +4646,37 @@ ${message}`,
     contextKey: TelegramContextKey,
     descriptor: AgentSessionDescriptor,
     agentSessionId: string,
+  ): string => describeBackgroundTurn(
+    contextKey,
+    "claude",
+    agentSessionId,
+    descriptor.providerSessionId,
+    descriptor.displayName || agentSessions.getSession(agentSessionId)?.displayName || "",
+  );
+
+  const describeBackgroundCodexTurn = (
+    contextKey: TelegramContextKey,
+    turn: { agentSessionId: string; threadId: string | null },
+  ): string => describeBackgroundTurn(
+    contextKey,
+    "codex",
+    turn.agentSessionId,
+    turn.threadId ?? undefined,
+    resolveCodexSessionDisplayName(turn.threadId, agentSessions.getSession(turn.agentSessionId)?.displayName ?? ""),
+  );
+
+  const describeBackgroundTurn = (
+    contextKey: TelegramContextKey,
+    provider: "claude" | "codex",
+    agentSessionId: string,
+    providerSessionId: string | undefined,
+    displayName: string,
   ): string => {
+    const providerName = provider === "claude" ? "Claude" : "Codex";
     const matches = (pick: ProviderSessionPick): boolean =>
-      pick.provider === "claude" && (
+      pick.provider === provider && (
         providerSessionPickAgentId(pick) === agentSessionId ||
-        (Boolean(descriptor.providerSessionId) && pick.providerSessionId === descriptor.providerSessionId)
+        (Boolean(providerSessionId) && pick.providerSessionId === providerSessionId)
       );
     let index = pendingAgentSessionPicks.get(contextKey)?.findIndex(matches) ?? -1;
     if (index < 0) {
@@ -4558,13 +4690,12 @@ ${message}`,
         index = -1;
       }
     }
-    const raw = cleanProviderSessionTitle(
-      descriptor.displayName || agentSessions.getSession(agentSessionId)?.displayName || "",
-    ) || `Claude ${descriptor.providerSessionId?.slice(0, 8) ?? descriptor.id}`;
+    const raw = cleanProviderSessionTitle(displayName) ||
+      `${providerName} ${providerSessionId?.slice(0, 8) ?? agentSessionId}`;
     const title = raw.length > 60 ? `${raw.slice(0, 57).trimEnd()}...` : raw;
     return index >= 0
-      ? `Background Claude, session ${index + 1} "${title}"`
-      : `Background Claude session "${title}"`;
+      ? `Background ${providerName}, session ${index + 1} "${title}"`
+      : `Background ${providerName} session "${title}"`;
   };
 
   /**
@@ -4683,6 +4814,93 @@ ${message}`,
     return entry.descriptor;
   };
 
+  /**
+   * Moves the lane's running Codex turn to the background: its runtime leaves the
+   * registry and keeps going, and the lane is free for a new runtime. Returns why
+   * it refused, or undefined once the lane is free.
+   */
+  const moveRunningCodexTurnToBackground = (
+    contextKey: TelegramContextKey,
+    options: { swapping: boolean },
+  ): string | undefined => {
+    const running = runningCodexTurnByLane.get(contextKey);
+    const runtime = registry.get(contextKey);
+    if (!running || !runtime || running.runtime !== runtime) {
+      return "Codex is still starting this turn. Try the switch again in a few seconds.";
+    }
+    if (runtime.getProcessingKind?.() === "goal") {
+      return "A Codex goal is running here. Goals can't move to the background yet; stop it with /stop first, or wait for it.";
+    }
+    if (queuedPrompts.has(contextKey)) {
+      return "A message is queued for the running Codex session. Let it run first, or drop it with /qdrop, then switch.";
+    }
+    const runningTurns = runningCodexTurnByLane.size + backgroundCodexTurns.size;
+    if (!options.swapping && runningTurns >= maxParallelCodexTurns) {
+      return `Codex is already running ${runningTurns} turns at once, and the limit is ${maxParallelCodexTurns}. Wait for one to finish, or stop one with /stop and its /sessions number, then switch.`;
+    }
+    registry.detach(contextKey);
+    codexTurnBackgroundHooks.get(runtime)?.();
+    backgroundCodexTurns.set(runtime, {
+      contextKey,
+      agentSessionId: running.agentSessionId,
+      threadId: runtime.getInfo().threadId,
+      startedAt: running.startedAt,
+    });
+    runningCodexTurnByLane.delete(contextKey);
+    markProviderBusy(contextKey, "codex", false);
+    getBusyState(contextKey).processing = false;
+    bridgeLog("background", `codex turn moved to background thread=${runtime.getInfo().threadId} lane=${contextKey} running=${runningTurns}`);
+    return undefined;
+  };
+
+  const findBackgroundCodexTurn = (
+    contextKey: TelegramContextKey,
+    pick: ProviderSessionPick,
+  ): CodexSessionRuntime | undefined => {
+    if (pick.provider !== "codex") {
+      return undefined;
+    }
+    for (const [runtime, entry] of backgroundCodexTurns) {
+      if (entry.contextKey !== contextKey) {
+        continue;
+      }
+      if (
+        providerSessionPickAgentId(pick) === entry.agentSessionId ||
+        (Boolean(pick.providerSessionId) && pick.providerSessionId === entry.threadId)
+      ) {
+        return runtime;
+      }
+    }
+    return undefined;
+  };
+
+  /**
+   * Makes a background Codex turn the lane's runtime again; the lane is busy with it
+   * from here on. The lane's idle runtime is disposed. Returns false when the turn
+   * finished in the meantime.
+   */
+  const adoptBackgroundCodexTurn = (contextKey: TelegramContextKey, runtime: CodexSessionRuntime): boolean => {
+    const entry = backgroundCodexTurns.get(runtime);
+    if (!entry) {
+      return false;
+    }
+    backgroundCodexTurns.delete(runtime);
+    const previous = registry.detach(contextKey);
+    if (previous && previous !== runtime) {
+      registry.disposeDetached(previous);
+    }
+    registry.attach(contextKey, runtime);
+    runningCodexTurnByLane.set(contextKey, {
+      runtime,
+      agentSessionId: entry.agentSessionId,
+      startedAt: entry.startedAt,
+    });
+    markProviderBusy(contextKey, "codex", true);
+    getBusyState(contextKey).processing = true;
+    bridgeLog("background", `background codex turn adopted back thread=${entry.threadId} lane=${contextKey}`);
+    return true;
+  };
+
   const selectUnifiedAgentSession = async (
     ctx: Context,
     contextKey: TelegramContextKey,
@@ -4740,27 +4958,53 @@ ${message}`,
     }
 
     if (targetPick.provider === "codex") {
-      if (isProviderBusy(contextKey, "codex")) {
-        const message = "Codex is running. Switching between Codex sessions while Codex is busy is not supported yet.";
-        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
-        return true;
+      const runningTarget = findBackgroundCodexTurn(contextKey, targetPick);
+      const currentThreadId = registry.get(contextKey)?.getInfo().threadId ?? null;
+      const switchingCodexSession = runningTarget !== undefined ||
+        currentThreadId !== (targetPick.providerSessionId ?? null);
+      let backgroundNote: string | undefined;
+      let movedToBackground = false;
+      if (isProviderBusy(contextKey, "codex") && switchingCodexSession) {
+        const leaving = registry.get(contextKey);
+        const refusal = moveRunningCodexTurnToBackground(contextKey, { swapping: runningTarget !== undefined });
+        if (refusal) {
+          await safeReply(ctx, escapeHTML(refusal), { fallbackText: refusal });
+          return true;
+        }
+        const leavingTurn = leaving ? backgroundCodexTurns.get(leaving) : undefined;
+        if (leavingTurn) {
+          movedToBackground = true;
+          backgroundNote = `${describeBackgroundCodexTurn(contextKey, leavingTurn)} keeps running. Its answer arrives here with its name in front when it finishes.`;
+        }
       }
 
       const target = await materializeProviderSessionPick(contextKey, targetPick);
-      const contextSession = await getContextSession(ctx, { deferThreadStart: true });
-      if (!contextSession) {
-        return true;
-      }
-      const codexSession = contextSession.session;
-      if (target.providerSessionId) {
-        await codexSession.switchSession(target.providerSessionId);
+      const adopted = runningTarget !== undefined && adoptBackgroundCodexTurn(contextKey, runningTarget);
+      if (!adopted) {
+        // After a move to the background the lane needs a fresh runtime, and it
+        // must not resume the thread the background turn is still running.
+        const contextSession = await getContextSession(ctx, {
+          deferThreadStart: true,
+          ...(movedToBackground ? { skipThreadResume: true } : {}),
+        });
+        if (!contextSession) {
+          return true;
+        }
+        const codexSession = contextSession.session;
+        if (target.providerSessionId && codexSession.getInfo().threadId !== target.providerSessionId) {
+          await codexSession.switchSession(target.providerSessionId);
+        }
         updateSessionMetadata(contextKey, codexSession);
       }
       registry.setActiveProvider(contextKey, "codex");
       agentSessions.selectSession(contextKey, target.id);
       persistAgentSessionState();
       await flushBufferedPriority(ctx, contextKey, target, parseContextKey(contextKey).messageThreadId);
-      const message = formatProviderSessionSelectionMessage(target, listNumber);
+      const selection = formatProviderSessionSelectionMessage(target, listNumber);
+      const adoptedNote = adopted
+        ? "This session is still working. Its answer arrives here as usual; use /replay for what it did while you were away."
+        : undefined;
+      const message = [backgroundNote, selection, adoptedNote].filter(Boolean).join("\n\n");
       await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
       return true;
     }
@@ -5500,15 +5744,31 @@ ${message}`,
   bot.command(["abort", "stop"], async (ctx) => {
     const rawContextKey = contextKeyFromCtx(ctx);
     const stopArgument = getCommandArgument(ctx).trim();
-    if (rawContextKey && stopArgument && claudeAdapter) {
-      // /stop <n>: stop a Claude turn left running in the background, by its
-      // /sessions number, without switching to it.
+    if (rawContextKey && stopArgument) {
+      // /stop <n>: stop a turn left running in the background, by its /sessions
+      // number, without switching to it.
       const picks = pendingAgentSessionPicks.get(rawContextKey) ??
         buildRecentProviderSessionPicks(rawContextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
       const pick = resolveProviderSessionPick(stopArgument, picks, agentSessions.getLane(rawContextKey)?.selectedSessionId);
-      const backgroundId = pick ? await findBackgroundClaudeTurnId(rawContextKey, pick) : undefined;
+      const backgroundCodex = pick ? findBackgroundCodexTurn(rawContextKey, pick) : undefined;
+      const backgroundCodexTurn = backgroundCodex ? backgroundCodexTurns.get(backgroundCodex) : undefined;
+      if (backgroundCodex && backgroundCodexTurn) {
+        const label = describeBackgroundCodexTurn(rawContextKey, backgroundCodexTurn);
+        try {
+          bridgeLog("abort", `/stop ${stopArgument} background codex thread=${backgroundCodexTurn.threadId} lane=${rawContextKey}`);
+          await backgroundCodex.abort();
+          const message = `Stop sent to ${label}.`;
+          await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        } catch (error) {
+          await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+            fallbackText: `Failed: ${friendlyErrorText(error)}`,
+          });
+        }
+        return;
+      }
+      const backgroundId = pick && claudeAdapter ? await findBackgroundClaudeTurnId(rawContextKey, pick) : undefined;
       const background = backgroundId ? backgroundClaudeTurns.get(backgroundId) : undefined;
-      if (backgroundId && background) {
+      if (claudeAdapter && backgroundId && background) {
         const label = describeBackgroundClaudeTurn(rawContextKey, background.descriptor, background.agentSessionId);
         try {
           bridgeLog("abort", `/stop ${stopArgument} background session=${backgroundId} lane=${rawContextKey}`);

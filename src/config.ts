@@ -66,6 +66,8 @@ export interface TeleCodeConfig {
    * session leaves it running in the background, so this caps how many pile up.
    */
   claudeMaxParallelTurns?: number;
+  /** The same cap for Codex turns; each background Codex turn keeps its own app server. */
+  codexMaxParallelTurns?: number;
 }
 
 export function loadConfig(): TeleCodeConfig {
@@ -148,6 +150,11 @@ export function loadConfig(): TeleCodeConfig {
     3,
     "CLAUDE_MAX_PARALLEL_TURNS",
   );
+  const codexMaxParallelTurns = parsePositiveIntegerEnv(
+    optionalString(process.env.CODEX_MAX_PARALLEL_TURNS),
+    3,
+    "CODEX_MAX_PARALLEL_TURNS",
+  );
   const rawClaudeParkIdleMs = optionalString(process.env.CLAUDE_PARK_IDLE_MS);
   let claudeParkIdleMs = 180_000;
   if (rawClaudeParkIdleMs !== undefined) {
@@ -198,6 +205,7 @@ export function loadConfig(): TeleCodeConfig {
     claudeParkIdleMs,
     claudeBackend: rawClaudeBackend,
     claudeMaxParallelTurns,
+    codexMaxParallelTurns,
   };
 }
 

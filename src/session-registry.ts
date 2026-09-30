@@ -37,6 +37,8 @@ interface LegacyPersistedContexts {
 
 export class SessionRegistry {
   private readonly sessions = new Map<TelegramContextKey, CodexSessionRuntime>();
+  /** Runtimes taken out by detach() and not yet attached or disposed; shutdown disposes them too. */
+  private readonly detached = new Set<CodexSessionRuntime>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
   private readonly preferencesPath: string;
@@ -81,6 +83,32 @@ export class SessionRegistry {
 
   get(contextKey: TelegramContextKey): CodexSessionRuntime | undefined {
     return this.sessions.get(contextKey);
+  }
+
+  /**
+   * Takes the lane's runtime out of the registry without disposing it, so a turn
+   * it is running can finish in the background. The lane's metadata stays.
+   */
+  detach(contextKey: TelegramContextKey): CodexSessionRuntime | undefined {
+    const session = this.sessions.get(contextKey);
+    this.sessions.delete(contextKey);
+    if (session) {
+      this.detached.add(session);
+    }
+    return session;
+  }
+
+  /** Disposes a detached runtime once its background work is over. */
+  disposeDetached(session: CodexSessionRuntime): void {
+    this.detached.delete(session);
+    session.dispose();
+  }
+
+  /** Makes a detached runtime the lane's runtime again. The caller retires the previous one. */
+  attach(contextKey: TelegramContextKey, session: CodexSessionRuntime): void {
+    this.detached.delete(session);
+    this.sessions.set(contextKey, session);
+    this.updateMetadata(contextKey, session);
   }
 
   has(contextKey: TelegramContextKey): boolean {
@@ -253,10 +281,11 @@ export class SessionRegistry {
   }
 
   disposeAll(): void {
-    for (const session of this.sessions.values()) {
+    for (const session of [...this.sessions.values(), ...this.detached]) {
       session.dispose();
     }
     this.sessions.clear();
+    this.detached.clear();
   }
 
   private persistMetadata(): void {

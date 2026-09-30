@@ -145,6 +145,7 @@ describe("loadConfig", () => {
       claudeParkIdleMs: 180000,
       claudeBackend: "pty",
       claudeMaxParallelTurns: 3,
+      codexMaxParallelTurns: 3,
     });
   });
 
