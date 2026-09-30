@@ -43,7 +43,7 @@ import type { CodexReasoningEffort } from "./reasoning-effort.js";
 type AppServerThread = {
   id: string;
   cwd?: string;
-  turns?: unknown[];
+  turns?: Array<{ id: string }>;
 };
 
 type AppServerTurn = {
@@ -508,16 +508,42 @@ export class AppServerSessionService {
     }));
   }
 
-  async forkThread(): Promise<CodexSessionInfo> {
+  async forkThread(turnCount = 0): Promise<CodexSessionInfo> {
     if (!this.currentThreadId) {
       throw new Error("No active app-server thread to fork");
     }
     this.ensureIdle("fork thread");
 
+    if (!Number.isInteger(turnCount) || turnCount < 0) {
+      throw new Error("Fork turn count must be a whole number of at least 0");
+    }
+
+    let lastTurnId: string | undefined;
+    if (turnCount > 0) {
+      const history = await this.requestCurrentThread<{ thread?: AppServerThread }>(
+        "thread/read",
+        (threadId) => ({
+          threadId,
+          includeTurns: true,
+        }),
+      );
+      const turns = history.thread?.turns ?? [];
+      if (turnCount >= turns.length) {
+        throw new Error(
+          `Cannot omit ${turnCount} turns from a thread with ${turns.length} persisted turn${turns.length === 1 ? "" : "s"}`,
+        );
+      }
+      lastTurnId = turns[turns.length - turnCount - 1]?.id;
+      if (!lastTurnId) {
+        throw new Error("Codex did not return an id for the last retained turn");
+      }
+    }
+
     const response = await this.requestCurrentThread<{ thread: AppServerThread; model?: string; cwd?: string }>(
       "thread/fork",
       (threadId) => ({
         threadId,
+        ...(lastTurnId ? { lastTurnId } : {}),
         cwd: this.currentWorkspace,
         model: this.currentModel ?? null,
         approvalPolicy: this.currentLaunchProfile.approvalPolicy,
@@ -578,20 +604,15 @@ export class AppServerSessionService {
     }));
   }
 
-  async rollbackThread(turnCount: number): Promise<void> {
-    if (!this.currentThreadId) {
-      throw new Error("No active app-server thread to roll back");
-    }
-    this.ensureIdle("roll back thread");
-
+  async rollbackThread(turnCount: number): Promise<CodexSessionInfo> {
     if (!Number.isInteger(turnCount) || turnCount < 1) {
       throw new Error("Rollback turn count must be a whole number of at least 1");
     }
 
-    await this.requestCurrentThread("thread/rollback", (threadId) => ({
-      threadId,
-      numTurns: turnCount,
-    }));
+    // Codex 0.156 removed the deprecated thread/rollback RPC. Forking through
+    // the last retained turn provides the same model context without mutating
+    // the original thread, so users can still recover it from /sessions.
+    return await this.forkThread(turnCount);
   }
 
   prepareNewThread(workspace?: string, model?: string): CodexSessionInfo {

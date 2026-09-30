@@ -26,11 +26,11 @@ export interface CodexSessionRuntime {
   runThreadGoal?(params: CodexThreadGoalSetParams, callbacks: CodexSessionCallbacks): Promise<CodexThreadGoal | null>;
   pauseActiveGoal?(): Promise<CodexThreadGoal | null>;
   steer?(input: CodexPromptInput): Promise<void>;
-  forkThread?(): Promise<CodexSessionInfo>;
+  forkThread?(turnCount?: number): Promise<CodexSessionInfo>;
   getTurnCount?(): Promise<number>;
   compactThread?(): Promise<void>;
   renameThread?(name: string): Promise<void>;
-  rollbackThread?(turnCount: number): Promise<void>;
+  rollbackThread?(turnCount: number): Promise<CodexSessionInfo>;
   abort(): Promise<void>;
   resetBackendClient?(): void;
   prepareNewThread(workspace?: string, model?: string): CodexSessionInfo;

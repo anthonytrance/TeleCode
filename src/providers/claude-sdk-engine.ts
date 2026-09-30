@@ -1444,6 +1444,57 @@ function formatSdkQuietWarning(milliseconds: number): string {
   ].join(" ");
 }
 
+export interface ClaudeModelInfo {
+  value: string;
+  resolvedModel?: string;
+  displayName: string;
+  description: string;
+}
+
+/**
+ * Asks Claude Code which models it offers and which exact model each alias maps to
+ * right now ("opus" -> "claude-opus-5-5"). No prompt is sent, so no tokens are spent.
+ */
+export async function probeClaudeModels(options: {
+  claudeBin: string;
+  cwd: string;
+  timeoutMs?: number;
+}): Promise<ClaudeModelInfo[]> {
+  const queryFn = await loadSdkQuery();
+  let releasePrompt: () => void = () => undefined;
+  const promptHeld = new Promise<void>((resolve) => {
+    releasePrompt = resolve;
+  });
+  async function* idlePrompt(): AsyncIterable<SdkUserMessageLike> {
+    await promptHeld;
+  }
+  const abortController = new AbortController();
+  const query = queryFn({
+    prompt: idlePrompt(),
+    options: {
+      ...buildSdkQueryOptions({
+        cwd: options.cwd,
+        claudeBin: options.claudeBin,
+        permissionMode: "default",
+        abortController,
+      }),
+    },
+  }) as unknown as { supportedModels(): Promise<ClaudeModelInfo[]> };
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      query.supportedModels(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Claude model probe timed out.")), options.timeoutMs ?? 20_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    releasePrompt();
+    abortController.abort();
+  }
+}
+
 async function loadSdkQuery(): Promise<NonNullable<ClaudeSdkTurnOptions["queryFn"]>> {
   const sdk = await import("@anthropic-ai/claude-agent-sdk");
   return sdk.query as unknown as NonNullable<ClaudeSdkTurnOptions["queryFn"]>;

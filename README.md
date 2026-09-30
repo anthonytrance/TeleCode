@@ -67,7 +67,7 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
    | `ENABLE_UNSAFE_LAUNCH_PROFILES` | — | Set to `true` to allow `danger-full-access` launch profiles |
    | `ENABLE_CLAUDE_PROVIDER` | — | Set to `true` to enable the Claude Code provider (`false` by default) |
    | `CLAUDE_BIN` | — | Absolute Claude Code binary path; defaults to `~/.local/bin/claude(.exe)` or PATH |
-   | `CLAUDE_DEFAULT_MODEL` | — | Default Claude model for new sessions (default `claude-sonnet-5`) |
+   | `CLAUDE_DEFAULT_MODEL` | — | Default Claude model for new sessions (default `sonnet`, which follows the latest Sonnet release) |
    | `CLAUDE_BACKEND` | — | Default Claude engine: `pty` *(default)* or `sdk` |
    | `CLAUDE_PERMISSION_MODE` | — | `default`, `acceptEdits` *(default)*, `plan`, `bypassPermissions` |
    | `CLAUDE_WORKSPACE` | — | Workspace for Claude sessions (defaults to the main workspace) |
@@ -116,9 +116,9 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
 | `/new claude [model]` | Start a fresh Claude session, optionally with a model |
 | `/newsummary` | Start a fresh thread from a handoff summary of the current thread |
 | `/fork` | Fork the current session (Claude: fork the conversation; Codex: alias of `/new`) |
-| `/forkthread [n]` | Fork the active Codex app-server thread; with `n`, roll back that many turns on the fork |
+| `/forkthread [n]` | Fork the active Codex app-server thread; with `n`, omit that many recent turns from the fork |
 | `/renamethread <name>` | Rename the active app-server thread |
-| `/rollbackthread <n>` | Roll back app-server thread history by `n` turns; file changes are not reverted |
+| `/rollbackthread <n>` | Switch to a truncated fork without the last `n` turns; the original thread remains available and file changes are not reverted |
 | `/session` | Current thread ID, workspace, model, effort, and token totals (`/status` alias) |
 | `/sessions [all]` | Browse top-level Codex and Claude sessions; `all` shows up to 500 sessions |
 | `/use <n\|previous\|latest>` | Switch sessions after `/sessions` |

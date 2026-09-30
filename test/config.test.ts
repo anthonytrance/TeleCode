@@ -135,7 +135,7 @@ describe("loadConfig", () => {
       claudeBin: defaultClaudeBinForTest(),
       claudeConfigDir: path.join(homedir(), ".telecode", "claude-config"),
       claudeStrictMcpConfig: true,
-      claudeDefaultModel: "claude-sonnet-5",
+      claudeDefaultModel: "sonnet",
       claudeWorkspace: process.cwd(),
       claudePermissionMode: "acceptEdits",
       claudeLargeSessionResume: "summary",
@@ -191,7 +191,7 @@ describe("loadConfig", () => {
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.enableClaudeProvider).toBe(false);
-    expect(config.claudeDefaultModel).toBe("claude-sonnet-5");
+    expect(config.claudeDefaultModel).toBe("sonnet");
     expect(config.claudeWorkspace).toBe(process.cwd());
     expect(config.claudePermissionMode).toBe("acceptEdits");
     expect(config.claudeLargeSessionResume).toBe("summary");

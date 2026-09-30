@@ -459,23 +459,24 @@ describe("AppServerSessionService", () => {
 
   it("supports native app-server thread controls", async () => {
     let client: FakeAppServerClient | null = null;
-    client = new FakeAppServerClient((method) => {
+    client = new FakeAppServerClient((method, params) => {
       if (method === "thread/start") {
         return { thread: { id: "thread-1", cwd: "/workspace/base" }, model: "gpt-test" };
       }
       if (method === "thread/fork") {
-        return { thread: { id: "thread-fork", cwd: "/workspace/base" }, model: "gpt-test" };
+        const lastTurnId = (params as { lastTurnId?: string } | undefined)?.lastTurnId;
+        return {
+          thread: { id: lastTurnId ? "thread-truncated" : "thread-fork", cwd: "/workspace/base" },
+          model: "gpt-test",
+        };
       }
       if (method === "thread/read") {
-        return { thread: { id: "thread-fork", turns: [{ id: "turn-1" }, { id: "turn-2" }] } };
+        return { thread: { id: "thread-fork", turns: [{ id: "turn-1" }, { id: "turn-2" }, { id: "turn-3" }] } };
       }
       if (method === "thread/compact/start") {
         return {};
       }
       if (method === "thread/name/set") {
-        return {};
-      }
-      if (method === "thread/rollback") {
         return {};
       }
       throw new Error(`unexpected request ${method}`);
@@ -488,11 +489,13 @@ describe("AppServerSessionService", () => {
     const turnCount = await service.getTurnCount();
     await service.compactThread();
     await service.renameThread(" App work ");
-    await service.rollbackThread(2);
+    const rolledBack = await service.rollbackThread(2);
 
     expect(forked.threadId).toBe("thread-fork");
-    expect(turnCount).toBe(2);
-    expect(client.requests.find((request) => request.method === "thread/fork")?.params).toMatchObject({
+    expect(rolledBack.threadId).toBe("thread-truncated");
+    expect(turnCount).toBe(3);
+    const forkRequests = client.requests.filter((request) => request.method === "thread/fork");
+    expect(forkRequests[0]?.params).toMatchObject({
       threadId: "thread-1",
       cwd: "/workspace/base",
       model: "gpt-test",
@@ -510,10 +513,15 @@ describe("AppServerSessionService", () => {
       threadId: "thread-fork",
       name: "App work",
     });
-    expect(client.requests.find((request) => request.method === "thread/rollback")?.params).toEqual({
+    expect(forkRequests[1]?.params).toMatchObject({
       threadId: "thread-fork",
-      numTurns: 2,
+      lastTurnId: "turn-1",
+      cwd: "/workspace/base",
+      model: "gpt-test",
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
     });
+    expect(client.requests.some((request) => request.method === "thread/rollback")).toBe(false);
   });
 
   it("supports native app-server goal controls", async () => {

@@ -13,7 +13,9 @@ import {
 } from "../model-vendors.js";
 import {
   ClaudeSdkInputController,
+  type ClaudeModelInfo,
   type ParkedQuery,
+  probeClaudeModels,
   runClaudeSdkCompact,
   runClaudeSdkTurn,
 } from "./claude-sdk-engine.js";
@@ -74,6 +76,12 @@ interface RuntimeSession {
   providerSessionId: string;
   workspace: string;
   model: string;
+  /**
+   * The exact model Claude last reported answering with. Kept apart from `model`
+   * so an alias choice such as "opus" keeps following the newest version instead
+   * of being frozen to whichever version answered the first turn.
+   */
+  observedModel?: string;
   permissionMode: ClaudePermissionMode;
   backend: ClaudeBackend;
   pty?: ClaudePty;
@@ -124,6 +132,8 @@ export class PromptNotDeliveredError extends Error {
   }
 }
 
+const MODEL_CATALOG_TTL_MS = 5 * 60_000;
+
 export class ClaudeProviderAdapter implements AgentProviderAdapter {
   readonly id = "claude";
   readonly displayName = "Claude Code";
@@ -140,6 +150,8 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   private outOfBandHandler?: (sessionId: string, event: AgentProviderEvent) => void;
   private parkActivityHandler?: (sessionId: string, active: boolean) => void;
   private parkStateHandler?: (sessionId: string, parked: boolean) => void;
+  private modelCatalog?: { models: ClaudeModelInfo[]; fetchedAt: number };
+  private modelCatalogProbe?: Promise<ClaudeModelInfo[]>;
 
   constructor(private readonly config: TeleCodeConfig) {
     this.processRegistry = new ClaudeProcessRegistry(claudeProcessRegistryPath(config.workspace));
@@ -406,12 +418,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
               ?? (event.inputTokens ?? 0) + (event.cachedInputTokens ?? 0),
           };
         } else if (event.type === "model_updated") {
-          runtime.model = event.model;
-          runtime.descriptor.metadata = {
-            ...runtime.descriptor.metadata,
-            model: event.model,
-          };
-          runtime.descriptor.updatedAt = Date.now();
+          recordObservedModel(runtime, event.model);
         } else if (event.type === "session_title_changed") {
           runtime.descriptor.displayName = event.title;
           runtime.descriptor.updatedAt = Date.now();
@@ -670,9 +677,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
               ?? 0,
           };
         } else if (event.type === "model_updated") {
-          runtime.model = event.model;
-          runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model: event.model };
-          runtime.descriptor.updatedAt = Date.now();
+          recordObservedModel(runtime, event.model);
         } else if (event.type === "compact_boundary") {
           if (event.postTokens !== undefined) {
             runtime.lastUsage = {
@@ -738,9 +743,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       return;
     }
     if (event.type === "model_updated") {
-      runtime.model = event.model;
-      runtime.descriptor.metadata = { ...runtime.descriptor.metadata, model: event.model };
-      runtime.descriptor.updatedAt = Date.now();
+      recordObservedModel(runtime, event.model);
       return;
     }
     this.outOfBandHandler?.(runtime.descriptor.id, event);
@@ -823,6 +826,30 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     }
   }
 
+  /**
+   * Claude Code's model list, including the exact model each alias maps to right now.
+   * Cached for a few minutes; undefined when Claude Code cannot be asked.
+   */
+  async listModels(): Promise<ClaudeModelInfo[] | undefined> {
+    if (this.modelCatalog && Date.now() - this.modelCatalog.fetchedAt < MODEL_CATALOG_TTL_MS) {
+      return this.modelCatalog.models;
+    }
+    this.modelCatalogProbe ??= probeClaudeModels({
+      claudeBin: this.config.claudeBin,
+      cwd: this.config.claudeWorkspace,
+    });
+    try {
+      const models = await this.modelCatalogProbe;
+      this.modelCatalog = { models, fetchedAt: Date.now() };
+      return models;
+    } catch (error) {
+      bridgeLog("model", `claude model probe failed: ${error instanceof Error ? error.message : String(error)}`);
+      return this.modelCatalog?.models;
+    } finally {
+      this.modelCatalogProbe = undefined;
+    }
+  }
+
   async getUsage(sessionId: string): Promise<Record<string, unknown>> {
     const runtime = this.requireRuntime(sessionId);
     return runtime.lastUsage ? { ...runtime.lastUsage } : {};
@@ -831,7 +858,9 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
   async getContext(sessionId: string): Promise<Record<string, unknown>> {
     const runtime = this.requireRuntime(sessionId);
     const used = runtime.lastUsage?.contextTokens ?? 0;
-    const window = contextWindowForModel(runtime.model) ?? this.config.claudeContextWindow;
+    const window = contextWindowForModel(runtime.observedModel)
+      ?? contextWindowForModel(runtime.model)
+      ?? this.config.claudeContextWindow;
     return {
       usedTokens: used,
       contextWindow: window,
@@ -1499,6 +1528,12 @@ function isDispatchSlashCommand(text: string): boolean {
   }
   const spec = getClaudeCommandSpec(parsed.name);
   return spec?.class === "dispatch" || spec?.class === "dispatch_arg";
+}
+
+function recordObservedModel(runtime: RuntimeSession, model: string): void {
+  runtime.observedModel = model;
+  runtime.descriptor.metadata = { ...runtime.descriptor.metadata, observedModel: model };
+  runtime.descriptor.updatedAt = Date.now();
 }
 
 function shouldPassClaudeModel(model: string): boolean {

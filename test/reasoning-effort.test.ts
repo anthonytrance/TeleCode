@@ -6,6 +6,16 @@ import {
 } from "../src/reasoning-effort.js";
 
 describe("native reasoning effort fallbacks", () => {
+  it("removes unsupported minimal and retains max for GPT-6.1 Sol", () => {
+    expect(addRequiredNativeReasoningEfforts("gpt-6.1-sol", LEGACY_CODEX_REASONING_EFFORTS)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
   it("keeps max available for Sol when a vendor catalog displaced the native cache", () => {
     expect(addRequiredNativeReasoningEfforts("gpt-5.6-sol", LEGACY_CODEX_REASONING_EFFORTS)).toEqual([
       "minimal",

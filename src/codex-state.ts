@@ -36,7 +36,10 @@ export interface CodexParentThreadRecord extends CodexThreadRecord {
 }
 
 export const FALLBACK_MODELS: CodexModelRecord[] = [
+  { slug: "gpt-6.1-sol", displayName: "GPT-6.1-Sol" },
   { slug: "gpt-6-astra", displayName: "GPT-6-Astra" },
+  { slug: "gpt-6-sol", displayName: "GPT-6-Sol" },
+  { slug: "gpt-6-luna", displayName: "GPT-6-Luna" },
   { slug: "gpt-5.4", displayName: "GPT-5.4" },
   { slug: "gpt-5.4-mini", displayName: "GPT-5.4-Mini" },
   { slug: "gpt-5", displayName: "GPT-5" },

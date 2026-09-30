@@ -25,6 +25,7 @@ export interface ContextMetadata {
 
 interface TeleCodePreferences {
   selectedCodexModel?: string;
+  selectedClaudeModel?: string;
   codexMcpEnabled?: boolean;
 }
 
@@ -40,6 +41,7 @@ export class SessionRegistry {
   private readonly persistPath: string;
   private readonly preferencesPath: string;
   private selectedCodexModel?: string;
+  private selectedClaudeModel?: string;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
 
   constructor(private readonly config: TeleCodeConfig) {
@@ -103,6 +105,17 @@ export class SessionRegistry {
 
   setDefaultModel(model: string): void {
     this.selectedCodexModel = model;
+    this.persistPreferences();
+  }
+
+  /** The model new Claude sessions start on: the last /model choice, else CLAUDE_DEFAULT_MODEL. */
+  getClaudeDefaultModel(): string {
+    return this.selectedClaudeModel ?? this.config.claudeDefaultModel;
+  }
+
+  /** Pass undefined to fall back to CLAUDE_DEFAULT_MODEL again. */
+  setClaudeDefaultModel(model: string | undefined): void {
+    this.selectedClaudeModel = model;
     this.persistPreferences();
   }
 
@@ -297,6 +310,7 @@ export class SessionRegistry {
       }
       const data: TeleCodePreferences = {
         selectedCodexModel: this.selectedCodexModel,
+        selectedClaudeModel: this.selectedClaudeModel,
         codexMcpEnabled: isCodexMcpEnabled(),
       };
       writeFileAtomically(this.preferencesPath, JSON.stringify(data, null, 2));
@@ -316,6 +330,7 @@ export class SessionRegistry {
       const raw = readFileSync(this.preferencesPath, "utf8");
       const preferences = parseJsonFileText<TeleCodePreferences>(raw);
       this.selectedCodexModel = preferences.selectedCodexModel;
+      this.selectedClaudeModel = preferences.selectedClaudeModel;
       setCodexMcpEnabled(preferences.codexMcpEnabled === true);
     } catch {
       // Silently ignore load errors.

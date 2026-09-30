@@ -93,6 +93,7 @@ import {
   isCodexReasoningEffort,
   type CodexReasoningEffort,
 } from "./reasoning-effort.js";
+import type { ClaudeModelInfo } from "./providers/claude-sdk-engine.js";
 import { ClaudeProviderAdapter, PromptNotDeliveredError } from "./providers/claude-adapter.js";
 import { classifyClaudeSlashCommand } from "./providers/claude-commands.js";
 import { claudeProcessRegistryPath } from "./providers/claude-process-registry.js";
@@ -415,6 +416,21 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   const activeProgressRefreshers = new Map<TelegramContextKey, () => Promise<void>>();
   const pendingClaudeLogins = new Map<TelegramContextKey, PendingClaudeLogin>();
   const claudeAdapter = config.enableClaudeProvider ? new ClaudeProviderAdapter(config) : undefined;
+  // Claude Code's current alias map ("opus" -> "claude-opus-5-5"), so every model line
+  // says which exact model a choice runs on today instead of only the alias.
+  const claudeModelCatalog = async (model: string): Promise<ClaudeModelInfo[] | undefined> =>
+    resolveVendorModel(model) ? undefined : await claudeAdapter?.listModels?.();
+  const describeClaudeModel = async (model: string): Promise<string> =>
+    formatClaudeModelChoice(model, await claudeModelCatalog(model));
+  const claudeModelLines = async (model: string, observedModel: unknown): Promise<string[]> => {
+    const catalog = await claudeModelCatalog(model);
+    const lines = [`Model: ${formatClaudeModelChoice(model, catalog)}`];
+    const expected = resolveClaudeModelId(model, catalog) ?? model;
+    if (typeof observedModel === "string" && observedModel && observedModel !== expected) {
+      lines.push(`Last answered as: ${observedModel}`);
+    }
+    return lines;
+  };
   const claudeState = config.enableClaudeProvider
     ? new ClaudeSessionStateIndex(new ClaudeStateStore(claudeProviderStatePath(config.workspace)))
     : undefined;
@@ -1244,7 +1260,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       sessionId: descriptor.providerSessionId,
       workspace: descriptor.workspace,
       displayName: descriptor.displayName,
-      model: String(descriptor.metadata?.model ?? config.claudeDefaultModel),
+      model: String(descriptor.metadata?.model ?? registry.getClaudeDefaultModel()),
       permissionMode: asClaudePermissionMode(descriptor.metadata?.permissionMode) ?? config.claudePermissionMode,
       transcriptPath: typeof descriptor.metadata?.transcriptPath === "string"
         ? descriptor.metadata.transcriptPath
@@ -1303,7 +1319,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           workspace: config.claudeWorkspace,
           displayName: `TeleCode ${contextKey}`,
           metadata: {
-            model: config.claudeDefaultModel,
+            model: registry.getClaudeDefaultModel(),
             permissionMode: config.claudePermissionMode,
             backend,
           },
@@ -1329,7 +1345,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       throw new Error("Claude provider is disabled. Set ENABLE_CLAUDE_PROVIDER=true to enable it.");
     }
 
-    const model = options.model ?? config.claudeDefaultModel;
+    const model = options.model ?? registry.getClaudeDefaultModel();
     const previous = claudeSessions.get(contextKey);
     const descriptor = await claudeAdapter.createSession({
       workspace: config.claudeWorkspace,
@@ -1386,6 +1402,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
     try {
       await createFreshClaudeSession(contextKey, { model: vendorHit.model.slug });
+      registry.setClaudeDefaultModel(vendorHit.model.slug);
       const text = `New Claude session on ${describeVendorModel(vendorHit)}. The next normal message will use it.`;
       await safeReply(ctx, escapeHTML(text), { fallbackText: text });
     } catch (error) {
@@ -3412,6 +3429,12 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       if (!sawAssistantCompletion) {
         throw new Error("Claude provider ended the turn without a completion event.");
       }
+      // Like Codex, a /model choice becomes the model every new Claude session starts
+      // on, until the next /model. "default" hands the choice back to CLAUDE_DEFAULT_MODEL.
+      const modelSwitch = claudeModelSwitchFromPrompt(text);
+      if (modelSwitch) {
+        registry.setClaudeDefaultModel(modelSwitch.toLowerCase() === "default" ? undefined : modelSwitch);
+      }
 
       // Claude reveals its real session id only once the first turn runs (it ignores the
       // id we launch with), so the adapter reconciles it mid-turn. Pull the refreshed
@@ -3941,7 +3964,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         `Binary: ${config.claudeBin}`,
         `Binary exists: ${path.isAbsolute(config.claudeBin) ? existsSync(config.claudeBin) : "resolved via PATH"}`,
         `Workspace: ${config.claudeWorkspace}`,
-        `Default model: ${config.claudeDefaultModel}`,
+        `Default model: ${registry.getClaudeDefaultModel()}`,
         `Strict MCP config: ${config.claudeStrictMcpConfig}`,
         `Transcript root: ${transcriptRoot}`,
         `Transcript root exists: ${existsSync(transcriptRoot)}`,
@@ -4127,13 +4150,17 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const descriptor = claudeSessions.get(contextKey);
     const persisted = claudeState?.get(contextKey);
     const lines = descriptor
-      ? renderClaudeSessionPlain(descriptor, await claudeAdapter?.getContext(descriptor.id))
+      ? renderClaudeSessionPlain(
+          descriptor,
+          await claudeAdapter?.getContext(descriptor.id),
+          await claudeModelLines(String(descriptor.metadata?.model ?? registry.getClaudeDefaultModel()), descriptor.metadata?.observedModel),
+        )
       : persisted
         ? [
             "Claude session:",
             `Session UUID: ${persisted.sessionId}`,
             `Workspace: ${persisted.workspace}`,
-            `Model: ${persisted.model}`,
+            `Model: ${await describeClaudeModel(persisted.model)}`,
             `Permission mode: ${persisted.permissionMode}`,
             "Status: not attached, will resume on next message",
           ].join("\n")
@@ -4141,7 +4168,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             "Claude session:",
             "Status: not started yet",
             `Workspace: ${config.claudeWorkspace}`,
-            `Model: ${config.claudeDefaultModel}`,
+            `Model: ${await describeClaudeModel(registry.getClaudeDefaultModel())}`,
             `Permission mode: ${config.claudePermissionMode}`,
           ].join("\n");
     await safeReply(ctx, formatTelegramHTML(lines), { fallbackText: lines, messageThreadId });
@@ -4165,7 +4192,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
     try {
       const descriptor = await ensureClaudeSession(contextKey);
-      const activeModel = String(descriptor.metadata?.model ?? config.claudeDefaultModel);
+      const activeModel = String(descriptor.metadata?.model ?? registry.getClaudeDefaultModel());
       const activeVendor = resolveVendorModel(activeModel);
       const vendorReader = activeVendor && hasUsageReader(activeVendor.vendor.id)
         ? USAGE_READERS[activeVendor.vendor.id]
@@ -4319,7 +4346,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (config.enableClaudeProvider) {
       for (const transcript of claudeTranscripts) {
         const pick = providerSessionPickFromClaudeTranscript(transcript, {
-          model: config.claudeDefaultModel,
+          model: registry.getClaudeDefaultModel(),
           permissionMode: config.claudePermissionMode,
         });
         if (!picksByKey.has(providerSessionPickKey(pick))) {
@@ -4518,6 +4545,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
 
+    // Bare /model is TeleCode's own model report (chosen model, what it runs on, what
+    // new sessions start on); only Claude's argument form goes through to Claude.
+    if (/^\/model(?:@\w+)?$/iu.test(text)) {
+      await next();
+      return;
+    }
+
     if (await handleClaudeSlashCommand(ctx, contextKey, ctx.chat.id, text)) {
       return;
     }
@@ -4530,12 +4564,12 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (rawContextKey && isClaudeActive(rawContextKey)) {
       const descriptor = claudeSessions.get(rawContextKey);
       const persisted = claudeState?.get(rawContextKey);
-      const model = String(descriptor?.metadata?.model ?? persisted?.model ?? config.claudeDefaultModel);
+      const model = String(descriptor?.metadata?.model ?? persisted?.model ?? registry.getClaudeDefaultModel());
       const lines = [
         "TeleCode is running.",
         "Active provider: Claude Code",
         `Workspace: ${descriptor?.workspace ?? persisted?.workspace ?? config.claudeWorkspace}`,
-        `Model: ${model}`,
+        `Model: ${await describeClaudeModel(model)}`,
         "Use /codex to switch this context back to Codex.",
       ];
       await safeReply(ctx, lines.map((line) => escapeHTML(line)).join("\n"), {
@@ -5028,8 +5062,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       registry.setActiveProvider(rawContextKey, "claude");
       try {
         const descriptor = await createFreshClaudeSession(rawContextKey, { model: requestedModel });
-        const model = String(descriptor.metadata?.model ?? config.claudeDefaultModel);
-        const message = `New Claude session selected with model ${model}. The next normal message will use it.`;
+        const model = String(descriptor.metadata?.model ?? registry.getClaudeDefaultModel());
+        const message = `New Claude session selected with model ${await describeClaudeModel(model)}. The next normal message will use it.`;
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       } catch (error) {
         const message = `Claude model change failed: ${friendlyErrorText(error)}`;
@@ -5622,13 +5656,6 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
 
-    if (rollbackCount > 0 && !session.rollbackThread) {
-      await safeReply(ctx, escapeHTML("Fork rollback requires the app-server backend. The live backend is still SDK."), {
-        fallbackText: "Fork rollback requires the app-server backend. The live backend is still SDK.",
-      });
-      return;
-    }
-
     try {
       if (rollbackCount > 0 && session.getTurnCount) {
         const turnCount = await session.getTurnCount();
@@ -5643,10 +5670,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         }
       }
 
-      const info = await session.forkThread();
-      if (rollbackCount > 0) {
-        await session.rollbackThread?.(rollbackCount);
-      }
+      const info = await session.forkThread(rollbackCount);
       updateSessionMetadata(contextKey, session);
       const latestInfo = session.getInfo();
       const rollbackText =
@@ -5734,8 +5758,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
     try {
       await session.rollbackThread(turnCount);
-      await safeReply(ctx, escapeHTML(`Rolled back ${turnCount} turn${turnCount === 1 ? "" : "s"}. File changes were not reverted.`), {
-        fallbackText: `Rolled back ${turnCount} turn${turnCount === 1 ? "" : "s"}. File changes were not reverted.`,
+      updateSessionMetadata(contextKey, session);
+      const message = `Rolled back ${turnCount} turn${turnCount === 1 ? "" : "s"} by switching to a truncated fork. The original thread remains available; file changes were not reverted.`;
+      await safeReply(ctx, escapeHTML(message), {
+        fallbackText: message,
       });
     } catch (error) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
@@ -5845,13 +5871,17 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       const descriptor = claudeSessions.get(rawContextKey);
       const persisted = claudeState?.get(rawContextKey);
       const lines = descriptor
-        ? renderClaudeSessionPlain(descriptor, await claudeAdapter?.getContext(descriptor.id))
+        ? renderClaudeSessionPlain(
+            descriptor,
+            await claudeAdapter?.getContext(descriptor.id),
+            await claudeModelLines(String(descriptor.metadata?.model ?? registry.getClaudeDefaultModel()), descriptor.metadata?.observedModel),
+          )
         : persisted
           ? [
               "Claude session:",
               `Session UUID: ${persisted.sessionId}`,
               `Workspace: ${persisted.workspace}`,
-              `Model: ${persisted.model}`,
+              `Model: ${await describeClaudeModel(persisted.model)}`,
               `Permission mode: ${persisted.permissionMode}`,
               "Status: not attached, will resume on next message",
             ].join("\n")
@@ -5859,7 +5889,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
               "Claude session:",
               "Status: not started yet",
               `Workspace: ${config.claudeWorkspace}`,
-              `Model: ${config.claudeDefaultModel}`,
+              `Model: ${await describeClaudeModel(registry.getClaudeDefaultModel())}`,
               `Permission mode: ${config.claudePermissionMode}`,
             ].join("\n");
       await safeReply(ctx, formatTelegramHTML(lines), { fallbackText: lines });
@@ -5893,7 +5923,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const activeModel = contextKey && isClaudeActive(contextKey)
       ? String(
           claudeSessions.get(contextKey)?.metadata?.model ??
-            config.claudeDefaultModel,
+            registry.getClaudeDefaultModel(),
         )
       : registry.getDefaultModel() ?? "";
     const activeVendor = activeModel
@@ -6637,7 +6667,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             updatedAt: hit.updatedAt,
           },
           {
-            model: config.claudeDefaultModel,
+            model: registry.getClaudeDefaultModel(),
             permissionMode: config.claudePermissionMode,
           },
         ),
@@ -6974,7 +7004,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         fallbackText: startMessage,
       });
 
-      const model = String(sourceDescriptor.metadata?.model ?? config.claudeDefaultModel);
+      const model = String(sourceDescriptor.metadata?.model ?? registry.getClaudeDefaultModel());
       const permissionMode = asClaudePermissionMode(sourceDescriptor.metadata?.permissionMode)
         ?? config.claudePermissionMode;
       const backend = claudeAdapter.getBackend(sourceDescriptor.id);
@@ -7024,7 +7054,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       const plain = [
         "New Claude session created from summary.",
         `Workspace: ${createdDescriptor.workspace}`,
-        `Model: ${String(createdDescriptor.metadata?.model ?? model)}`,
+        `Model: ${await describeClaudeModel(String(createdDescriptor.metadata?.model ?? model))}`,
         `Backend: ${String(createdDescriptor.metadata?.backend ?? backend)}`,
         "",
         "Summary:",
@@ -7033,7 +7063,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       const html = [
         "<b>New Claude session created from summary.</b>",
         `Workspace: <code>${escapeHTML(createdDescriptor.workspace)}</code>`,
-        `Model: <code>${escapeHTML(String(createdDescriptor.metadata?.model ?? model))}</code>`,
+        `Model: <code>${escapeHTML(await describeClaudeModel(String(createdDescriptor.metadata?.model ?? model)))}</code>`,
         `Backend: <code>${escapeHTML(String(createdDescriptor.metadata?.backend ?? backend))}</code>`,
         "",
         "<b>Summary:</b>",
@@ -7476,13 +7506,19 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       const currentModel = String(
         currentDescriptor?.metadata?.model ??
           persisted?.model ??
-          config.claudeDefaultModel,
+          registry.getClaudeDefaultModel(),
       );
       if (!modelArg) {
+        const [currentLine, ...observedLines] = await claudeModelLines(
+          currentModel,
+          currentDescriptor?.metadata?.observedModel,
+        );
         const message = [
-          `Claude model: ${currentModel}`,
-          "Use /model fable, /model sonnet, /model opus, /model haiku, /model best, or /model default to change the active Claude session.",
-        ].join("\n");
+          `Claude ${currentLine}`,
+          ...observedLines,
+          `New sessions start on: ${await describeClaudeModel(registry.getClaudeDefaultModel())}`,
+          "Use /model fable, /model sonnet, /model opus, /model haiku, /model best, or /model default to change the active Claude session and the model new sessions start on.",
+        ].filter((line): line is string => Boolean(line)).join("\n");
         await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
         return;
       }
@@ -8662,7 +8698,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "newsummary", description: "Start a new thread from summary" },
     { command: "forkthread", description: "Fork active app-server thread" },
     { command: "renamethread", description: "Rename active app-server thread" },
-    { command: "rollbackthread", description: "Roll back app-server thread history" },
+    { command: "rollbackthread", description: "Omit recent turns using a recoverable fork" },
     { command: "session", description: "Current thread details" },
     { command: "status", description: "Current thread details" },
     { command: "usage", description: "Codex limits & reset times" },
@@ -8742,6 +8778,7 @@ function renderSessionInfoHTML(info: CodexSessionInfo): string {
 function renderClaudeSessionPlain(
   descriptor: AgentSessionDescriptor,
   context?: Record<string, unknown>,
+  modelLines: string[] = [`Model: ${String(descriptor.metadata?.model ?? "(default)")}`],
 ): string {
   const used = Number(context?.usedTokens ?? 0);
   const window = Number(context?.contextWindow ?? 0);
@@ -8750,7 +8787,7 @@ function renderClaudeSessionPlain(
     "Claude session:",
     `Session UUID: ${descriptor.providerSessionId ?? "(unknown)"}`,
     `Workspace: ${descriptor.workspace}`,
-    `Model: ${String(descriptor.metadata?.model ?? "(default)")}`,
+    ...modelLines,
     `Permission mode: ${String(descriptor.metadata?.permissionMode ?? "(default)")}`,
     `Engine: ${String(descriptor.metadata?.backend ?? "pty")}`,
     `Status: ${descriptor.status}`,
@@ -9614,7 +9651,7 @@ function formatModelButtonLabel(displayName: string): string {
   return displayName.replace(/^GPT[- ]?/i, "").replace(/^gpt[- ]?/i, "");
 }
 
-function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName: string }>): string | null {
+export function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName: string }>): string | null {
   const value = raw.trim();
   const normalized = normalizeModelName(value);
   const aliases: Record<string, string> = {
@@ -9624,12 +9661,18 @@ function resolveModelSlug(raw: string, models: Array<{ slug: string; displayName
     codex56tera: "gpt-5.6-terra",
     terra: "gpt-5.6-terra",
     tera: "gpt-5.6-terra",
-    codexluna: "gpt-5.6-luna",
+    codexluna: "gpt-6-luna",
     codex56luna: "gpt-5.6-luna",
-    luna: "gpt-5.6-luna",
-    codexsol: "gpt-5.6-sol",
+    codex6luna: "gpt-6-luna",
+    "6luna": "gpt-6-luna",
+    luna: "gpt-6-luna",
+    codexsol: "gpt-6.1-sol",
     codex56sol: "gpt-5.6-sol",
-    sol: "gpt-5.6-sol",
+    codex6sol: "gpt-6-sol",
+    "6sol": "gpt-6-sol",
+    codex61sol: "gpt-6.1-sol",
+    "61sol": "gpt-6.1-sol",
+    sol: "gpt-6.1-sol",
     codexastra: "gpt-6-astra",
     codex6astra: "gpt-6-astra",
     "6astra": "gpt-6-astra",
@@ -10467,6 +10510,42 @@ function parseProviderName(raw: string): "codex" | "claude" | undefined {
     default:
       return undefined;
   }
+}
+
+/**
+ * A Claude model choice plus the exact model it runs on today, e.g.
+ * "opus, currently Opus 5.5 (claude-opus-5-5)". Without a catalog the choice is shown as is.
+ */
+export function formatClaudeModelChoice(model: string, catalog: ClaudeModelInfo[] | undefined): string {
+  const row = findClaudeModelRow(model, catalog);
+  if (!row?.resolvedModel) {
+    return catalog && !model.toLowerCase().startsWith("claude-")
+      ? `${model} (exact version shows after the first reply)`
+      : model;
+  }
+  const version = row.description.split("\u00b7")[0]?.trim() || row.displayName;
+  return row.resolvedModel === model
+    ? `${model} (${version})`
+    : `${model}, currently ${version} (${row.resolvedModel})`;
+}
+
+/** The exact model ID a Claude model choice resolves to, when Claude Code reported it. */
+export function resolveClaudeModelId(model: string, catalog: ClaudeModelInfo[] | undefined): string | undefined {
+  return findClaudeModelRow(model, catalog)?.resolvedModel;
+}
+
+function findClaudeModelRow(model: string, catalog: ClaudeModelInfo[] | undefined): ClaudeModelInfo | undefined {
+  const wanted = model.trim().toLowerCase();
+  return catalog?.find((row) =>
+    [row.value, row.value.replace(/\[1m\]$/i, ""), row.resolvedModel, row.displayName].some(
+      (candidate) => candidate?.toLowerCase() === wanted,
+    ));
+}
+
+/** The model a "/model X" prompt switches to, or undefined for any other prompt. */
+export function claudeModelSwitchFromPrompt(text: string): string | undefined {
+  const match = text.trim().match(/^\/model(?:@\w+)?\s+([a-zA-Z0-9_.:-]+)$/u);
+  return match?.[1];
 }
 
 function parseClaudeModelArgument(raw: string): string | undefined {

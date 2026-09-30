@@ -45,6 +45,7 @@ const mockClaude = vi.hoisted(() => {
   const queuedReplies: string[] = [];
   let failNextPromptDelivery = false;
   let artifactFileName: string | undefined;
+  let modelCatalog: Array<Record<string, string>> | undefined;
   let outOfBandHandler: ((sessionId: string, event: Record<string, unknown>) => void) | undefined;
   let parkActivityHandler: ((sessionId: string, active: boolean) => void) | undefined;
   let parkStateHandler: ((sessionId: string, parked: boolean) => void) | undefined;
@@ -59,6 +60,10 @@ const mockClaude = vi.hoisted(() => {
       artifactFileName = name;
     },
     getArtifactFileName: () => artifactFileName,
+    setModelCatalog: (catalog: Array<Record<string, string>> | undefined) => {
+      modelCatalog = catalog;
+    },
+    getModelCatalog: () => modelCatalog,
     setOutOfBandHandler: (handler: ((sessionId: string, event: Record<string, unknown>) => void) | undefined) => {
       outOfBandHandler = handler;
     },
@@ -161,6 +166,7 @@ const mockClaude = vi.hoisted(() => {
       queuedReplies.length = 0;
       failNextPromptDelivery = false;
       artifactFileName = undefined;
+      modelCatalog = undefined;
       outOfBandHandler = undefined;
       parkActivityHandler = undefined;
       createSession.mockReset();
@@ -388,6 +394,10 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
 
     async getUsageReport() {
       return "Mock Claude usage panel";
+    }
+
+    async listModels() {
+      return mockClaude.getModelCatalog();
     }
 
     async getContext() {
@@ -1069,6 +1079,41 @@ describe("Claude bot flow", () => {
     expect(mockClaude.dispose).toHaveBeenCalledWith("claude-provider-1");
   });
 
+  it("starts later /new claude sessions on the last /model choice, across restarts", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude first"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to first"));
+    await waitForAgentSessionsIdle(tempDir);
+    await bot.handleUpdate(textUpdate(2, "/model opus"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to /model opus"));
+    await waitForAgentSessionsIdle(tempDir);
+
+    const preferences = JSON.parse(readFileSync(path.join(tempDir, ".telecode", "preferences.json"), "utf8"));
+    expect(preferences.selectedClaudeModel).toBe("opus");
+
+    // A restarted bridge reads the saved choice back, so /new keeps using it.
+    const restarted = await createTestBot(tempDir);
+    await restarted.bot.handleUpdate(textUpdate(3, "/new claude"));
+    expect(mockClaude.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ model: "opus" }),
+    }));
+    expect(restarted.sent.map((entry) => entry.text)).toContain(
+      "New Claude session selected with model opus. The next normal message will use it.",
+    );
+  });
+
+  it("does not save a one-off /new claude model as the default", async () => {
+    const { bot } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/new claude opus"));
+    await bot.handleUpdate(textUpdate(2, "/new claude"));
+
+    expect(mockClaude.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
+      metadata: expect.objectContaining({ model: "sonnet" }),
+    }));
+  });
+
   it("starts /new claude with the requested model", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
@@ -1142,6 +1187,31 @@ describe("Claude bot flow", () => {
     await bot.handleUpdate(textUpdate(3, "continue in original"));
     await waitFor(() => mockClaude.prompts.includes("continue in original"));
     expect(mockClaude.promptSessionIds.at(-1)).toBe("claude-provider-1");
+  });
+
+  it("reports the exact model an alias runs on in /status, /model and /new", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.setModelCatalog([
+      { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus", description: "Opus 5.5 \u00b7 Best for everyday, complex tasks" },
+      { value: "sonnet", resolvedModel: "claude-sonnet-5", displayName: "Sonnet", description: "Sonnet 5 \u00b7 Efficient for routine tasks" },
+    ]);
+
+    await bot.handleUpdate(textUpdate(1, "/new claude opus"));
+    expect(sent.map((entry) => entry.text)).toContain(
+      "New Claude session selected with model opus, currently Opus 5.5 (claude-opus-5-5). The next normal message will use it.",
+    );
+
+    await bot.handleUpdate(textUpdate(2, "/status"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("Claude session:")));
+    expect(sent.map((entry) => entry.text).find((text) => text?.includes("Claude session:"))).toContain(
+      "Model: opus, currently Opus 5.5 (claude-opus-5-5)",
+    );
+
+    await bot.handleUpdate(textUpdate(3, "/model"));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("New sessions start on:")));
+    const modelReply = sent.map((entry) => entry.text).find((text) => text?.includes("New sessions start on:"));
+    expect(modelReply).toContain("Claude Model: opus, currently Opus 5.5 (claude-opus-5-5)");
+    expect(modelReply).toContain("New sessions start on: sonnet, currently Sonnet 5 (claude-sonnet-5)");
   });
 
   it("changes Claude model inside the active Claude runtime", async () => {

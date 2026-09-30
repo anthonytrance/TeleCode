@@ -10,6 +10,7 @@ import {
 } from "@openai/codex-sdk";
 
 import { buildCodexMcpOverrideConfig } from "./codex-mcp-toggle.js";
+import { syncClaudeSkillsIntoCodexHome } from "./skill-sync.js";
 import type { TeleCodeConfig } from "./config.js";
 import {
   buildVendorCodexConfig,
@@ -136,6 +137,7 @@ export class CodexSessionService {
   }
 
   static async create(config: TeleCodeConfig, options?: CreateOptions): Promise<CodexSessionService> {
+    syncClaudeSkillsIntoCodexHome();
     const service = new CodexSessionService(config);
     service.currentWorkspace = options?.workspace ?? config.workspace;
     service.currentModel = options?.model ?? config.codexModel;
@@ -208,6 +210,7 @@ export class CodexSessionService {
   }
 
   async prompt(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
+    syncClaudeSkillsIntoCodexHome();
     if (!this.thread) {
       throw new Error("Codex thread is not initialized");
     }
@@ -429,6 +432,7 @@ export class CodexSessionService {
   }
 
   async runText(input: CodexPromptInput): Promise<string> {
+    syncClaudeSkillsIntoCodexHome();
     if (!this.thread) {
       throw new Error("Codex thread is not initialized");
     }

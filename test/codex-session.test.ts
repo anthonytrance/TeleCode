@@ -51,7 +51,7 @@ const mockState = vi.hoisted(() => {
     return thread;
   };
 
-  const Codex = vi.fn().mockImplementation((options: any) => {
+  const Codex = vi.fn(function (options: any) {
     createdCodexOptions.push(options);
 
     const instance = {

@@ -608,6 +608,21 @@ describe("SessionRegistry", () => {
     expect(reloaded.getDefaultModel()).toBe("gpt-5.6-terra");
   });
 
+  it("persists the Claude model choice and falls back to CLAUDE_DEFAULT_MODEL when cleared", () => {
+    const config = createConfig({ claudeDefaultModel: "opus" });
+    const preferencesPath = path.join(config.workspace, ".telecode", "preferences.json");
+    const registry = new SessionRegistry(config);
+
+    expect(registry.getClaudeDefaultModel()).toBe("opus");
+    registry.setClaudeDefaultModel("claude-opus-5-5");
+    expect(registry.getClaudeDefaultModel()).toBe("claude-opus-5-5");
+    expect(mockFsState.files.get(preferencesPath)).toContain("claude-opus-5-5");
+    expect(new SessionRegistry(config).getClaudeDefaultModel()).toBe("claude-opus-5-5");
+
+    registry.setClaudeDefaultModel(undefined);
+    expect(new SessionRegistry(config).getClaudeDefaultModel()).toBe("opus");
+  });
+
   it("disposeAll disposes all sessions and clears the map", async () => {
     const registry = new SessionRegistry(createConfig());
 
