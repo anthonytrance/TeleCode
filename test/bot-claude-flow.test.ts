@@ -50,8 +50,17 @@ const mockClaude = vi.hoisted(() => {
   let parkActivityHandler: ((sessionId: string, active: boolean) => void) | undefined;
   let parkStateHandler: ((sessionId: string, parked: boolean) => void) | undefined;
   const parkedSessions = new Set<string>();
+  // Provider session id per runtime, like the real adapter; getSessionInfo on a
+  // runtime the mock never created falls back to the last active id.
+  const sessionProviderIds = new Map<string, string>();
+  const aborts: string[] = [];
 
   return {
+    aborts,
+    rememberSession: (sessionId: string, providerSessionId: string) => {
+      sessionProviderIds.set(sessionId, providerSessionId);
+    },
+    providerSessionIdFor: (sessionId: string) => sessionProviderIds.get(sessionId) ?? activeProviderSessionId,
     prompts,
     rawPrompts,
     promptSessionIds,
@@ -155,6 +164,8 @@ const mockClaude = vi.hoisted(() => {
       promptSessionIds.length = 0;
       steers.length = 0;
       parkedSessions.clear();
+      sessionProviderIds.clear();
+      aborts.length = 0;
       createCount = 0;
       activeModel = "sonnet";
       activeBackend = "pty";
@@ -230,6 +241,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
         metadata: options.metadata,
       };
       mockClaude.setActiveProviderSessionId(descriptor.providerSessionId);
+      mockClaude.rememberSession(descriptor.id, descriptor.providerSessionId);
       mockClaude.createSession(options);
       return descriptor;
     }
@@ -258,6 +270,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
       }
       if (providerSessionId) {
         mockClaude.setActiveProviderSessionId(providerSessionId);
+        mockClaude.rememberSession((session as { id: string }).id, providerSessionId);
       }
       mockClaude.resumeSession(session);
       return session;
@@ -286,6 +299,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
         metadata: { model: mockClaude.getActiveModel(), backend: "pty" },
       };
       mockClaude.setActiveProviderSessionId(descriptor.providerSessionId);
+      mockClaude.rememberSession(descriptor.id, descriptor.providerSessionId);
       return descriptor;
     }
 
@@ -295,7 +309,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
         provider: "claude",
         workspace: "C:\\workspace",
         displayName: "Mock Claude",
-        providerSessionId: mockClaude.getActiveProviderSessionId(),
+        providerSessionId: mockClaude.providerSessionIdFor(sessionId),
         status: "idle",
         capabilities: this.capabilities,
         createdAt: 1000,
@@ -378,6 +392,12 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
         jobId: options.jobId,
         text: reply,
       };
+    }
+
+    async abort(sessionId: string) {
+      mockClaude.aborts.push(sessionId);
+      mockClaude.setNextEvents([{ type: "error", sessionId, message: "Claude turn aborted" }]);
+      mockClaude.releaseBlockedPrompt();
     }
 
     async streamInput(_sessionId: string, input: { text?: string }) {
@@ -1740,6 +1760,107 @@ describe("Claude bot flow", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(sent.slice(before).some((entry) => entry.text?.includes("SHOULD NOT APPEAR"))).toBe(false);
+  });
+
+  describe("background Claude turns", () => {
+    // Two conversations: the original, then a fork that is selected and runs a
+    // long turn. Returns the list numbers of both once the fork is working.
+    const startLongTurnOnFork = async (
+      bot: Awaited<ReturnType<typeof createTestBot>>["bot"],
+      sent: Array<{ text?: string }>,
+    ) => {
+      await bot.handleUpdate(textUpdate(1, "/claude first conversation"));
+      await waitFor(() => sent.some((entry) => entry.text === "mock reply to first conversation"));
+      await waitForAgentSessionsIdle(tempDir);
+      await bot.handleUpdate(textUpdate(2, "/fork second conversation"));
+      await waitFor(() => sent.some((entry) => entry.text?.includes("Forked this conversation")));
+      mockClaude.blockNextPrompt();
+      await bot.handleUpdate(textUpdate(3, "long task on the fork"));
+      await waitFor(() => mockClaude.prompts.includes("long task on the fork"));
+      const forkSessionId = mockClaude.promptSessionIds.at(-1) ?? "";
+      await bot.handleUpdate(textUpdate(4, "/sessions"));
+      const list = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Recent provider sessions")).at(-1) ?? "";
+      const lines = list.split("\n");
+      const originalNumber = lines.find((line) =>
+        /^\d+\. Claude/u.test(line) && !line.includes(", selected") && !line.includes(", old"),
+      )?.match(/^(\d+)\./u)?.[1];
+      const forkLine = lines.find((line) => /^\d+\. Claude, selected/u.test(line)) ?? "";
+      const forkNumber = forkLine.match(/^(\d+)\./u)?.[1];
+      expect(originalNumber).toBeDefined();
+      expect(forkNumber).toBeDefined();
+      expect(forkLine).toContain(", running");
+      return { originalNumber: originalNumber!, forkNumber: forkNumber!, forkSessionId };
+    };
+
+    it("keeps a running turn going in the background after /use and labels its answer", async () => {
+      const { bot, sent } = await createTestBot(tempDir);
+      const { originalNumber, forkSessionId } = await startLongTurnOnFork(bot, sent);
+
+      await bot.handleUpdate(textUpdate(5, `/use ${originalNumber}`));
+      const switched = sent.map((entry) => entry.text ?? "").find((text) => text.includes(`Selected #${originalNumber}`)) ?? "";
+      expect(switched).toContain("keeps running");
+      expect(switched).toContain("second conversation");
+
+      // The selected session works normally while the fork is still running.
+      await bot.handleUpdate(textUpdate(6, "quick question"));
+      await waitFor(() => sent.some((entry) => entry.text === "mock reply to quick question"));
+      expect(mockClaude.promptSessionIds.at(-1)).not.toBe(forkSessionId);
+
+      mockClaude.releaseBlockedPrompt();
+      await waitFor(() => sent.some((entry) => entry.text?.includes("mock reply to long task on the fork")));
+      const answer = sent.find((entry) => entry.text?.includes("mock reply to long task on the fork"))?.text ?? "";
+      expect(answer).toMatch(/^Background Claude, session \d+ "second conversation", finished after /u);
+      await waitFor(() => mockClaude.dispose.mock.calls.some((call) => call[0] === forkSessionId));
+
+      // The lane was never wedged by the background turn.
+      await bot.handleUpdate(textUpdate(7, "after the fork"));
+      await waitFor(() => sent.some((entry) => entry.text === "mock reply to after the fork"));
+    });
+
+    it("refuses to leave a running turn once the parallel limit is reached", async () => {
+      const { bot, sent } = await createTestBot(tempDir, { claudeMaxParallelTurns: 1 });
+      const { originalNumber } = await startLongTurnOnFork(bot, sent);
+
+      await bot.handleUpdate(textUpdate(5, `/use ${originalNumber}`));
+      await waitFor(() => sent.some((entry) => entry.text?.includes("the limit is 1")));
+      expect(sent.some((entry) => entry.text?.includes(`Selected #${originalNumber}`))).toBe(false);
+
+      mockClaude.releaseBlockedPrompt();
+      await waitFor(() => sent.some((entry) => entry.text === "mock reply to long task on the fork"));
+    });
+
+    it("picks a background turn back up when the user switches to it again", async () => {
+      const { bot, sent } = await createTestBot(tempDir);
+      const { originalNumber, forkNumber, forkSessionId } = await startLongTurnOnFork(bot, sent);
+
+      await bot.handleUpdate(textUpdate(5, `/use ${originalNumber}`));
+      await waitFor(() => sent.some((entry) => entry.text?.includes("keeps running")));
+      await bot.handleUpdate(textUpdate(6, `/use ${forkNumber}`));
+      await waitFor(() => sent.some((entry) => entry.text?.includes("This session is still working")));
+
+      // Selected again, so its answer arrives as a normal reply and a new message queues behind it.
+      await bot.handleUpdate(textUpdate(7, "follow-up on the fork"));
+      mockClaude.releaseBlockedPrompt();
+      await waitFor(() => sent.some((entry) => entry.text === "mock reply to long task on the fork"));
+      await waitFor(() => sent.some((entry) => entry.text === "mock reply to follow-up on the fork"));
+      expect(mockClaude.promptSessionIds.at(-1)).toBe(forkSessionId);
+      expect(sent.some((entry) => entry.text?.includes("finished after"))).toBe(false);
+    });
+
+    it("stops a background turn by its /sessions number", async () => {
+      const { bot, sent } = await createTestBot(tempDir);
+      const { originalNumber, forkNumber, forkSessionId } = await startLongTurnOnFork(bot, sent);
+
+      await bot.handleUpdate(textUpdate(5, `/use ${originalNumber}`));
+      await waitFor(() => sent.some((entry) => entry.text?.includes("keeps running")));
+      await bot.handleUpdate(textUpdate(6, `/stop ${forkNumber}`));
+      await waitFor(() => sent.some((entry) => entry.text?.startsWith("Stop sent to Background Claude")));
+      expect(mockClaude.aborts).toEqual([forkSessionId]);
+      await waitFor(() => sent.some((entry) => entry.text?.includes("stopped after")));
+      const stopped = sent.find((entry) => entry.text?.includes("stopped after"))?.text ?? "";
+      expect(stopped).toContain("second conversation");
+      expect(stopped).toContain("Claude turn aborted");
+    });
   });
 });
 

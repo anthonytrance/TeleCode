@@ -144,6 +144,7 @@ describe("loadConfig", () => {
       claudeAutoCompactWindow: 200000,
       claudeParkIdleMs: 180000,
       claudeBackend: "pty",
+      claudeMaxParallelTurns: 3,
     });
   });
 

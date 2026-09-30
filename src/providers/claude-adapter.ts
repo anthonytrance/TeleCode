@@ -249,6 +249,16 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       bridgeLog("park", `resume kept the live parked runtime session=${existing.providerSessionId}`);
       return { ...existing.descriptor };
     }
+    const running = [...this.sessions.values()].find((candidate) =>
+      candidate.busy && candidate.providerSessionId === session.providerSessionId,
+    );
+    if (running) {
+      // The conversation is mid-turn in another runtime (a turn left running in the
+      // background). A cold runtime beside it would run a second CLI on the same
+      // transcript, so hand back the live one.
+      bridgeLog("resume", `resume kept the running runtime session=${running.providerSessionId}`);
+      return { ...running.descriptor };
+    }
     const runtime = this.runtimeFromDescriptor(session);
     runtime.hasLiveProviderSession = true;
     this.sessions.set(session.id, runtime);

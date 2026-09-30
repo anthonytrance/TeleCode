@@ -61,6 +61,11 @@ export interface TeleCodeConfig {
   claudeParkIdleMs: number;
   /** Default Claude engine for contexts that never ran /backend: pty or sdk. */
   claudeBackend: "pty" | "sdk";
+  /**
+   * Most Claude turns allowed to run at once. Switching away from a running
+   * session leaves it running in the background, so this caps how many pile up.
+   */
+  claudeMaxParallelTurns?: number;
 }
 
 export function loadConfig(): TeleCodeConfig {
@@ -138,6 +143,11 @@ export function loadConfig(): TeleCodeConfig {
     200000,
     "CLAUDE_AUTO_COMPACT_WINDOW",
   );
+  const claudeMaxParallelTurns = parsePositiveIntegerEnv(
+    optionalString(process.env.CLAUDE_MAX_PARALLEL_TURNS),
+    3,
+    "CLAUDE_MAX_PARALLEL_TURNS",
+  );
   const rawClaudeParkIdleMs = optionalString(process.env.CLAUDE_PARK_IDLE_MS);
   let claudeParkIdleMs = 180_000;
   if (rawClaudeParkIdleMs !== undefined) {
@@ -187,6 +197,7 @@ export function loadConfig(): TeleCodeConfig {
     claudeAutoCompactWindow,
     claudeParkIdleMs,
     claudeBackend: rawClaudeBackend,
+    claudeMaxParallelTurns,
   };
 }
 

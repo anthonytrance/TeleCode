@@ -886,10 +886,37 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     { contextKey: TelegramContextKey; descriptor: AgentSessionDescriptor }
   >();
 
+  /**
+   * The Claude turn each lane is running in its selected session. Set once the turn
+   * knows its runtime, so a switch can tell a turn it may move to the background
+   * from one still starting up.
+   */
+  const runningClaudeTurnByLane = new Map<
+    TelegramContextKey,
+    { descriptorId: string; agentSessionId: string; startedAt: number }
+  >();
+
+  /**
+   * Claude turns still running in sessions the user switched away from. The lane is
+   * free for other work meanwhile; the turn finishes on its own and reports back
+   * with its session named. Keyed by descriptor id, and always mirrored in
+   * backgroundClaudeSessions so late parked output is labeled the same way.
+   */
+  const backgroundClaudeTurns = new Map<
+    string,
+    { contextKey: TelegramContextKey; descriptor: AgentSessionDescriptor; agentSessionId: string; startedAt: number }
+  >();
+
+  const maxParallelClaudeTurns = Math.max(1, config.claudeMaxParallelTurns ?? 3);
+
   const retireClaudeDescriptor = async (
     contextKey: TelegramContextKey,
     previous: AgentSessionDescriptor,
   ): Promise<void> => {
+    if (backgroundClaudeTurns.has(previous.id)) {
+      // Its turn is still running in the background; the turn disposes it when done.
+      return;
+    }
     if (claudeAdapter && typeof claudeAdapter.isParked === "function" && claudeAdapter.isParked(previous.id)) {
       backgroundClaudeSessions.set(previous.id, { contextKey, descriptor: previous });
       bridgeLog("park", `park kept alive in background session=${previous.id} lane=${contextKey}`);
@@ -1086,7 +1113,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
       const background = backgroundClaudeSessions.get(sessionId);
-      if (!background) {
+      if (!background || backgroundClaudeTurns.has(sessionId)) {
+        // A background turn still owns this runtime and disposes it when it ends.
         return;
       }
       // The park the user left behind has run out on its own. Nothing is
@@ -3099,7 +3127,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     }
 
     const typingInterval = setInterval(() => {
-      if (!isProviderForeground(contextKey, "claude")) {
+      if (!turnForeground()) {
         return;
       }
       void bot.api.sendChatAction(source.chatId, "typing", {
@@ -3129,6 +3157,39 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     let deferQueuedDispatch = false;
     let sawAssistantCompletion = false;
     let providerTurnError: string | undefined;
+
+    // The user may switch sessions mid-turn, which moves this turn to the
+    // background. From then on it no longer owns the lane: it must not touch the
+    // lane's descriptor or busy state, and it reports with its session named.
+    const turnBackgrounded = (): boolean => descriptor !== undefined && backgroundClaudeTurns.has(descriptor.id);
+    const turnForeground = (): boolean => !turnBackgrounded() && isProviderForeground(contextKey, "claude");
+    const storeTurnDescriptor = (next: AgentSessionDescriptor): void => {
+      descriptor = next;
+      const background = backgroundClaudeTurns.get(next.id);
+      if (background) {
+        background.descriptor = next;
+        const parked = backgroundClaudeSessions.get(next.id);
+        if (parked) {
+          parked.descriptor = next;
+        }
+        return;
+      }
+      claudeSessions.set(contextKey, next);
+      persistClaudeSession(contextKey, next);
+    };
+    const backgroundTurnLabel = (): string =>
+      descriptor && claudeAgentSession
+        ? describeBackgroundClaudeTurn(contextKey, descriptor, claudeAgentSession.id)
+        : "Background Claude session";
+    const sendBackgroundTurnText = async (outputText: string): Promise<void> => {
+      for (const chunk of splitMarkdownForTelegram(outputText)) {
+        await sendTextMessage(bot.api, source.chatId, chunk.text, {
+          parseMode: chunk.parseMode,
+          fallbackText: chunk.fallbackText,
+          messageThreadId,
+        });
+      }
+    };
 
     const bufferClaudeOutput = (
       kind: BufferedOutputEvent["kind"],
@@ -3161,7 +3222,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       if (artifacts.length === 0 && skippedCount === 0) {
         return;
       }
-      if (!isProviderForeground(contextKey, "claude")) {
+      const background = turnBackgrounded();
+      if (!background && !isProviderForeground(contextKey, "claude")) {
         const summary = formatArtifactSummary(artifacts, skippedCount);
         if (summary) {
           bufferClaudeOutput("status", summary, artifacts.length > 0 || skippedCount > 0);
@@ -3170,6 +3232,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           bufferClaudeOutput("artifact", artifact.name, true, artifact.localPath);
         }
         return;
+      }
+      if (background && artifacts.length > 0) {
+        // Name the session before its files, so they are not taken for the selected one's.
+        const heading = `${backgroundTurnLabel()} sent files:`;
+        await replyToClaudeRunSource(source, escapeHTML(heading), { fallbackText: heading, messageThreadId });
       }
       await bot.api
         .sendChatAction(source.chatId, "upload_document", {
@@ -3207,7 +3274,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
 
-      if (!isProviderForeground(contextKey, "claude")) {
+      if (!turnForeground()) {
         bufferClaudeOutput("assistant", trimmed, false);
         return;
       }
@@ -3305,6 +3372,14 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
       const quietWarning = isClaudeQuietWarning(trimmed);
+      if (turnBackgrounded()) {
+        if (priority || quietWarning) {
+          await sendBackgroundTurnText(`${backgroundTurnLabel()}:\n\n${trimmed}`);
+        } else {
+          bufferClaudeOutput("status", trimmed, false);
+        }
+        return;
+      }
       if (priority || quietWarning || isProviderForeground(contextKey, "claude")) {
         await replyToClaudeRunSource(source, escapeHTML(trimmed), {
           fallbackText: trimmed,
@@ -3326,13 +3401,16 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         metadata: descriptor.metadata,
       });
       claudeAgentSession = agentSession;
+      runningClaudeTurnByLane.set(contextKey, {
+        descriptorId: descriptor.id,
+        agentSessionId: agentSession.id,
+        startedAt: turnStartedAt,
+      });
       const provisionalTitle = provisionalClaudeTitle(text);
       if (provisionalTitle && isGenericClaudeDisplayName(descriptor.displayName, contextKey)) {
-        descriptor = { ...descriptor, displayName: provisionalTitle };
-        claudeSessions.set(contextKey, descriptor);
+        storeTurnDescriptor({ ...descriptor, displayName: provisionalTitle });
         agentSessions.updateDisplayName(agentSession.id, provisionalTitle);
         persistAgentSessionState();
-        persistClaudeSession(contextKey, descriptor);
       }
       agentJobId = jobId;
       startAgentJob(agentSession.id, jobId);
@@ -3370,17 +3448,15 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             pendingAssistantProgressText = "";
             break;
           case "session_title_changed":
-            descriptor = { ...descriptor, displayName: cleanProviderSessionTitle(event.title) };
-            claudeSessions.set(contextKey, descriptor);
+            storeTurnDescriptor({ ...descriptor, displayName: cleanProviderSessionTitle(event.title) });
             agentSessions.updateDisplayName(agentSession.id, descriptor.displayName ?? event.title);
             persistAgentSessionState();
-            persistClaudeSession(contextKey, descriptor);
             break;
           case "tool_started":
             await flushPendingClaudeAssistantProgress();
             if (registry.getProgressDelivery(contextKey) !== "none" && config.toolVerbosity === "all") {
               const line = event.text ? `Claude started ${event.toolName}: ${event.text}` : `Claude started ${event.toolName}`;
-              if (isProviderForeground(contextKey, "claude")) {
+              if (turnForeground()) {
                 await replyToClaudeRunSource(source, escapeHTML(line), { fallbackText: line, messageThreadId });
               } else {
                 bufferClaudeOutput("tool", line, false);
@@ -3404,7 +3480,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
               break;
             }
             const message = `Claude tool failed: ${event.toolName}${event.text ? `: ${event.text}` : ""}`;
-            if (isProviderForeground(contextKey, "claude")) {
+            if (turnForeground()) {
               await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
             } else {
               bufferClaudeOutput("tool", message, true);
@@ -3454,11 +3530,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           )
           ? refreshed.displayName
           : descriptor.displayName;
-        descriptor = {
+        storeTurnDescriptor({
           ...refreshed,
           displayName: refreshedDisplayName,
-        };
-        claudeSessions.set(contextKey, descriptor);
+        });
         if (providerSessionChanged && refreshed.providerSessionId) {
           agentSessions.updateProviderSessionId(agentSession.id, refreshed.providerSessionId);
         }
@@ -3467,7 +3542,6 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         }
         agentSessions.updateMetadata(agentSession.id, refreshed.metadata);
         persistAgentSessionState();
-        persistClaudeSession(contextKey, descriptor);
       } catch {
         // Non-fatal: keep the existing descriptor if the adapter cannot be queried.
       }
@@ -3502,7 +3576,16 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       };
 
       let finalDelivered = false;
-      if (finalTextToDeliver) {
+      if (turnBackgrounded()) {
+        // Switched away mid-turn: the answer goes out straight away, named, so it
+        // is never mistaken for the selected session's reply.
+        const header = `${backgroundTurnLabel()}, finished after ${formatDuration(Date.now() - turnStartedAt)}.`;
+        await deliverClaudeFinal(
+          finalTextToDeliver || "No further text. /replay with its session selected shows what it did.",
+          header,
+        );
+        finalDelivered = Boolean(finalTextToDeliver);
+      } else if (finalTextToDeliver) {
         if (isProviderForeground(contextKey, "claude")) {
           await deliverClaudeFinal(finalTextToDeliver);
           finalDelivered = true;
@@ -3534,7 +3617,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       if (descriptor && finalDelivered) {
         clearDeliveredCompletionFromBuffer(claudeAgentSession?.id ?? descriptor.id, finalTextToDeliver);
       }
-      if (descriptor) {
+      if (descriptor && !turnBackgrounded()) {
         persistClaudeSession(contextKey, descriptor);
       }
       completedSuccessfully = true;
@@ -3542,6 +3625,14 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     } catch (error) {
       console.error("Claude prompt failed:", error);
       bridgeLog("error", `claude turn failed lane=${contextKey}: ${String(error)}`);
+      if (error instanceof PromptNotDeliveredError && turnBackgrounded()) {
+        // The lane's queue now feeds another session, so a retry cannot go there.
+        await sendBackgroundTurnText(
+          `${backgroundTurnLabel()}: Claude did not accept the message. Select this session with /use and send the message again.`,
+        );
+        await clearClaudeRunReaction(source);
+        return;
+      }
       if (error instanceof PromptNotDeliveredError) {
         const deliveryFailures = (source.queueEntry?.deliveryFailures ?? 0) + 1;
         const terminalCommandFailure = /Unknown command:|Args from unknown skill:/i.test(error.message);
@@ -3596,7 +3687,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
       const message = `Claude failed: ${friendlyErrorText(error)}`;
-      if (isProviderForeground(contextKey, "claude")) {
+      if (turnBackgrounded()) {
+        await sendBackgroundTurnText(
+          `${backgroundTurnLabel()}, stopped after ${formatDuration(Date.now() - turnStartedAt)}.
+
+${message}`,
+        );
+      } else if (isProviderForeground(contextKey, "claude")) {
         await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
       } else {
         bufferClaudeOutput("error", message, true);
@@ -3631,6 +3728,23 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         "turn",
         `end lane=${contextKey} ok=${completedSuccessfully} durationMs=${Date.now() - turnStartedAt} queueDepth=${queuedClaudePrompts.depth(contextKey)}`,
       );
+      if (descriptor && backgroundClaudeTurns.has(descriptor.id)) {
+        // A background turn does not own the lane: its busy state and queue belong
+        // to whatever session is selected now. It only cleans up after itself.
+        const finished = descriptor;
+        backgroundClaudeTurns.delete(finished.id);
+        if (!(typeof claudeAdapter.isParked === "function" && claudeAdapter.isParked(finished.id))) {
+          backgroundClaudeSessions.delete(finished.id);
+          void disposeClaudeDescriptor(finished).catch((disposeError) => {
+            console.warn("Failed to dispose finished background Claude session", disposeError);
+          });
+        }
+        bridgeLog("background", `background claude turn ended session=${finished.id} lane=${contextKey} ok=${completedSuccessfully}`);
+        return;
+      }
+      if (descriptor && runningClaudeTurnByLane.get(contextKey)?.descriptorId === descriptor.id) {
+        runningClaudeTurnByLane.delete(contextKey);
+      }
       markProviderBusy(contextKey, "claude", false);
       busyState.processing = false;
       try {
@@ -4417,6 +4531,158 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     return lines.filter((line): line is string => Boolean(line)).join("\n");
   };
 
+  /**
+   * "Background Claude, session 3 "title"", numbered from the /sessions list the
+   * user last saw so /use with that number reaches it. Rebuilds the list when the
+   * session is not on it, and keeps the rebuilt list so the number stays valid.
+   */
+  const describeBackgroundClaudeTurn = (
+    contextKey: TelegramContextKey,
+    descriptor: AgentSessionDescriptor,
+    agentSessionId: string,
+  ): string => {
+    const matches = (pick: ProviderSessionPick): boolean =>
+      pick.provider === "claude" && (
+        providerSessionPickAgentId(pick) === agentSessionId ||
+        (Boolean(descriptor.providerSessionId) && pick.providerSessionId === descriptor.providerSessionId)
+      );
+    let index = pendingAgentSessionPicks.get(contextKey)?.findIndex(matches) ?? -1;
+    if (index < 0) {
+      try {
+        const picks = buildRecentProviderSessionPicks(contextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
+        index = picks.findIndex(matches);
+        if (index >= 0) {
+          pendingAgentSessionPicks.set(contextKey, picks);
+        }
+      } catch {
+        index = -1;
+      }
+    }
+    const raw = cleanProviderSessionTitle(
+      descriptor.displayName || agentSessions.getSession(agentSessionId)?.displayName || "",
+    ) || `Claude ${descriptor.providerSessionId?.slice(0, 8) ?? descriptor.id}`;
+    const title = raw.length > 60 ? `${raw.slice(0, 57).trimEnd()}...` : raw;
+    return index >= 0
+      ? `Background Claude, session ${index + 1} "${title}"`
+      : `Background Claude session "${title}"`;
+  };
+
+  /**
+   * Moves the lane's running Claude turn to the background so the user can work in
+   * another session meanwhile. Returns why it refused, or undefined once the lane
+   * is free (also when the turn finished on its own during the check).
+   */
+  const moveRunningClaudeTurnToBackground = async (
+    contextKey: TelegramContextKey,
+    options: { swapping: boolean },
+  ): Promise<string | undefined> => {
+    const running = runningClaudeTurnByLane.get(contextKey);
+    const current = claudeSessions.get(contextKey);
+    if (!claudeAdapter || !running || !current || current.id !== running.descriptorId) {
+      return "Claude is still starting this turn. Try the switch again in a few seconds.";
+    }
+    const queued = queuedClaudePrompts.depth(contextKey);
+    if (queued > 0) {
+      return `${queued === 1 ? "One message is" : `${queued} messages are`} queued for the running Claude session. Let them run first, or drop them with /qdrop, then switch.`;
+    }
+    const runningTurns = runningClaudeTurnByLane.size + backgroundClaudeTurns.size;
+    if (!options.swapping && runningTurns >= maxParallelClaudeTurns) {
+      return `Claude is already running ${runningTurns} turns at once, and the limit is ${maxParallelClaudeTurns}. Wait for one to finish, or stop one with /stop and its /sessions number, then switch.`;
+    }
+    let descriptor = current;
+    try {
+      const info = await claudeAdapter.getSessionInfo(current.id);
+      descriptor = { ...info, displayName: current.displayName ?? info.displayName };
+    } catch {
+      // Keep the lane's copy.
+    }
+    if (runningClaudeTurnByLane.get(contextKey)?.descriptorId !== current.id) {
+      // The turn ended while we looked; the lane is already free.
+      return undefined;
+    }
+    // A new session learns its real Claude id during its first turn. Record it now
+    // so /sessions shows the running conversation once, marked running.
+    if (
+      descriptor.providerSessionId &&
+      agentSessions.getSession(running.agentSessionId)?.providerSessionId !== descriptor.providerSessionId
+    ) {
+      agentSessions.updateProviderSessionId(running.agentSessionId, descriptor.providerSessionId);
+      persistAgentSessionState();
+    }
+    backgroundClaudeTurns.set(current.id, {
+      contextKey,
+      descriptor,
+      agentSessionId: running.agentSessionId,
+      startedAt: running.startedAt,
+    });
+    backgroundClaudeSessions.set(current.id, { contextKey, descriptor });
+    runningClaudeTurnByLane.delete(contextKey);
+    markProviderBusy(contextKey, "claude", false);
+    getBusyState(contextKey).processing = false;
+    bridgeLog("background", `claude turn moved to background session=${current.id} lane=${contextKey} running=${runningTurns}`);
+    return undefined;
+  };
+
+  const findBackgroundClaudeTurnId = async (
+    contextKey: TelegramContextKey,
+    pick: ProviderSessionPick,
+  ): Promise<string | undefined> => {
+    if (pick.provider !== "claude") {
+      return undefined;
+    }
+    for (const [id, entry] of backgroundClaudeTurns) {
+      if (entry.contextKey !== contextKey) {
+        continue;
+      }
+      if (providerSessionPickAgentId(pick) === entry.agentSessionId) {
+        return id;
+      }
+      // Match on the live id: the descriptor id of a new session never changes,
+      // but its Claude session id does once the first turn reveals it.
+      let providerSessionId = entry.descriptor.providerSessionId;
+      try {
+        providerSessionId = (await claudeAdapter?.getSessionInfo(id))?.providerSessionId ?? providerSessionId;
+      } catch {
+        // Keep the stored id.
+      }
+      if (pick.providerSessionId && providerSessionId === pick.providerSessionId) {
+        return id;
+      }
+    }
+    return undefined;
+  };
+
+  /** Selects a background Claude turn again; the lane is busy with it from here on. */
+  const adoptBackgroundClaudeTurn = (
+    contextKey: TelegramContextKey,
+    descriptorId: string,
+  ): AgentSessionDescriptor | undefined => {
+    const entry = backgroundClaudeTurns.get(descriptorId);
+    if (!entry) {
+      // It finished in the meantime; the caller resumes it like any idle session.
+      return undefined;
+    }
+    const previous = claudeSessions.get(contextKey);
+    backgroundClaudeTurns.delete(descriptorId);
+    backgroundClaudeSessions.delete(descriptorId);
+    if (previous && previous.id !== descriptorId) {
+      void retireClaudeDescriptor(contextKey, previous).catch((error) => {
+        console.warn("Failed to retire the previous Claude session", error);
+      });
+    }
+    claudeSessions.set(contextKey, entry.descriptor);
+    persistClaudeSession(contextKey, entry.descriptor);
+    runningClaudeTurnByLane.set(contextKey, {
+      descriptorId,
+      agentSessionId: entry.agentSessionId,
+      startedAt: entry.startedAt,
+    });
+    markProviderBusy(contextKey, "claude", true);
+    getBusyState(contextKey).processing = true;
+    bridgeLog("background", `background claude turn adopted back session=${descriptorId} lane=${contextKey}`);
+    return entry.descriptor;
+  };
+
   const selectUnifiedAgentSession = async (
     ctx: Context,
     contextKey: TelegramContextKey,
@@ -4436,22 +4702,39 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const listNumber = targetPick ? picks.indexOf(targetPick) + 1 : undefined;
     if (targetPick.provider === "claude") {
       const currentClaude = claudeSessions.get(contextKey);
-      const switchingClaudeSession = currentClaude?.providerSessionId !== targetPick.providerSessionId;
+      const runningTargetId = await findBackgroundClaudeTurnId(contextKey, targetPick);
+      const switchingClaudeSession = runningTargetId !== undefined ||
+        currentClaude?.providerSessionId !== targetPick.providerSessionId;
+      let backgroundNote: string | undefined;
       if (isProviderBusy(contextKey, "claude") && switchingClaudeSession) {
-        const message = "Claude is running. You can switch to the running Claude session, but not to another Claude session until it finishes.";
-        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
-        return true;
+        const leaving = currentClaude;
+        const refusal = await moveRunningClaudeTurnToBackground(contextKey, { swapping: runningTargetId !== undefined });
+        if (refusal) {
+          await safeReply(ctx, escapeHTML(refusal), { fallbackText: refusal });
+          return true;
+        }
+        const leavingTurn = leaving ? backgroundClaudeTurns.get(leaving.id) : undefined;
+        if (leaving && leavingTurn) {
+          backgroundNote = `${describeBackgroundClaudeTurn(contextKey, leavingTurn.descriptor, leavingTurn.agentSessionId)} keeps running. Its answer arrives here with its name in front when it finishes.`;
+        }
       }
 
       const target = await materializeProviderSessionPick(contextKey, targetPick);
       registry.setActiveProvider(contextKey, "claude");
       agentSessions.selectSession(contextKey, target.id);
       persistAgentSessionState();
-      const descriptor = switchingClaudeSession
+      const adopted = runningTargetId !== undefined
+        ? adoptBackgroundClaudeTurn(contextKey, runningTargetId)
+        : undefined;
+      const descriptor = adopted ?? (switchingClaudeSession
         ? await resumeClaudeAgentSession(contextKey, target)
-        : currentClaude ?? await resumeClaudeAgentSession(contextKey, target);
+        : currentClaude ?? await resumeClaudeAgentSession(contextKey, target));
       await flushBufferedPriority(ctx, contextKey, descriptor, parseContextKey(contextKey).messageThreadId);
-      const message = formatProviderSessionSelectionMessage(target, listNumber);
+      const selection = formatProviderSessionSelectionMessage(target, listNumber);
+      const adoptedNote = adopted
+        ? "This session is still working. Its answer arrives here as usual; use /replay for what it did while you were away."
+        : undefined;
+      const message = [backgroundNote, selection, adoptedNote].filter(Boolean).join("\n\n");
       await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
       return true;
     }
@@ -5216,6 +5499,39 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
   bot.command(["abort", "stop"], async (ctx) => {
     const rawContextKey = contextKeyFromCtx(ctx);
+    const stopArgument = getCommandArgument(ctx).trim();
+    if (rawContextKey && stopArgument && claudeAdapter) {
+      // /stop <n>: stop a Claude turn left running in the background, by its
+      // /sessions number, without switching to it.
+      const picks = pendingAgentSessionPicks.get(rawContextKey) ??
+        buildRecentProviderSessionPicks(rawContextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
+      const pick = resolveProviderSessionPick(stopArgument, picks, agentSessions.getLane(rawContextKey)?.selectedSessionId);
+      const backgroundId = pick ? await findBackgroundClaudeTurnId(rawContextKey, pick) : undefined;
+      const background = backgroundId ? backgroundClaudeTurns.get(backgroundId) : undefined;
+      if (backgroundId && background) {
+        const label = describeBackgroundClaudeTurn(rawContextKey, background.descriptor, background.agentSessionId);
+        try {
+          bridgeLog("abort", `/stop ${stopArgument} background session=${backgroundId} lane=${rawContextKey}`);
+          await claudeAdapter.abort(backgroundId);
+          const message = `Stop sent to ${label}.`;
+          await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        } catch (error) {
+          await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+            fallbackText: `Failed: ${friendlyErrorText(error)}`,
+          });
+        }
+        return;
+      }
+      const selectedId = agentSessions.getLane(rawContextKey)?.selectedSessionId;
+      if (!pick || providerSessionPickAgentId(pick) !== selectedId) {
+        const message = pick
+          ? "That session is not running in the background. /sessions marks running sessions; /stop without a number stops the selected one."
+          : "Unknown session number. Run /sessions, then /stop with the number of a running session.";
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+      // The number names the selected session: a plain /stop.
+    }
     if (rawContextKey && isClaudeActive(rawContextKey)) {
       const descriptor = claudeSessions.get(rawContextKey);
       if (!descriptor || !claudeAdapter) {
