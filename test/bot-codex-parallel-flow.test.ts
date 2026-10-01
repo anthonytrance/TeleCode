@@ -5,7 +5,7 @@ import path from "node:path";
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
-import type { CodexSessionCallbacks, CodexSessionInfo } from "../src/codex-session.js";
+import type { CodexSessionCallbacks, CodexSessionInfo, CodexThreadGoal, CodexThreadGoalSetParams } from "../src/codex-session.js";
 import type { TeleCodeConfig } from "../src/config.js";
 import { SessionRegistry } from "../src/session-registry.js";
 
@@ -41,7 +41,15 @@ const holds = new Map<string, () => void>();
 /** Prompts containing "hold" wait until released by name; others finish at once. */
 class FakeRuntime {
   processing = false;
+  kind: "prompt" | "goal" | null = null;
   aborted = false;
+  goal: CodexThreadGoal | null = null;
+  readonly pauseActiveGoal = vi.fn(async () => {
+    this.setGoalStatus("paused");
+    holds.get(this.goalHold)?.();
+    return this.goal;
+  });
+  private goalHold = "";
   readonly dispose = vi.fn();
   readonly prompts: string[] = [];
 
@@ -65,8 +73,60 @@ class FakeRuntime {
     return this.processing;
   }
 
-  getProcessingKind(): "prompt" | null {
-    return this.processing ? "prompt" : null;
+  getProcessingKind(): "prompt" | "goal" | null {
+    return this.processing ? this.kind : null;
+  }
+
+  async getThreadGoal(): Promise<CodexThreadGoal | null> {
+    return this.goal;
+  }
+
+  async setThreadGoal(params: CodexThreadGoalSetParams): Promise<CodexThreadGoal | null> {
+    if (params.status) {
+      this.setGoalStatus(params.status);
+    }
+    return this.goal;
+  }
+
+  async clearThreadGoal(): Promise<boolean> {
+    const had = Boolean(this.goal);
+    this.goal = null;
+    return had;
+  }
+
+  /** Goal objectives name a hold too; the goal completes when it is released. */
+  async runThreadGoal(params: CodexThreadGoalSetParams, callbacks: CodexSessionCallbacks): Promise<CodexThreadGoal | null> {
+    this.goalHold = params.objective?.match(/hold \w+/)?.[0] ?? "";
+    this.goal = {
+      threadId: this.threadId ?? "",
+      objective: params.objective ?? "",
+      status: "active",
+      tokenBudget: null,
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    this.prompts.push(`goal ${this.goalHold}`);
+    this.processing = true;
+    this.kind = "goal";
+    try {
+      await new Promise<void>((resolve) => holds.set(this.goalHold, resolve));
+      if (this.goal.status === "active") {
+        this.setGoalStatus("complete");
+        callbacks.onTextDelta(`FINAL goal ${this.goalHold}`, { phase: "final_answer" });
+      }
+      return this.goal;
+    } finally {
+      this.processing = false;
+      this.kind = null;
+    }
+  }
+
+  private setGoalStatus(status: CodexThreadGoal["status"]): void {
+    if (this.goal) {
+      this.goal = { ...this.goal, status };
+    }
   }
 
   hasActiveThread(): boolean {
@@ -108,6 +168,7 @@ class FakeRuntime {
     const text = (typeof input === "string" ? input : JSON.stringify(input)).match(/(hold \w+|quick \w+)/)?.[1] ?? "?";
     this.prompts.push(text);
     this.processing = true;
+    this.kind = "prompt";
     try {
       if (text.startsWith("hold")) {
         await new Promise<void>((resolve) => holds.set(text, resolve));
@@ -119,6 +180,7 @@ class FakeRuntime {
       callbacks.onAgentEnd();
     } finally {
       this.processing = false;
+      this.kind = null;
     }
   }
 
@@ -215,7 +277,90 @@ describe("background Codex turns", () => {
     expect(runtimes[1].aborted).toBe(false);
     await waitFor(() => runtimes[0].dispose.mock.calls.length === 1);
   });
+
+  it("keeps the running turn going when /new starts a fresh session", async () => {
+    const { bot, sent } = createHarness();
+    await bot.handleUpdate(textUpdate(1, "hold A"));
+    await waitFor(() => holds.has("hold A"));
+
+    await bot.handleUpdate(textUpdate(2, "/new"));
+    await waitFor(() => sent.some((text) => text.includes("New Codex session ready")));
+    const reply = sent.find((text) => text.includes("New Codex session ready"))!;
+    expect(reply).toMatch(/^Background Codex, session \d+ .* keeps running/);
+    expect(runtimes).toHaveLength(2);
+    expect(runtimes[1].threadId).toBeNull();
+
+    await bot.handleUpdate(textUpdate(3, "quick two"));
+    await waitFor(() => sent.includes("FINAL quick two"));
+    expect(runtimes[1].prompts).toEqual(["quick two"]);
+    expect(runtimes[1].threadId).not.toBe(runtimes[0].threadId);
+
+    holds.get("hold A")!();
+    await waitFor(() => sent.some((text) => /^Background Codex.*, finished after [\s\S]*FINAL hold A/.test(text)));
+  });
+
+  it("moves a running goal to the background and reports it when the goal completes", async () => {
+    const { bot, sent } = createHarness();
+    await startHeldGoalInSecondSession(bot, sent);
+
+    await bot.handleUpdate(textUpdate(10, "/use previous"));
+    await waitFor(() => sent.some((text) => text.includes("keeps running")));
+    expect(runtimes).toHaveLength(2);
+
+    holds.get("hold G")!();
+    await waitFor(() => sent.some((text) => text.includes("FINAL goal hold G")));
+    const finished = sent.find((text) => text.includes("FINAL goal hold G"))!;
+    expect(finished).toMatch(/^Background Codex, session \d+ .*, finished after /);
+    await waitFor(() => runtimes[0].dispose.mock.calls.length === 1);
+  });
+
+  it("brings a background goal back with /use, where /goal status sees it running", async () => {
+    const { bot, sent } = createHarness();
+    await startHeldGoalInSecondSession(bot, sent);
+
+    await bot.handleUpdate(textUpdate(10, "/use previous"));
+    await waitFor(() => sent.some((text) => text.includes("keeps running")));
+    await bot.handleUpdate(textUpdate(11, "/use previous"));
+    await waitFor(() => sent.some((text) => text.includes("This session is still working")));
+
+    const before = sent.length;
+    await bot.handleUpdate(textUpdate(12, "/goal"));
+    await waitFor(() => sent.length > before);
+    expect(sent.at(-1)).not.toContain("not currently attached");
+    expect(sent.at(-1)).toContain("hold G");
+
+    holds.get("hold G")!();
+    await waitFor(() => sent.some((text) => text.includes("FINAL goal hold G")));
+    expect(sent.some((text) => text.includes("finished after"))).toBe(false);
+  });
+
+  it("pauses a background goal with /stop and reports it stopped", async () => {
+    const { bot, sent } = createHarness();
+    await startHeldGoalInSecondSession(bot, sent);
+
+    await bot.handleUpdate(textUpdate(10, "/use previous"));
+    await waitFor(() => sent.some((text) => text.includes("keeps running")));
+    await bot.handleUpdate(textUpdate(11, "/stop previous"));
+    await waitFor(() => sent.some((text) => text.startsWith("Stop sent to Background Codex")));
+    await waitFor(() => sent.some((text) => /^Background Codex.*, stopped after /.test(text)));
+    expect(runtimes[0].pauseActiveGoal).toHaveBeenCalled();
+    expect(runtimes[0].aborted).toBe(false);
+    expect(runtimes[0].goal?.status).toBe("paused");
+    await waitFor(() => runtimes[0].dispose.mock.calls.length === 1);
+  });
 });
+
+/** Like startHeldTurnInSecondSession, but session 2 runs a goal that holds. */
+async function startHeldGoalInSecondSession(bot: ReturnType<typeof createBot>, sent: string[]): Promise<void> {
+  await bot.handleUpdate(textUpdate(1, "quick one"));
+  await waitFor(() => sent.includes("FINAL quick one"));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const beforeNew = sent.length;
+  await bot.handleUpdate(textUpdate(2, "/new"));
+  await waitFor(() => sent.length > beforeNew);
+  await bot.handleUpdate(textUpdate(3, "/goal hold G"));
+  await waitFor(() => holds.has("hold G"));
+}
 
 /**
  * Session 1 ("thread-1") runs a quick turn, /new opens session 2, and session 2

@@ -1861,6 +1861,23 @@ describe("Claude bot flow", () => {
       expect(stopped).toContain("second conversation");
       expect(stopped).toContain("Claude turn aborted");
     });
+
+    it("keeps the running turn going when /new starts a fresh session", async () => {
+      const { bot, sent } = await createTestBot(tempDir);
+      const { forkSessionId } = await startLongTurnOnFork(bot, sent);
+
+      await bot.handleUpdate(textUpdate(5, "/new"));
+      await waitFor(() => sent.some((entry) => entry.text?.includes("New Claude session selected")));
+      const reply = sent.find((entry) => entry.text?.includes("New Claude session selected"))?.text ?? "";
+      expect(reply).toMatch(/^Background Claude, session \d+ "second conversation" keeps running/u);
+
+      await bot.handleUpdate(textUpdate(6, "fresh question"));
+      await waitFor(() => sent.some((entry) => entry.text === "mock reply to fresh question"));
+      expect(mockClaude.promptSessionIds.at(-1)).not.toBe(forkSessionId);
+
+      mockClaude.releaseBlockedPrompt();
+      await waitFor(() => sent.some((entry) => /^Background Claude.*finished after[\s\S]*mock reply to long task on the fork/u.test(entry.text ?? "")));
+    });
   });
 });
 

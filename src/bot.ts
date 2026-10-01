@@ -922,7 +922,14 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
    */
   const backgroundCodexTurns = new Map<
     CodexSessionRuntime,
-    { contextKey: TelegramContextKey; agentSessionId: string; threadId: string | null; startedAt: number }
+    {
+      contextKey: TelegramContextKey;
+      agentSessionId: string;
+      threadId: string | null;
+      startedAt: number;
+      /** /stop asked for it; a goal pauses cleanly, so this marks it "stopped". */
+      stopRequested: boolean;
+    }
   >();
 
   const maxParallelCodexTurns = Math.max(1, config.codexMaxParallelTurns ?? 3);
@@ -3024,7 +3031,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
       if (turnBackgrounded()) {
         const elapsed = formatDuration(Date.now() - turnStartedAt);
-        const header = completedSuccessfully
+        const header = completedSuccessfully && !backgroundCodexTurns.get(session)?.stopRequested
           ? `${backgroundTurnLabel()}, finished after ${elapsed}.`
           : `${backgroundTurnLabel()}, stopped after ${elapsed}.`;
         const body = backgroundCompletionText && finalDelivery.disposition === "buffered"
@@ -4710,15 +4717,15 @@ ${message}`,
     const running = runningClaudeTurnByLane.get(contextKey);
     const current = claudeSessions.get(contextKey);
     if (!claudeAdapter || !running || !current || current.id !== running.descriptorId) {
-      return "Claude is still starting this turn. Try the switch again in a few seconds.";
+      return "Claude is still starting this turn. Try again in a few seconds.";
     }
     const queued = queuedClaudePrompts.depth(contextKey);
     if (queued > 0) {
-      return `${queued === 1 ? "One message is" : `${queued} messages are`} queued for the running Claude session. Let them run first, or drop them with /qdrop, then switch.`;
+      return `${queued === 1 ? "One message is" : `${queued} messages are`} queued for the running Claude session. Let them run first, or drop them with /qdrop, then try again.`;
     }
     const runningTurns = runningClaudeTurnByLane.size + backgroundClaudeTurns.size;
     if (!options.swapping && runningTurns >= maxParallelClaudeTurns) {
-      return `Claude is already running ${runningTurns} turns at once, and the limit is ${maxParallelClaudeTurns}. Wait for one to finish, or stop one with /stop and its /sessions number, then switch.`;
+      return `Claude is already running ${runningTurns} turns at once, and the limit is ${maxParallelClaudeTurns}. Wait for one to finish, or stop one with /stop and its /sessions number, then try again.`;
     }
     let descriptor = current;
     try {
@@ -4826,17 +4833,14 @@ ${message}`,
     const running = runningCodexTurnByLane.get(contextKey);
     const runtime = registry.get(contextKey);
     if (!running || !runtime || running.runtime !== runtime) {
-      return "Codex is still starting this turn. Try the switch again in a few seconds.";
-    }
-    if (runtime.getProcessingKind?.() === "goal") {
-      return "A Codex goal is running here. Goals can't move to the background yet; stop it with /stop first, or wait for it.";
+      return "Codex is still starting this turn. Try again in a few seconds.";
     }
     if (queuedPrompts.has(contextKey)) {
-      return "A message is queued for the running Codex session. Let it run first, or drop it with /qdrop, then switch.";
+      return "A message is queued for the running Codex session. Let it run first, or drop it with /qdrop, then try again.";
     }
     const runningTurns = runningCodexTurnByLane.size + backgroundCodexTurns.size;
     if (!options.swapping && runningTurns >= maxParallelCodexTurns) {
-      return `Codex is already running ${runningTurns} turns at once, and the limit is ${maxParallelCodexTurns}. Wait for one to finish, or stop one with /stop and its /sessions number, then switch.`;
+      return `Codex is already running ${runningTurns} turns at once, and the limit is ${maxParallelCodexTurns}. Wait for one to finish, or stop one with /stop and its /sessions number, then try again.`;
     }
     registry.detach(contextKey);
     codexTurnBackgroundHooks.get(runtime)?.();
@@ -4845,6 +4849,7 @@ ${message}`,
       agentSessionId: running.agentSessionId,
       threadId: runtime.getInfo().threadId,
       startedAt: running.startedAt,
+      stopRequested: false,
     });
     runningCodexTurnByLane.delete(contextKey);
     markProviderBusy(contextKey, "codex", false);
@@ -5574,23 +5579,33 @@ ${message}`,
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
         return;
       }
-      if (isProviderBusy(rawContextKey, "claude")) {
-        await safeReply(ctx, escapeHTML("Cannot create a new Claude session while a prompt is running."), {
-          fallbackText: "Cannot create a new Claude session while a prompt is running.",
-        });
-        return;
-      }
       const requestedModel = parseClaudeModelArgument(remainingArg);
       if (remainingArg && !requestedModel) {
         const message = "Usage: /new claude, /new claude fable, /new claude sonnet, /new claude opus, /new claude haiku, or /new claude default.";
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
         return;
       }
+      let backgroundNote: string | undefined;
+      if (isProviderBusy(rawContextKey, "claude")) {
+        const leaving = claudeSessions.get(rawContextKey);
+        const refusal = await moveRunningClaudeTurnToBackground(rawContextKey, { swapping: false });
+        if (refusal) {
+          await safeReply(ctx, escapeHTML(refusal), { fallbackText: refusal });
+          return;
+        }
+        const leavingTurn = leaving ? backgroundClaudeTurns.get(leaving.id) : undefined;
+        if (leavingTurn) {
+          backgroundNote = `${describeBackgroundClaudeTurn(rawContextKey, leavingTurn.descriptor, leavingTurn.agentSessionId)} keeps running. Its answer arrives here with its name in front when it finishes.`;
+        }
+      }
       registry.setActiveProvider(rawContextKey, "claude");
       try {
         const descriptor = await createFreshClaudeSession(rawContextKey, { model: requestedModel });
         const model = String(descriptor.metadata?.model ?? registry.getClaudeDefaultModel());
-        const message = `New Claude session selected with model ${await describeClaudeModel(model)}. The next normal message will use it.`;
+        const message = [
+          backgroundNote,
+          `New Claude session selected with model ${await describeClaudeModel(model)}. The next normal message will use it.`,
+        ].filter(Boolean).join("\n\n");
         await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       } catch (error) {
         const message = `Claude model change failed: ${friendlyErrorText(error)}`;
@@ -5607,12 +5622,27 @@ ${message}`,
       return;
     }
 
-    const { contextKey, session } = contextSession;
+    const { contextKey } = contextSession;
+    let session = contextSession.session;
+    let backgroundNote: string | undefined;
     if (isProviderBusy(contextKey, "codex")) {
-      await safeReply(ctx, escapeHTML("Cannot create a new thread while a prompt is running."), {
-        fallbackText: "Cannot create a new thread while a prompt is running.",
-      });
-      return;
+      const leaving = registry.get(contextKey);
+      const refusal = moveRunningCodexTurnToBackground(contextKey, { swapping: false });
+      if (refusal) {
+        await safeReply(ctx, escapeHTML(refusal), { fallbackText: refusal });
+        return;
+      }
+      const leavingTurn = leaving ? backgroundCodexTurns.get(leaving) : undefined;
+      if (leavingTurn) {
+        backgroundNote = `${describeBackgroundCodexTurn(contextKey, leavingTurn)} keeps running. Its answer arrives here with its name in front when it finishes.`;
+      }
+      // A fresh runtime for the lane, which must not resume the thread the
+      // background turn is still running.
+      const fresh = await getContextSession(ctx, { deferThreadStart: true, skipThreadResume: true });
+      if (!fresh) {
+        return;
+      }
+      session = fresh.session;
     }
 
     if (requestedProvider === "codex") {
@@ -5621,6 +5651,9 @@ ${message}`,
 
     const workspaceArg = remainingArg;
     if (workspaceArg) {
+      if (backgroundNote) {
+        await safeReply(ctx, escapeHTML(backgroundNote), { fallbackText: backgroundNote });
+      }
       if (/^(?:choose|list|workspace|workspaces)$/i.test(workspaceArg)) {
         await showWorkspacePicker(ctx, contextKey, session);
         return;
@@ -5638,8 +5671,10 @@ ${message}`,
       const label = isTopicContext(contextKey)
         ? "New Codex session ready for this topic. The thread will initialize with your next message."
         : "New Codex session ready. The thread will initialize with your next message.";
-      const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
-      const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
+      const notePlain = backgroundNote ? `${backgroundNote}\n\n` : "";
+      const noteHtml = backgroundNote ? `${escapeHTML(backgroundNote)}\n\n` : "";
+      const plainText = `${notePlain}${label}\n\n${renderSessionInfoPlain(info)}`;
+      const html = `${noteHtml}<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
       await safeReply(ctx, html, { fallbackText: plainText });
     } catch (error) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
@@ -5756,7 +5791,12 @@ ${message}`,
         const label = describeBackgroundCodexTurn(rawContextKey, backgroundCodexTurn);
         try {
           bridgeLog("abort", `/stop ${stopArgument} background codex thread=${backgroundCodexTurn.threadId} lane=${rawContextKey}`);
-          await backgroundCodex.abort();
+          backgroundCodexTurn.stopRequested = true;
+          if (backgroundCodex.getProcessingKind?.() === "goal" && backgroundCodex.pauseActiveGoal) {
+            await backgroundCodex.pauseActiveGoal();
+          } else {
+            await backgroundCodex.abort();
+          }
           const message = `Stop sent to ${label}.`;
           await safeReply(ctx, escapeHTML(message), { fallbackText: message });
         } catch (error) {
