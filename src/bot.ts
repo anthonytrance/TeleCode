@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn as spawnProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { readTranscriptWindow, type TranscriptWindow } from "./transcript-window.js";
-import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -9069,14 +9069,69 @@ ${message}`,
     }
   });
 
+  /** Claude reads uploads with its own tools, so a document or photo is saved to
+   * the inbox and its path is handed over with the caption. Unlike Codex uploads,
+   * the file is kept after the turn because later turns often return to it. */
+  async function forwardUploadToClaude(
+    ctx: Context,
+    contextKey: string,
+    fileId: string,
+    originalName: string,
+    mimeType: string,
+    fileSize: number | undefined,
+  ): Promise<void> {
+    const chatId = ctx.chat!.id;
+    if (fileSize && fileSize > config.maxFileSize) {
+      const sizeMB = Math.round(fileSize / 1024 / 1024);
+      const maxMB = Math.round(config.maxFileSize / 1024 / 1024);
+      await safeReply(ctx, `<b>File too large</b> (${sizeMB} MB, max ${maxMB} MB)`, {
+        fallbackText: `File too large (${sizeMB} MB, max ${maxMB} MB)`,
+      });
+      return;
+    }
+
+    let tempFilePath: string | undefined;
+    let stagedFile: StagedFile;
+    try {
+      await ctx.api.sendChatAction(chatId, "typing").catch(() => {});
+      tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, fileId, config.maxFileSize);
+      const buffer = await readFile(tempFilePath);
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      stagedFile = await stageFile(buffer, originalName, mimeType, {
+        workspace: config.workspace,
+        turnId: `claude-${stamp}`,
+        maxFileSize: config.maxFileSize,
+      });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed to receive file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Failed to receive file: ${friendlyErrorText(error)}`,
+      });
+      return;
+    } finally {
+      if (tempFilePath) {
+        await unlink(tempFilePath).catch(() => {});
+      }
+    }
+    void pruneClaudeInbox(path.dirname(path.dirname(stagedFile.localPath))).catch(() => {});
+
+    const caption = ctx.message?.caption?.trim();
+    const fileNote = `[The user sent a file via Telegram: ${stagedFile.safeName} (${mimeType}), saved at: ${stagedFile.localPath}. Open it from there with your own tools.]`;
+    const promptText = caption ? `${caption}\n\n${fileNote}` : `The user sent a file without a message.\n\n${fileNote}`;
+    lastPromptInput.set(contextKey, caption || stagedFile.safeName);
+    await setReaction(ctx, "👀");
+    startClaudePrompt(ctx, contextKey, chatId, promptText);
+  }
+
   bot.on("message:photo", async (ctx) => {
     const rawContextKey = contextKeyFromCtx(ctx);
     if (!rawContextKey) {
       return;
     }
     if (isClaudeActive(rawContextKey)) {
-      const message = "Photo input is not supported for Claude sessions yet. Send text, or use /codex for Codex image handling.";
-      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      if (photo) {
+        await forwardUploadToClaude(ctx, rawContextKey, photo.file_id, `photo-${Date.now()}.jpg`, "image/jpeg", photo.file_size);
+      }
       return;
     }
 
@@ -9140,8 +9195,15 @@ ${message}`,
       return;
     }
     if (isClaudeActive(rawContextKey)) {
-      const message = "Document input is not supported for Claude sessions yet. Send text, or use /codex for Codex file handling.";
-      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      const doc = ctx.message.document;
+      await forwardUploadToClaude(
+        ctx,
+        rawContextKey,
+        doc.file_id,
+        doc.file_name ?? "document",
+        doc.mime_type ?? "application/octet-stream",
+        doc.file_size,
+      );
       return;
     }
 
@@ -9850,6 +9912,23 @@ async function archiveVoiceAudio(workspace: string, tempPath: string): Promise<s
     return target;
   } catch {
     return undefined;
+  }
+}
+
+const CLAUDE_UPLOAD_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+
+/** Claude uploads stay on disk for later turns; drop the ones older than two weeks. */
+async function pruneClaudeInbox(inboxRoot: string): Promise<void> {
+  const cutoff = Date.now() - CLAUDE_UPLOAD_MAX_AGE_MS;
+  for (const entry of await readdir(inboxRoot)) {
+    if (!entry.startsWith("claude-")) {
+      continue;
+    }
+    const dir = path.join(inboxRoot, entry);
+    const s = await stat(dir).catch(() => null);
+    if (s?.isDirectory() && s.mtimeMs < cutoff) {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 

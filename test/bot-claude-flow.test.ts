@@ -1560,6 +1560,43 @@ describe("Claude bot flow", () => {
     await waitFor(() => sent.some((entry) => entry.text?.includes("1 artifact generated")));
   });
 
+  it("hands documents and photos to Claude as saved files with the caption", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("hello world")));
+    try {
+      const { bot, sent } = await createTestBot(tempDir);
+
+      await bot.handleUpdate(textUpdate(1, "/claude"));
+      await bot.handleUpdate({
+        update_id: 2,
+        message: {
+          ...textMessage(2, ""),
+          text: undefined,
+          caption: "read this",
+          document: { file_id: "doc1", file_unique_id: "doc1", file_name: "notes.docx", mime_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", file_size: 11 },
+        },
+      });
+      await waitFor(() => mockClaude.prompts.some((prompt) => prompt.startsWith("read this")));
+      const docPrompt = mockClaude.prompts.find((prompt) => prompt.startsWith("read this")) ?? "";
+      const savedPath = docPrompt.match(/saved at: (.+?\.docx)\./u)?.[1] ?? "";
+      expect(savedPath).toContain(path.join(".telecode", "inbox", "claude-"));
+      expect(readFileSync(savedPath, "utf8")).toBe("hello world");
+      expect(sent.map((entry) => entry.text ?? "").join(" ")).not.toContain("not supported");
+
+      await waitForAgentSessionsIdle(tempDir);
+      await bot.handleUpdate({
+        update_id: 3,
+        message: {
+          ...textMessage(3, ""),
+          text: undefined,
+          photo: [{ file_id: "pic1", file_unique_id: "pic1", width: 10, height: 10, file_size: 11 }],
+        },
+      });
+      await waitFor(() => mockClaude.prompts.some((prompt) => prompt.startsWith("The user sent a file without a message.")));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("appends outbox instructions to normal prompts but not slash commands", async () => {
     const { bot } = await createTestBot(tempDir);
 
@@ -1900,6 +1937,10 @@ async function createTestBot(workspace: string, overrides: Partial<TeleCodeConfi
     if (method === "sendChatAction" || method === "answerCallbackQuery" || method === "setMessageReaction") {
       sent.push({ method });
       return { ok: true, result: true };
+    }
+    if (method === "getFile") {
+      const fileId = (payload as { file_id?: string }).file_id ?? "file";
+      return { ok: true, result: { file_id: fileId, file_unique_id: fileId, file_size: 11, file_path: `documents/${fileId}.docx` } };
     }
     if (method === "sendDocument") {
       const document = (payload as { document?: { filename?: string } }).document;
