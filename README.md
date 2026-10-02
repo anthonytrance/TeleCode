@@ -82,6 +82,9 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
    | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
    | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
    | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
+   | `VOICE_OPENROUTER_MODEL` | — | OpenRouter audio model tried first for voice transcription, e.g. `qwen/qwen3.8-omni-flash`; local backends stay as fallback |
+   | `VOICE_OPENROUTER_API_KEY` | — | OpenRouter key for voice transcription (falls back to `OPENROUTER_API_KEY`) |
+   | `VOICE_OPENROUTER_PROMPT` | — | Overrides the transcription instruction, e.g. to name the languages you speak |
    | `FASTER_WHISPER_PYTHON` | — | Python binary of a faster-whisper environment for local voice transcription |
    | `FASTER_WHISPER_MODEL` | — | faster-whisper model name (default `tiny`) |
    | `OPENAI_API_KEY` | — | Enables OpenAI Whisper voice transcription fallback |

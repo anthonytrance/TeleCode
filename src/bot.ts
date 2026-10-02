@@ -5528,14 +5528,14 @@ ${message}`,
         [
           "<b>Voice transcription is not available.</b>",
           "",
-          "Set <code>FASTER_WHISPER_PYTHON</code>, install <code>parakeet-coreml</code>, or set <code>OPENAI_API_KEY</code>.",
+          "Set <code>VOICE_OPENROUTER_MODEL</code>, <code>FASTER_WHISPER_PYTHON</code>, install <code>parakeet-coreml</code>, or set <code>OPENAI_API_KEY</code>.",
           "<i>Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.</i>",
         ].join("\n"),
         {
           fallbackText: [
             "Voice transcription is not available.",
             "",
-            "Set FASTER_WHISPER_PYTHON, install parakeet-coreml, or set OPENAI_API_KEY.",
+            "Set VOICE_OPENROUTER_MODEL, FASTER_WHISPER_PYTHON, install parakeet-coreml, or set OPENAI_API_KEY.",
             "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.",
           ].join("\n"),
         },

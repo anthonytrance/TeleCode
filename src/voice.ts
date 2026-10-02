@@ -6,11 +6,11 @@ import { readFile } from "node:fs/promises";
 
 export interface TranscriptionResult {
   text: string;
-  backend: "faster-whisper" | "parakeet" | "openai";
+  backend: TranscriptionBackend;
   durationMs: number;
 }
 
-export type TranscriptionBackend = "faster-whisper" | "parakeet" | "openai";
+export type TranscriptionBackend = "openrouter" | "faster-whisper" | "parakeet" | "openai";
 
 // Minimal interface for the parakeet-coreml engine instance.
 interface ParakeetEngine {
@@ -18,9 +18,21 @@ interface ParakeetEngine {
   transcribe(samples: Float32Array): Promise<unknown>;
 }
 
+const DEFAULT_OPENROUTER_PROMPT =
+  "Transcribe this voice message verbatim. The speaker may switch between languages; " +
+  "write each part in the language actually spoken, do not translate. " +
+  "Mark unclear words with [?]. Output only the transcript.";
+const OPENROUTER_AUDIO_FORMATS: Record<string, string> = {
+  ogg: "ogg", oga: "ogg", opus: "ogg", mp3: "mp3", wav: "wav",
+  m4a: "m4a", aac: "aac", flac: "flac",
+};
 const PARAKEET_SPECIFIER = "parakeet-coreml";
 const FFMPEG_INSTALL_MESSAGE = "ffmpeg not found. Install it with winget install Gyan.FFmpeg";
 const NO_BACKEND_ERROR = `Voice messages require a transcription backend.
+
+Option 0: Use an audio-capable chat model on OpenRouter (local backends stay as fallback):
+  VOICE_OPENROUTER_MODEL=qwen/qwen3.8-omni-flash
+  VOICE_OPENROUTER_API_KEY=sk-or-...
 
 Option 1: Use a faster-whisper Python environment:
   FASTER_WHISPER_PYTHON=/path/to/python
@@ -53,6 +65,18 @@ export function _resetImportHook(): void {
 }
 
 export async function transcribeAudio(filePath: string): Promise<TranscriptionResult> {
+  if (hasOpenRouter()) {
+    try {
+      return await transcribeWithOpenRouter(filePath);
+    } catch (error) {
+      if (!hasLocalOrOpenAIBackend()) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`OpenRouter transcription failed, falling back: ${message}`);
+    }
+  }
+
   if (hasFasterWhisper()) {
     return await transcribeWithFasterWhisper(filePath);
   }
@@ -76,6 +100,10 @@ export async function transcribeAudio(filePath: string): Promise<TranscriptionRe
 export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
   const backends: TranscriptionBackend[] = [];
 
+  if (hasOpenRouter()) {
+    backends.push("openrouter");
+  }
+
   if (hasFasterWhisper()) {
     backends.push("faster-whisper");
   }
@@ -92,6 +120,67 @@ export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
   }
 
   return backends;
+}
+
+function openRouterApiKey(): string {
+  return (process.env.VOICE_OPENROUTER_API_KEY?.trim() || process.env.OPENROUTER_API_KEY?.trim()) ?? "";
+}
+
+function hasOpenRouter(): boolean {
+  return Boolean(process.env.VOICE_OPENROUTER_MODEL?.trim() && openRouterApiKey());
+}
+
+// Parakeet is an optional install, so a fallback is only promised when something
+// cheaper to check is configured; otherwise the OpenRouter error is the useful one.
+function hasLocalOrOpenAIBackend(): boolean {
+  return hasFasterWhisper() || hasOpenAIApiKey();
+}
+
+async function transcribeWithOpenRouter(filePath: string): Promise<TranscriptionResult> {
+  const startedAt = Date.now();
+  const model = process.env.VOICE_OPENROUTER_MODEL?.trim() ?? "";
+  const prompt = process.env.VOICE_OPENROUTER_PROMPT?.trim() || DEFAULT_OPENROUTER_PROMPT;
+  const ext = (path.extname(filePath) || ".ogg").slice(1).toLowerCase();
+  const audio = (await readFile(filePath)).toString("base64");
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${openRouterApiKey()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      reasoning: { effort: "low" },
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          { type: "input_audio", input_audio: { data: audio, format: OPENROUTER_AUDIO_FORMATS[ext] ?? "ogg" } },
+        ],
+      }],
+    }),
+    signal: AbortSignal.timeout(180_000),
+  });
+
+  if (!response.ok) {
+    const errorText = (await response.text().catch(() => "")).trim();
+    throw new Error(
+      `OpenRouter transcription failed (${response.status}): ${errorText || response.statusText || "Unknown error"}`,
+    );
+  }
+
+  const payload = (await response.json()) as { choices?: Array<{ message?: { content?: unknown } }> };
+  const text = payload.choices?.[0]?.message?.content;
+  if (typeof text !== "string" || !text.trim()) {
+    throw new Error("OpenRouter transcription returned no text");
+  }
+
+  return {
+    text: text.trim(),
+    backend: "openrouter",
+    durationMs: Date.now() - startedAt,
+  };
 }
 
 function hasFasterWhisper(): boolean {

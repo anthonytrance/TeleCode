@@ -14,6 +14,8 @@ import {
 describe("voice transcription", () => {
   const originalOpenAIKey = process.env.OPENAI_API_KEY;
   const originalFasterWhisperPython = process.env.FASTER_WHISPER_PYTHON;
+  const openRouterKeys = ["VOICE_OPENROUTER_MODEL", "VOICE_OPENROUTER_API_KEY", "OPENROUTER_API_KEY"] as const;
+  const originalOpenRouter = openRouterKeys.map((key) => process.env[key]);
   let tempDir: string;
   let audioPath: string;
 
@@ -22,6 +24,7 @@ describe("voice transcription", () => {
     audioPath = path.join(tempDir, "sample.ogg");
     writeFileSync(audioPath, Buffer.from("audio"));
     delete process.env.OPENAI_API_KEY;
+    for (const key of openRouterKeys) delete process.env[key];
     process.env.FASTER_WHISPER_PYTHON = path.join(tempDir, "missing-python.exe");
     _resetImportHook();
     vi.unstubAllGlobals();
@@ -41,6 +44,66 @@ describe("voice transcription", () => {
     } else {
       process.env.FASTER_WHISPER_PYTHON = originalFasterWhisperPython;
     }
+    openRouterKeys.forEach((key, i) => {
+      if (originalOpenRouter[i] === undefined) delete process.env[key];
+      else process.env[key] = originalOpenRouter[i];
+    });
+  });
+
+  it("uses the OpenRouter audio model first when configured", async () => {
+    process.env.VOICE_OPENROUTER_MODEL = "qwen/qwen3.8-omni-flash";
+    process.env.OPENROUTER_API_KEY = "sk-or-test";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: " omni transcript " } }] }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await transcribeAudio(audioPath);
+
+    expect(result).toMatchObject({ text: "omni transcript", backend: "openrouter" });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    expect(init.headers).toMatchObject({ Authorization: "Bearer sk-or-test" });
+    const body = JSON.parse(String(init.body));
+    expect(body.model).toBe("qwen/qwen3.8-omni-flash");
+    expect(body.messages[0].content[1].input_audio).toEqual({
+      data: Buffer.from("audio").toString("base64"),
+      format: "ogg",
+    });
+  });
+
+  it("falls back to the next backend when OpenRouter fails", async () => {
+    process.env.VOICE_OPENROUTER_MODEL = "qwen/qwen3.8-omni-flash";
+    process.env.VOICE_OPENROUTER_API_KEY = "sk-or-test";
+    process.env.OPENAI_API_KEY = "sk-test";
+    _setImportHook(async () => {
+      const error = new Error("Cannot find package 'parakeet-coreml'") as Error & { code?: string };
+      error.code = "ERR_MODULE_NOT_FOUND";
+      throw error;
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 502, statusText: "Bad Gateway", text: async () => "upstream down" })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ text: "whisper transcript" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await transcribeAudio(audioPath);
+
+    expect(result).toMatchObject({ text: "whisper transcript", backend: "openai" });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("upstream down"));
+    warn.mockRestore();
+  });
+
+  it("surfaces the OpenRouter error when no fallback is configured", async () => {
+    process.env.VOICE_OPENROUTER_MODEL = "qwen/qwen3.8-omni-flash";
+    process.env.OPENROUTER_API_KEY = "sk-or-test";
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "" } }] }),
+    }));
+
+    await expect(transcribeAudio(audioPath)).rejects.toThrow("OpenRouter transcription returned no text");
   });
 
   it("uses parakeet when available", async () => {
