@@ -294,7 +294,7 @@ describe("parked sdk queries", () => {
 
     controlled.push(textMessage("NO RESULT FOLLOWS"));
     await waitUntil(() =>
-      parkedEvents.some((event) => event.type === "assistant_message_complete" && event.text === "NO RESULT FOLLOWS"),
+      parkedEvents.some((event) => event.type === "assistant_text_delta" && event.text === "NO RESULT FOLLOWS"),
     );
   });
 
@@ -523,7 +523,7 @@ describe("adopting a parked sdk query", () => {
     // The handover must not swallow it.
     expect(
       parkedEvents.some(
-        (event) => event.type === "assistant_message_complete" && event.text === "HELD BY THE DRAIN",
+        (event) => event.type === "assistant_text_delta" && event.text === "HELD BY THE DRAIN",
       ),
     ).toBe(true);
   });
@@ -638,7 +638,7 @@ describe("parked drain liveness", () => {
     controlled.push(textMessage("WORKING ON IT"));
 
     await waitUntil(() =>
-      parkedEvents.some((event) => event.type === "assistant_message_complete" && event.text === "WORKING ON IT"),
+      parkedEvents.some((event) => event.type === "assistant_text_delta" && event.text === "WORKING ON IT"),
     );
     // Delivered while the park is still open, not as part of its teardown.
     expect(parkStates).toEqual([true]);
@@ -681,6 +681,74 @@ describe("parked drain liveness", () => {
     expect(parkedQuery?.isActive).toBe(false);
   });
 
+  it("does not make a finished session busy on idle metadata or task progress", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+    const activity: boolean[] = [];
+    await collect(runClaudeSdkTurn({
+      ...liveParkOptions,
+      queryFn: controlled.queryFn,
+      onParkedEvent: () => {},
+      onParkActivityChanged: (active) => activity.push(active),
+    }));
+
+    controlled.push({ type: "system", subtype: "session_state_changed", state: "idle" } as SdkMessageLike);
+    controlled.push({ type: "system", subtype: "status", status: null } as SdkMessageLike);
+    controlled.push({ type: "system", subtype: "task_progress" });
+    controlled.push({ type: "system", subtype: "init", session_id: "park-session" });
+    await waitUntil(() => controlled.queuedCount() === 0 && controlled.waitingReaders() === 1);
+    expect(activity).toEqual([]);
+    controlled.end();
+  });
+
+  it("honors the SDK session idle signal after an injected turn", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+    const activity: boolean[] = [];
+    await collect(runClaudeSdkTurn({
+      ...liveParkOptions,
+      queryFn: controlled.queryFn,
+      onParkedEvent: () => {},
+      onParkActivityChanged: (active) => activity.push(active),
+    }));
+
+    controlled.push({ type: "system", subtype: "session_state_changed", state: "running" } as SdkMessageLike);
+    await waitUntil(() => activity.length === 1);
+    controlled.push({ type: "system", subtype: "session_state_changed", state: "idle" } as SdkMessageLike);
+    await waitUntil(() => controlled.queuedCount() === 0 && controlled.waitingReaders() === 1);
+    expect(activity).toEqual([true, false]);
+    controlled.end();
+  });
+
+  it("distinguishes parked narration from the final result even after a timer flush", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+    const events: AgentProviderEvent[] = [];
+    await collect(runClaudeSdkTurn({
+      ...liveParkOptions,
+      queryFn: controlled.queryFn,
+      onParkedEvent: (event) => events.push(event),
+    }));
+
+    controlled.push(textMessage("INTERIM"));
+    await waitUntil(() => events.length > 0);
+    expect(events[0]).toMatchObject({ type: "assistant_text_delta", text: "INTERIM" });
+    controlled.push(textMessage("FINAL"));
+    await waitUntil(() => events.length > 1);
+    controlled.push(successResult("FINAL"));
+    await waitUntil(() => events.some((event) => event.type === "assistant_message_complete"));
+    expect(events.filter((event) => event.type === "assistant_message_complete")).toEqual([
+      expect.objectContaining({ text: "FINAL" }),
+    ]);
+    controlled.end();
+  });
+
   it("accepts a steer pushed into an active park and answers it through the drain", async () => {
     const controlled = controlledQuery();
     controlled.push(initMessage);
@@ -715,7 +783,7 @@ describe("parked drain liveness", () => {
 
     controlled.push(textMessage("CHECKED THE LOG"));
     await waitUntil(() =>
-      parkedEvents.some((event) => event.type === "assistant_message_complete" && event.text === "CHECKED THE LOG"),
+      parkedEvents.some((event) => event.type === "assistant_text_delta" && event.text === "CHECKED THE LOG"),
     );
   });
 
@@ -744,9 +812,11 @@ describe("parked drain liveness", () => {
     controlled.push(successResult("SECOND PART"));
 
     await waitUntil(() => parkedEvents.some((event) => event.type === "assistant_message_complete"));
-    const delivered = parkedEvents.filter((event) => event.type === "assistant_message_complete");
-    expect(delivered).toHaveLength(1);
-    expect(delivered[0]?.text).toBe(["FIRST PART", "SECOND PART"].join("\n\n"));
+    const delivered = parkedEvents.filter((event) => event.type === "assistant_message_complete" || event.type === "assistant_text_delta");
+    expect(delivered.map((event) => ({ type: event.type, text: event.text }))).toEqual([
+      { type: "assistant_text_delta", text: "FIRST PART" },
+      { type: "assistant_message_complete", text: "SECOND PART" },
+    ]);
   });
 });
 
@@ -804,9 +874,33 @@ describe("parked drain background tasks", () => {
     controlled.push(textMessage("THE SUITE FINISHED"));
     await waitUntil(() =>
       parkedEvents.some(
-        (event) => event.type === "assistant_message_complete" && event.text === "THE SUITE FINISHED",
+        (event) => event.type === "assistant_text_delta" && event.text === "THE SUITE FINISHED",
       ),
     );
+  });
+
+  it("keeps structured SDK background tasks alive and clears them on completion", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push({ type: "system", subtype: "task_started", task_id: "sdk-task", is_backgrounded: true });
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+    let handle: ParkedQuery | undefined;
+    const activity: boolean[] = [];
+    await collect(runClaudeSdkTurn({
+      ...taskParkOptions,
+      queryFn: controlled.queryFn,
+      onParkedEvent: () => {},
+      onParkStateChanged: (parked, query) => { if (parked) handle = query; },
+      onParkActivityChanged: (active) => activity.push(active),
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(controlled.isClosed()).toBe(false);
+    expect(handle?.pendingTaskCount).toBe(1);
+    controlled.push({ type: "system", subtype: "task_notification", task_id: "sdk-task", status: "completed" });
+    await waitUntil(() => handle?.pendingTaskCount === 0);
+    expect(activity).toEqual([]);
+    await waitUntil(() => controlled.isClosed());
   });
 
   async function adoptParkedTurn(
@@ -928,7 +1022,7 @@ describe("parked drain background tasks", () => {
     await waitUntil(() =>
       parkedEvents.some(
         (event) =>
-          event.type === "assistant_message_complete" && (event.text ?? "").includes("PART TWO"),
+          event.type === "assistant_text_delta" && (event.text ?? "").includes("PART TWO"),
       ),
     );
   });
@@ -1098,10 +1192,9 @@ describe("stop and model switch against a live or adopted query", () => {
     await waitUntil(() =>
       parkedEvents.some(
         (event) =>
-          event.type === "assistant_message_complete" &&
-          (event.text ?? "").includes("PARTIAL") &&
-          (event.text ?? "").includes("boom"),
+          event.type === "error" && event.message.includes("boom"),
       ),
     );
+    expect(parkedEvents).toContainEqual(expect.objectContaining({ type: "assistant_text_delta", text: "PARTIAL" }));
   });
 });

@@ -46,8 +46,9 @@ Runtime rules:
 - If a persisted Claude session has no transcript file, TeleCode starts fresh instead of resuming a stale UUID.
 - If Claude is working and another normal message arrives, TeleCode queues it as the next Claude turn instead of dropping it.
 - If Claude is working and `/steer <instruction>` arrives, TeleCode sends it into the active Claude turn. PTY sessions type the instruction into the running Claude Code TUI; SDK sessions push it through the SDK streaming-input channel. If the turn is still starting and cannot accept live input yet, TeleCode falls back to queueing it as the next Claude follow-up.
-- Claude model fallbacks and safeguard refusals are priority notices. TeleCode immediately reports the original model, fallback model, reason when supplied, and whether the change applies to the whole session. These notices bypass progress suppression and are delivered even while Claude is running in the background.
-- If Claude finishes while Codex is foreground, TeleCode sends the Claude final answer directly with a background header.
+- In the foreground, Claude model fallbacks and safeguard refusals are reported before held narration, including the models and reason when supplied. Background status notices and commentary stay buffered for `/replay`.
+- If Claude finishes while another provider or Claude session is selected, TeleCode sends the final answer directly with a session header. This also applies to follow-up work from a kept-alive SDK query. Select the session and use `/replay all` to read its interim messages; selecting it alone does not release background commentary.
+- SDK idle and running session-state events determine whether a kept-alive Claude query is working. Idle metadata and task progress do not start a new turn.
 
 Self-test:
 

@@ -22,22 +22,18 @@ async function importVoiceWithSpawn(spawnMock: ReturnType<typeof createSpawnMock
   return await import("../src/voice.js");
 }
 
-const originalFasterWhisperPython = process.env.FASTER_WHISPER_PYTHON;
-
 beforeEach(() => {
-  process.env.FASTER_WHISPER_PYTHON = "Z:\\missing-python.exe";
+  // These tests exercise the local decoder regardless of host cloud credentials.
+  vi.stubEnv("VOICE_OPENROUTER_MODEL", undefined);
+  vi.stubEnv("OPENAI_API_KEY", undefined);
+  vi.stubEnv("FASTER_WHISPER_PYTHON", "Z:\\missing-python.exe");
 });
 
 afterEach(() => {
   vi.doUnmock("node:child_process");
   vi.resetModules();
   vi.unstubAllGlobals();
-  delete process.env.OPENAI_API_KEY;
-  if (originalFasterWhisperPython === undefined) {
-    delete process.env.FASTER_WHISPER_PYTHON;
-  } else {
-    process.env.FASTER_WHISPER_PYTHON = originalFasterWhisperPython;
-  }
+  vi.unstubAllEnvs();
 });
 
 describe("voice decoding", () => {

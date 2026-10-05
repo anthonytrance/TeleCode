@@ -141,7 +141,6 @@ const DEFAULT_PROVIDER_SESSION_LIST_LIMIT = 20;
 const MAX_PROVIDER_SESSION_LIST_LIMIT = 500;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
-const CLAUDE_QUIET_WARNING_PREFIX = "Claude has been quiet for ";
 // How long an unanswered idle-steer y/n question stays valid.
 const IDLE_STEER_CONFIRM_TTL_MS = 5 * 60 * 1000;
 // Offered every time a message is parked in a provider queue. A message sent by
@@ -862,6 +861,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     } else {
       busyProviders.delete(contextKey);
     }
+    getBusyState(contextKey).processing = providers.size > 0;
   };
 
   const isProviderBusy = (contextKey: TelegramContextKey, provider: AgentProviderKind): boolean =>
@@ -1000,10 +1000,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     registry.getActiveProvider(contextKey) === provider;
 
   // A parked Claude query answered its turn, stayed alive, and has now produced
-  // more output (late narration the result message raced ahead of, a background
-  // task notification the CLI acted on once idle). Deliver that text on the lane:
-  // straight to the chat when the lane is idle, buffered for /replay when a turn
-  // is running. Everything but finished text stays in the transcript.
+  // more output. Commentary follows foreground selection and otherwise waits
+  // for /replay. Only a completed turn is delivered from an unselected session.
   const findClaudeLaneBySessionId = (
     sessionId: string,
   ): { contextKey: TelegramContextKey; descriptor: AgentSessionDescriptor; background: boolean } | undefined => {
@@ -1016,11 +1014,40 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     return background ? { ...background, background: true } : undefined;
   };
 
+  const parkedClaudeDeliveries = new Map<string, Promise<void>>();
+  const lastParkedClaudeProgress = new Map<string, string>();
+  const queueParkedClaudeDelivery = (sessionId: string, send: () => Promise<void>): Promise<void> => {
+    const previous = parkedClaudeDeliveries.get(sessionId) ?? Promise.resolve();
+    const delivery = previous.then(send).catch((error) => {
+      console.warn("Failed to deliver parked Claude output", error);
+      bridgeLog("park", `failed to deliver parked claude output session=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => {
+      if (parkedClaudeDeliveries.get(sessionId) === delivery) {
+        parkedClaudeDeliveries.delete(sessionId);
+      }
+    });
+    parkedClaudeDeliveries.set(sessionId, delivery);
+    return delivery;
+  };
+  const dispatchAfterParkedClaudeDelivery = (sessionId: string, contextKey: TelegramContextKey): void => {
+    // A result clears activity just before emitting its final event. Wait a
+    // microtask so that event enters the outbox, then finish delivery before
+    // starting the queued turn. Otherwise the two answers arrive backwards.
+    queueMicrotask(() => {
+      const delivery = parkedClaudeDeliveries.get(sessionId) ?? Promise.resolve();
+      void delivery.then(() => {
+        if (claudeSessions.get(contextKey)?.id === sessionId) {
+          dispatchNextQueuedClaudePrompt(contextKey);
+        }
+      });
+    });
+  };
   const deliverParkedClaudeEvent = (sessionId: string, event: AgentProviderEvent): void => {
-    if (event.type !== "assistant_message_complete") {
+    if (event.type !== "assistant_message_complete" && event.type !== "assistant_text_delta" && event.type !== "error") {
       return;
     }
-    const text = event.text?.trim();
+    const final = event.type !== "assistant_text_delta";
+    const text = event.type === "error" ? `Claude failed: ${event.message}` : event.text.trim();
     if (!text) {
       return;
     }
@@ -1029,54 +1056,58 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return;
     }
     const { contextKey, descriptor } = lane;
-    if (lane.background) {
-      // Output from a session the user switched away from. It is not the selected
-      // conversation, so it goes out live with the session named in front, never
-      // buffered behind whatever the selected session is doing.
-      const parsedBackground = parseContextKey(contextKey);
-      const labeled = `${formatBackgroundClaudeLabel(descriptor)}\n\n${text}`;
-      void (async () => {
-        for (const chunk of splitMarkdownForTelegram(labeled)) {
-          await sendTextMessage(bot.api, parsedBackground.chatId, chunk.text, {
-            parseMode: chunk.parseMode,
-            fallbackText: chunk.fallbackText,
-            messageThreadId: parsedBackground.messageThreadId,
-          });
-        }
-        bridgeLog("park", `delivered background claude output session=${sessionId} chars=${text.length}`);
-      })().catch((error) => {
-        console.warn("Failed to deliver background Claude output", error);
-        bridgeLog("park", `failed to deliver background claude output session=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
-      });
-      return;
-    }
-    if (isProviderBusy(contextKey, "claude")) {
-      // Buffer under the AGENT SESSION id, not the provider descriptor id: those
-      // are different namespaces and /replay drains by the former, so keying this
-      // on sessionId filed parked output where nothing would ever read it.
-      const bufferKey = outputBufferSessionId(contextKey, descriptor);
-      outputBuffer.append(bufferKey, {
-        kind: "assistant",
-        text,
-        priority: false,
-        metadata: { provider: "claude", parked: true },
-      });
-      bridgeLog("park", `buffered parked claude output session=${bufferKey} chars=${text.length}`);
-      return;
+    const foregroundAtArrival = !lane.background && isProviderForeground(contextKey, "claude");
+    const bufferKey = outputBufferSessionId(contextKey, descriptor);
+    // Store before trying Telegram, so a failed send remains recoverable. Only
+    // foreground arrivals held by a running turn may be automatically flushed.
+    const buffered = outputBuffer.append(bufferKey, {
+      kind: event.type === "error" ? "error" : final ? "final" : "assistant",
+      text,
+      priority: final,
+      metadata: {
+        provider: "claude", parked: true,
+        deliverWhenIdle: foregroundAtArrival && (final || registry.getProgressDelivery(contextKey) !== "none"),
+      },
+    });
+    if (final) {
+      lastAssistantReplyBySessionId.set(bufferKey, text);
     }
     const parsed = parseContextKey(contextKey);
-    void (async () => {
-      for (const chunk of splitMarkdownForTelegram(text)) {
+    void queueParkedClaudeDelivery(sessionId, async () => {
+      if (!outputBuffer.list(bufferKey).some((entry) => entry.id === buffered.id)) {
+        return;
+      }
+      const foreground = isProviderForeground(contextKey, "claude") &&
+        claudeSessions.get(contextKey)?.id === sessionId && !backgroundClaudeSessions.has(sessionId);
+      if ((!final && (!foregroundAtArrival || !foreground || registry.getProgressDelivery(contextKey) === "none")) ||
+          (foreground && isProviderBusy(contextKey, "claude"))) {
+        return;
+      }
+      const streamed = lastParkedClaudeProgress.get(sessionId)?.trim();
+      if (final && foreground && streamed && (streamed === text || streamed.endsWith(`\n\n${text}`))) {
+        // The narration timer already delivered this final paragraph. It still
+        // becomes /repeat's last answer, but is not posted twice in the foreground.
+        outputBuffer.drainWhere(bufferKey, (entry) => entry.id === buffered.id);
+        clearDeliveredCompletionFromBuffer(bufferKey, text);
+        lastParkedClaudeProgress.delete(sessionId);
+        return;
+      }
+      const textToSend = foreground ? text : `${formatBackgroundClaudeLabel(descriptor)}\n\n${text}`;
+      for (const chunk of splitMarkdownForTelegram(textToSend)) {
         await sendTextMessage(bot.api, parsed.chatId, chunk.text, {
           parseMode: chunk.parseMode,
           fallbackText: chunk.fallbackText,
           messageThreadId: parsed.messageThreadId,
         });
       }
-      bridgeLog("park", `delivered parked claude output session=${sessionId} chars=${text.length}`);
-    })().catch((error) => {
-      console.warn("Failed to deliver parked Claude output", error);
-      bridgeLog("park", `failed to deliver parked claude output session=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      outputBuffer.drainWhere(bufferKey, (entry) => entry.id === buffered.id);
+      if (final) {
+        clearDeliveredCompletionFromBuffer(bufferKey, text);
+        lastParkedClaudeProgress.delete(sessionId);
+      } else {
+        lastParkedClaudeProgress.set(sessionId, text);
+      }
+      bridgeLog("park", `delivered parked claude ${final ? "final" : "commentary"} session=${sessionId} foreground=${foreground} chars=${text.length}`);
     });
   };
 
@@ -1085,37 +1116,47 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   }
 
   /**
-   * Parked output that arrived while a turn was running was buffered rather than
-   * sent. Only an explicit /replay drained it, so text the user never asked to be
-   * hidden could sit there unread forever. Send it as soon as the lane is free.
+   * Deliver foreground parked output held behind a turn. Commentary received
+   * while another session was selected stays buffered until an explicit /replay.
    */
   const flushBufferedParkedClaude = async (contextKey: TelegramContextKey): Promise<void> => {
     const descriptor = claudeSessions.get(contextKey);
     if (!descriptor) {
       return;
     }
-    const events = outputBuffer.drainWhere(
-      outputBufferSessionId(contextKey, descriptor),
-      (event) => event.metadata?.parked === true && event.metadata?.provider === "claude",
-    );
-    if (events.length === 0) {
-      return;
-    }
-    const parsed = parseContextKey(contextKey);
-    for (const event of events) {
-      const text = event.text?.trim();
-      if (!text) {
-        continue;
+    await queueParkedClaudeDelivery(descriptor.id, async () => {
+      const canDeliver = (): boolean => claudeSessions.get(contextKey)?.id === descriptor.id &&
+        isProviderForeground(contextKey, "claude") && !isProviderBusy(contextKey, "claude");
+      if (!canDeliver()) {
+        return;
       }
-      for (const chunk of splitMarkdownForTelegram(text)) {
-        await sendTextMessage(bot.api, parsed.chatId, chunk.text, {
-          parseMode: chunk.parseMode,
-          fallbackText: chunk.fallbackText,
-          messageThreadId: parsed.messageThreadId,
-        });
+      const bufferKey = outputBufferSessionId(contextKey, descriptor);
+      const events = outputBuffer.list(bufferKey).filter((event) =>
+        event.metadata?.parked === true && event.metadata?.provider === "claude" &&
+        event.metadata?.deliverWhenIdle === true,
+      );
+      const parsed = parseContextKey(contextKey);
+      for (const event of events) {
+        const text = event.text?.trim();
+        if (!text) {
+          continue;
+        }
+        for (const chunk of splitMarkdownForTelegram(text)) {
+          if (!canDeliver()) {
+            return;
+          }
+          await sendTextMessage(bot.api, parsed.chatId, chunk.text, {
+            parseMode: chunk.parseMode,
+            fallbackText: chunk.fallbackText,
+            messageThreadId: parsed.messageThreadId,
+          });
+        }
+        outputBuffer.drainWhere(bufferKey, (entry) => entry.id === event.id);
       }
-    }
-    bridgeLog("park", `flushed ${events.length} buffered parked claude message(s) lane=${contextKey}`);
+      if (events.length > 0) {
+        bridgeLog("park", `flushed ${events.length} buffered parked claude message(s) lane=${contextKey}`);
+      }
+    });
   };
 
   if (typeof claudeAdapter?.setParkActivityHandler === "function") {
@@ -1134,7 +1175,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
       // Anything the user parked in the queue while the CLI was working runs now.
-      dispatchNextQueuedClaudePrompt(lane.contextKey);
+      dispatchAfterParkedClaudeDelivery(sessionId, lane.contextKey);
     });
   }
 
@@ -1143,8 +1184,20 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       if (parked) {
         return;
       }
+      // Clear activity even for a selected park. A drain that exits without a
+      // result must not leave the session permanently busy.
+      claudeParkActiveSessions.delete(sessionId);
+      const pendingDelivery = parkedClaudeDeliveries.get(sessionId) ?? Promise.resolve();
+      void pendingDelivery.then(() => lastParkedClaudeProgress.delete(sessionId));
       const background = backgroundClaudeSessions.get(sessionId);
-      if (!background || backgroundClaudeTurns.has(sessionId)) {
+      if (!background) {
+        const lane = findClaudeLaneBySessionId(sessionId);
+        if (lane) {
+          dispatchAfterParkedClaudeDelivery(sessionId, lane.contextKey);
+        }
+        return;
+      }
+      if (backgroundClaudeTurns.has(sessionId)) {
         // A background turn still owns this runtime and disposes it when it ends.
         return;
       }
@@ -1922,7 +1975,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   ): Promise<void> => {
     const messageThreadId = source.messageThreadId ?? parseContextKey(contextKey).messageThreadId;
     let liveSteerError: string | undefined;
-    if (isClaudeWorking(contextKey) || getBusyState(contextKey).processing) {
+    if (isClaudeWorking(contextKey)) {
       const descriptor = claudeSessions.get(contextKey);
       if (descriptor && claudeAdapter?.streamInput) {
         try {
@@ -2095,19 +2148,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       if (!codexAgentSession || (!outputText.trim() && !artifactPath)) {
         return;
       }
-      if (priority && turnBackgrounded() && (kind === "status" || kind === "tool")) {
-        // Errors and priority notices of a background turn go out at once, named.
-        void sendBackgroundTurnText(`${backgroundTurnLabel()}:\n\n${outputText.trim()}`).catch((error) => {
-          console.error("Failed to send a background Codex notice", error);
-        });
-        return;
-      }
-
       outputBuffer.append(codexAgentSession.id, {
         kind,
         text: outputText,
         artifactPath,
-        priority,
+        priority: kind === "status" || kind === "tool" ? false : priority,
         metadata: { provider: "codex" },
       });
     };
@@ -3092,7 +3137,6 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           runningCodexTurnByLane.delete(contextKey);
         }
         markProviderBusy(contextKey, "codex", false);
-        busyState.processing = false;
       }
     }
     return finishedInBackground;
@@ -3218,7 +3262,6 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
       markProviderBusy(contextKey, "claude", false);
-      busyState.processing = false;
       claimedBusy = false;
     };
 
@@ -3383,12 +3426,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         return;
       }
       const mode = registry.getProgressDelivery(contextKey);
-      if (mode === "none") {
-        return;
-      }
-
       if (!turnForeground()) {
         bufferClaudeOutput("assistant", trimmed, false);
+        return;
+      }
+      if (mode === "none") {
         return;
       }
 
@@ -3479,28 +3521,19 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }, NARRATION_IDLE_FLUSH_MS);
     };
 
-    const deliverClaudeStatusMessage = async (message: string, priority = false): Promise<void> => {
+    const deliverClaudeStatusMessage = async (message: string): Promise<void> => {
       const trimmed = message.trim();
       if (!trimmed) {
         return;
       }
-      const quietWarning = isClaudeQuietWarning(trimmed);
-      if (turnBackgrounded()) {
-        if (priority || quietWarning) {
-          await sendBackgroundTurnText(`${backgroundTurnLabel()}:\n\n${trimmed}`);
-        } else {
-          bufferClaudeOutput("status", trimmed, false);
-        }
+      if (!turnForeground()) {
+        bufferClaudeOutput("status", trimmed, false);
         return;
       }
-      if (priority || quietWarning || isProviderForeground(contextKey, "claude")) {
-        await replyToClaudeRunSource(source, escapeHTML(trimmed), {
-          fallbackText: trimmed,
-          messageThreadId,
-        });
-      } else {
-        bufferClaudeOutput("status", trimmed, false);
-      }
+      await replyToClaudeRunSource(source, escapeHTML(trimmed), {
+        fallbackText: trimmed,
+        messageThreadId,
+      });
     };
 
     try {
@@ -3545,7 +3578,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             // progress (edit or messages) and hold this one; the last held block becomes the
             // final answer rather than a progress line, so the answer is never posted twice.
             const progressMode = registry.getProgressDelivery(contextKey);
-            if ((progressMode === "messages" || progressMode === "edit") && pendingAssistantProgressText.trim()) {
+            if ((!turnForeground() || progressMode === "messages" || progressMode === "edit") && pendingAssistantProgressText.trim()) {
               await flushPendingClaudeAssistantProgress();
             }
             pendingAssistantProgressText = event.text;
@@ -3578,9 +3611,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             break;
           case "status_message":
             if (event.priority) {
-              // Model fallbacks and refusals must reach Telegram before any held
-              // narration, even if Claude is currently running in the background.
-              await deliverClaudeStatusMessage(event.text, true);
+              // In the foreground, deliver fallback notices before held narration.
+              // Background notices remain available with the rest of /replay.
+              await deliverClaudeStatusMessage(event.text);
               await flushPendingClaudeAssistantProgress();
             } else {
               await flushPendingClaudeAssistantProgress();
@@ -3667,7 +3700,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       // messages, every block but the last was already sent; only the held final block
       // remains, so deliver just that and never re-post the whole answer. Otherwise (edit
       // or none delivery, or a single-block turn) deliver the full answer.
-      let finalTextToDeliver = sentAssistantProgress ? finalAssistantBlock.trim() : finalText;
+      let finalTextToDeliver = turnForeground() && sentAssistantProgress ? finalAssistantBlock.trim() : finalText;
       if (undeliveredNarration.length > 0) {
         finalTextToDeliver = [...undeliveredNarration, finalTextToDeliver].filter((part) => part.trim()).join("\n\n");
         undeliveredNarration.length = 0;
@@ -3859,7 +3892,6 @@ ${message}`,
         runningClaudeTurnByLane.delete(contextKey);
       }
       markProviderBusy(contextKey, "claude", false);
-      busyState.processing = false;
       try {
         await flushBufferedParkedClaude(contextKey);
       } catch (flushError) {
@@ -3900,7 +3932,7 @@ ${message}`,
   };
 
   const dispatchNextQueuedClaudePrompt = (contextKey: TelegramContextKey): void => {
-    if (!claudeAdapter || isClaudeWorking(contextKey) || getBusyState(contextKey).processing) {
+    if (!claudeAdapter || isClaudeWorking(contextKey)) {
       return;
     }
     const queued = queuedClaudePrompts.dequeue(contextKey);
@@ -3943,9 +3975,8 @@ ${message}`,
     const normalizedDeliveredText = deliveredText.trim();
     outputBuffer.drainWhere(
       sessionId,
-      (event) => event.kind === "final" || (
-        event.kind === "error" && event.text?.trim() === normalizedDeliveredText
-      ),
+      (event) => (event.kind === "final" || event.kind === "error" || event.kind === "assistant") &&
+        event.text?.trim() === normalizedDeliveredText,
     );
   };
 
@@ -4756,7 +4787,6 @@ ${message}`,
     backgroundClaudeSessions.set(current.id, { contextKey, descriptor });
     runningClaudeTurnByLane.delete(contextKey);
     markProviderBusy(contextKey, "claude", false);
-    getBusyState(contextKey).processing = false;
     bridgeLog("background", `claude turn moved to background session=${current.id} lane=${contextKey} running=${runningTurns}`);
     return undefined;
   };
@@ -4816,7 +4846,6 @@ ${message}`,
       startedAt: entry.startedAt,
     });
     markProviderBusy(contextKey, "claude", true);
-    getBusyState(contextKey).processing = true;
     bridgeLog("background", `background claude turn adopted back session=${descriptorId} lane=${contextKey}`);
     return entry.descriptor;
   };
@@ -4853,7 +4882,6 @@ ${message}`,
     });
     runningCodexTurnByLane.delete(contextKey);
     markProviderBusy(contextKey, "codex", false);
-    getBusyState(contextKey).processing = false;
     bridgeLog("background", `codex turn moved to background thread=${runtime.getInfo().threadId} lane=${contextKey} running=${runningTurns}`);
     return undefined;
   };
@@ -4901,7 +4929,6 @@ ${message}`,
       startedAt: entry.startedAt,
     });
     markProviderBusy(contextKey, "codex", true);
-    getBusyState(contextKey).processing = true;
     bridgeLog("background", `background codex turn adopted back thread=${entry.threadId} lane=${contextKey}`);
     return true;
   };
@@ -6022,7 +6049,7 @@ ${message}`,
         await reply("Dropped the queued message. Nothing was sent to Claude.");
         return;
       }
-      if (!isClaudeWorking(contextKey) && !getBusyState(contextKey).processing) {
+      if (!isClaudeWorking(contextKey)) {
         await reply("The turn already finished, so your message is starting now as a normal prompt.");
         return;
       }
@@ -9715,10 +9742,6 @@ function remainingCompletionText(completionText: string, streamedText: string): 
     return completion.slice(streamed.length).trim();
   }
   return completion;
-}
-
-function isClaudeQuietWarning(text: string): boolean {
-  return text.startsWith(CLAUDE_QUIET_WARNING_PREFIX);
 }
 
 export function renderProgressCompletedMessage(): RenderedText {

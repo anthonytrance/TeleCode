@@ -5,6 +5,7 @@ import path from "node:path";
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
+import type { CodexSessionCallbacks } from "../src/codex-session.js";
 import type { TeleCodeConfig } from "../src/config.js";
 import { VENDOR_CREDENTIALS_FILENAME } from "../src/model-vendors.js";
 import { SessionRegistry } from "../src/session-registry.js";
@@ -61,6 +62,9 @@ const mockClaude = vi.hoisted(() => {
       sessionProviderIds.set(sessionId, providerSessionId);
     },
     providerSessionIdFor: (sessionId: string) => sessionProviderIds.get(sessionId) ?? activeProviderSessionId,
+    parkedRuntimeFor: (providerSessionId: string) => [...sessionProviderIds].find(([sessionId, providerId]) =>
+      providerId === providerSessionId && parkedSessions.has(sessionId),
+    )?.[0],
     prompts,
     rawPrompts,
     promptSessionIds,
@@ -273,7 +277,8 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
         mockClaude.rememberSession((session as { id: string }).id, providerSessionId);
       }
       mockClaude.resumeSession(session);
-      return session;
+      const parkedId = providerSessionId ? mockClaude.parkedRuntimeFor(providerSessionId) : undefined;
+      return parkedId ? { ...session as Record<string, unknown>, id: parkedId } : session;
     }
 
     getBackend() {
@@ -705,7 +710,7 @@ describe("Claude bot flow", () => {
     );
   });
 
-  it("delivers priority Claude fallback notices immediately while Claude is backgrounded", async () => {
+  it("keeps Claude fallback and quiet notices in replay while Claude is backgrounded", async () => {
     const { bot, sent, registry } = await createTestBot(tempDir);
     mockClaude.blockNextPrompt();
     mockClaude.setNextEvents([
@@ -715,6 +720,10 @@ describe("Claude bot flow", () => {
         jobId: "job-1",
         text: "Claude model fallback: Fable 5.1 switched to Opus 4.8. Reason: cyber safeguards. This session will continue on Opus 4.8.",
         priority: true,
+      },
+      {
+        type: "status_message", sessionId: "claude-provider-1", jobId: "job-1",
+        text: "Claude has been quiet for 3 minutes. Still waiting.",
       },
       {
         type: "assistant_text_delta",
@@ -735,14 +744,18 @@ describe("Claude bot flow", () => {
     registry.setActiveProvider("123", "codex");
     mockClaude.releaseBlockedPrompt();
 
-    await waitFor(() => sent.some((entry) => entry.text?.includes("Claude model fallback:")));
-    expect(sent.map((entry) => entry.text)).toContain(
-      "Claude model fallback: Fable 5.1 switched to Opus 4.8. Reason: cyber safeguards. This session will continue on Opus 4.8.",
-    );
+    await waitForAgentSessionsIdle(tempDir);
+    expect(sent.some((entry) => entry.text?.includes("Claude model fallback:"))).toBe(false);
+    expect(sent.some((entry) => entry.text?.includes("Claude has been quiet"))).toBe(false);
+    await bot.handleUpdate(textUpdate(2, "/claude"));
+    await bot.handleUpdate(textUpdate(3, "/replay all"));
+    const replay = sent.filter((entry) => entry.text?.includes("Buffered Claude output")).map((entry) => entry.text).join("\n");
+    expect(replay).toContain("Claude model fallback: Fable 5.1 switched to Opus 4.8.");
+    expect(replay).toContain("Claude has been quiet for 3 minutes");
   });
 
-  it("keeps background commentary quiet, delivers the full final, and replays commentary only on command", async () => {
-    const { bot, sent, registry } = await createTestBot(tempDir);
+  it.each(["messages", "none"] as const)("keeps background commentary quiet and replayable with progress=%s", async (progressDelivery) => {
+    const { bot, sent, registry } = await createTestBot(tempDir, { progressDelivery });
     const finalText = `FULL_FINAL ${"x".repeat(900)}`;
     mockClaude.blockNextPrompt();
     mockClaude.setNextEvents([
@@ -1671,6 +1684,219 @@ describe("Claude bot flow", () => {
     expect(delivered[0]?.text).not.toContain("Buffered Claude output");
   });
 
+  it("keeps parked Claude commentary quiet while Codex is selected and replays it on request", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    await bot.handleUpdate(textUpdate(2, "/codex"));
+
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "parked-job", text: "PARKED_INTERIM",
+    });
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "parked-job", text: "PARKED_FINAL",
+    });
+    await waitFor(() => sent.some((entry) => entry.text?.includes("PARKED_FINAL")));
+    expect(sent.filter((entry) => entry.text?.includes("PARKED_FINAL"))).toHaveLength(1);
+    expect(sent.find((entry) => entry.text?.includes("PARKED_FINAL"))?.text).toContain("From ");
+    expect(sent.some((entry) => entry.text?.includes("PARKED_INTERIM"))).toBe(false);
+
+    await bot.handleUpdate(textUpdate(3, "/claude"));
+    expect(sent.some((entry) => entry.text?.includes("PARKED_INTERIM"))).toBe(false);
+    await bot.handleUpdate(textUpdate(4, "/replay all"));
+    expect(sent.filter((entry) => entry.text?.includes("PARKED_INTERIM"))).toHaveLength(1);
+    await bot.handleUpdate(textUpdate(5, "/repeat"));
+    expect(sent.filter((entry) => entry.text?.includes("PARKED_FINAL"))).toHaveLength(2);
+  });
+
+  it("does not repeat a parked final paragraph already delivered in the foreground", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "parked-job", text: "ALREADY_STREAMED_FINAL",
+    });
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "parked-job", text: "ALREADY_STREAMED_FINAL",
+    });
+    await waitFor(() => sent.some((entry) => entry.text?.includes("ALREADY_STREAMED_FINAL")));
+    await bot.handleUpdate(textUpdate(2, "/repeat"));
+    expect(sent.filter((entry) => entry.text?.includes("ALREADY_STREAMED_FINAL"))).toHaveLength(2);
+  });
+
+  it("keeps later parked commentary quiet when Telegram is delayed across a provider switch", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    let releaseSend!: () => void;
+    const sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    let sendStarted = false;
+    bot.api.config.use(async (prev, method, payload: { text?: string }) => {
+      if (method === "sendMessage" && payload.text?.includes("IN_FLIGHT_PROGRESS")) {
+        sendStarted = true;
+        await sendGate;
+      }
+      return prev(method, payload);
+    });
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "parked-job", text: "IN_FLIGHT_PROGRESS",
+    });
+    await waitFor(() => sendStarted);
+    try {
+      await bot.handleUpdate(textUpdate(2, "/codex"));
+      mockClaude.emitOutOfBand("claude-provider-1", {
+        type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "parked-job", text: "QUEUED_PARK_PROGRESS",
+      });
+      mockClaude.emitOutOfBand("claude-provider-1", {
+        type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "parked-job", text: "QUEUED_PARK_FINAL",
+      });
+    } finally {
+      releaseSend();
+    }
+    await waitFor(() => sent.some((entry) => entry.text?.includes("QUEUED_PARK_FINAL")));
+    expect(sent.some((entry) => entry.text?.includes("QUEUED_PARK_PROGRESS"))).toBe(false);
+    expect(sent.find((entry) => entry.text?.includes("QUEUED_PARK_FINAL"))?.text).toContain("From ");
+    await bot.handleUpdate(textUpdate(3, "/claude"));
+    await bot.handleUpdate(textUpdate(4, "/replay all"));
+    expect(sent.some((entry) => entry.text?.includes("QUEUED_PARK_PROGRESS"))).toBe(true);
+  });
+
+  it("keeps an undelivered parked final available when Telegram rejects it", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    await bot.handleUpdate(textUpdate(2, "/codex"));
+    let failSend = true;
+    const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+    bot.api.config.use(async (prev, method, payload: { text?: string }) => {
+      if (failSend && method === "sendMessage" && payload.text?.includes("REJECTED_PARK_FINAL")) {
+        throw new Error("Telegram send failed");
+      }
+      return prev(method, payload);
+    });
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "parked-job", text: "REJECTED_PARK_FINAL",
+    });
+    await waitFor(() => warnings.mock.calls.some((call) => call[0] === "Failed to deliver parked Claude output"));
+    expect(sent.some((entry) => entry.text?.includes("REJECTED_PARK_FINAL"))).toBe(false);
+    failSend = false;
+    await bot.handleUpdate(textUpdate(3, "/claude"));
+    expect(sent.filter((entry) => entry.text?.includes("REJECTED_PARK_FINAL"))).toHaveLength(1);
+  });
+
+  it("recovers the Claude queue when an active park closes without an activity callback", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    mockClaude.emitParkActivity("claude-provider-1", true);
+    await bot.handleUpdate(textUpdate(2, "queued behind the park"));
+    expect(mockClaude.prompts).not.toContain("queued behind the park");
+    mockClaude.emitParkState("claude-provider-1", false);
+    await waitFor(() => sent.some((entry) => entry.text?.includes("mock reply to queued behind the park")));
+  });
+
+  it.each(["idle", "closed"])("delivers a parked turn's final before its follow-up on %s", async (endSignal) => {
+    const { bot, sent } = await createTestBot(tempDir);
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    mockClaude.emitParkActivity("claude-provider-1", true);
+    await bot.handleUpdate(textUpdate(2, "queued after parked work"));
+    if (endSignal === "idle") {
+      mockClaude.emitParkActivity("claude-provider-1", false);
+    } else {
+      mockClaude.emitParkState("claude-provider-1", false);
+    }
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "parked-job", text: "PARKED_ORDER_FINAL",
+    });
+    await waitFor(() => sent.some((entry) => entry.text?.includes("mock reply to queued after parked work")));
+    await waitFor(() => sent.some((entry) => entry.text?.includes("PARKED_ORDER_FINAL")));
+    expect(sent.findIndex((entry) => entry.text?.includes("PARKED_ORDER_FINAL"))).toBeLessThan(
+      sent.findIndex((entry) => entry.text?.includes("mock reply to queued after parked work")),
+    );
+  });
+
+  it("does not flush parked commentary into Codex when a Claude turn finishes", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.blockNextPrompt();
+    await bot.handleUpdate(textUpdate(1, "/claude held turn"));
+    await waitFor(() => mockClaude.prompts.includes("held turn"));
+    await bot.handleUpdate(textUpdate(2, "/codex"));
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "parked-job", text: "HIDDEN_PARKED_INTERIM",
+    });
+    mockClaude.releaseBlockedPrompt();
+    await waitForAgentSessionsIdle(tempDir);
+    expect(sent.some((entry) => entry.text?.includes("HIDDEN_PARKED_INTERIM"))).toBe(false);
+    await bot.handleUpdate(textUpdate(3, "/claude"));
+    await bot.handleUpdate(textUpdate(4, "/replay all"));
+    expect(sent.some((entry) => entry.text?.includes("HIDDEN_PARKED_INTERIM"))).toBe(true);
+  });
+
+  it("delivers the full background final after foreground narration and a delayed result", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    mockClaude.setNextEvents([
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "FOREGROUND_NARRATION" },
+      { type: "tool_started", sessionId: "claude-provider-1", jobId: "job-1", toolName: "Read" },
+      { __delayMs: 300 },
+      { type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "job-1", text: "DELAYED_BACKGROUND_FINAL" },
+      { __delayMs: 1800 },
+      { type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "job-1", text: "DELAYED_BACKGROUND_FINAL" },
+    ]);
+    await bot.handleUpdate(textUpdate(1, "/claude delayed answer"));
+    await waitFor(() => sent.some((entry) => entry.text === "FOREGROUND_NARRATION"));
+    await bot.handleUpdate(textUpdate(2, "/codex"));
+    await waitForAgentSessionsIdle(tempDir);
+    const answer = sent.find((entry) => entry.text?.includes("finished in background"))?.text;
+    expect(answer).toContain("DELAYED_BACKGROUND_FINAL");
+    await bot.handleUpdate(textUpdate(3, "/claude"));
+    await bot.handleUpdate(textUpdate(4, "/replay all"));
+    expect(sent.filter((entry) => entry.text?.includes("DELAYED_BACKGROUND_FINAL"))).toHaveLength(1);
+  });
+
+  it("dispatches Claude's queue while a separate Codex turn is busy", async () => {
+    const { bot, sent, registry } = await createTestBot(tempDir);
+    mockClaude.blockNextPrompt();
+    await bot.handleUpdate(textUpdate(1, "/claude held turn"));
+    await waitFor(() => mockClaude.prompts.includes("held turn"));
+    await bot.handleUpdate(textUpdate(2, "queued follow-up"));
+    mockClaude.emitParkActivity("claude-provider-1", true);
+    mockClaude.releaseBlockedPrompt();
+    await waitForAgentSessionsIdle(tempDir);
+
+    let releaseCodex!: () => void;
+    const codexGate = new Promise<void>((resolve) => { releaseCodex = resolve; });
+    let codexStarted = false;
+    const codexSession = {
+      getInfo: () => ({ workspace: tempDir, threadId: "held-codex", model: "gpt-5.5" }),
+      getCurrentWorkspace: () => tempDir,
+      hasActiveThread: () => true,
+      isProcessing: () => codexStarted,
+      prompt: async (_input: unknown, callbacks: CodexSessionCallbacks) => {
+        codexStarted = true;
+        await codexGate;
+        callbacks.onTextDelta("CODEX_DONE", { phase: "final_answer" });
+        callbacks.onAgentEnd();
+        codexStarted = false;
+      },
+    };
+    vi.spyOn(registry, "get").mockReturnValue(codexSession as never);
+    vi.spyOn(registry, "getOrCreate").mockResolvedValue(codexSession as never);
+    await bot.handleUpdate(textUpdate(3, "/codex"));
+    await bot.handleUpdate(textUpdate(4, "codex held turn"));
+    await waitFor(() => codexStarted);
+    // The queued Claude message belongs to its own runtime even while Codex works.
+    mockClaude.emitParkActivity("claude-provider-1", false);
+    try {
+      await waitFor(() => mockClaude.prompts.includes("queued follow-up"));
+      await waitFor(() => sent.some((entry) => entry.text?.includes("mock reply to queued follow-up")));
+      expect(codexStarted).toBe(true);
+    } finally {
+      releaseCodex();
+    }
+    await waitForAgentSessionsIdle(tempDir);
+  });
+
   /**
    * A parked query whose CLI picked up queued work is a running turn from the
    * user's side. His next plain message must be held and offered as a steer,
@@ -1763,7 +1989,13 @@ describe("Claude bot flow", () => {
     // Switching away no longer kills the park.
     expect(mockClaude.dispose).not.toHaveBeenCalledWith(forkSessionId);
 
-    // Its later output reaches the chat live, labeled with the session it came from.
+    // Commentary from another Claude session stays quiet; its final is named.
+    mockClaude.emitOutOfBand(forkSessionId ?? "", {
+      type: "assistant_text_delta",
+      sessionId: forkSessionId,
+      jobId: "parked-job",
+      text: "FORK_INTERIM",
+    });
     mockClaude.emitOutOfBand(forkSessionId ?? "", {
       type: "assistant_message_complete",
       sessionId: forkSessionId,
@@ -1774,6 +2006,18 @@ describe("Claude bot flow", () => {
     const labeled = sent.find((entry) => entry.text?.includes("FORK FINISHED LATER"))?.text ?? "";
     expect(labeled).toContain("From ");
     expect(labeled).toContain("second conversation");
+    expect(sent.some((entry) => entry.text?.includes("FORK_INTERIM"))).toBe(false);
+
+    await bot.handleUpdate(textUpdate(6, "/sessions"));
+    const refreshedList = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Recent provider sessions")).at(-1);
+    const forkNumber = refreshedList?.split("\n").find((line) =>
+      /^\d+\. Claude/u.test(line) && line.includes("second conversation"),
+    )?.match(/^(\d+)\./u)?.[1];
+    expect(forkNumber).toBeDefined();
+    await bot.handleUpdate(textUpdate(7, `/use ${forkNumber}`));
+    await bot.handleUpdate(textUpdate(8, "/replay all"));
+    expect(sent.some((entry) => entry.text?.includes("FORK_INTERIM"))).toBe(true);
+    await bot.handleUpdate(textUpdate(9, "/use provider-session-1"));
 
     // Once the background park ends on its own, the runtime is dropped.
     mockClaude.emitParkState(forkSessionId ?? "", false);

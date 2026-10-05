@@ -231,23 +231,23 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     onStartupStatus?: StartupStatusCallback,
   ): Promise<AgentSessionDescriptor> {
     this.validateEnabled();
-    const existing = this.sessions.get(session.id);
     const requestedBackend = asClaudeBackend(session.metadata?.backend) || this.config.claudeBackend;
-    if (
-      existing &&
-      existing.backend === "sdk" &&
-      requestedBackend === "sdk" &&
-      existing.providerSessionId === session.providerSessionId &&
-      existing.parkedQuery &&
-      !existing.parkedQuery.isClosed
-    ) {
+    const parkedRuntime = requestedBackend === "sdk"
+      ? [...this.sessions.values()].find((candidate) =>
+          candidate.backend === "sdk" && candidate.providerSessionId === session.providerSessionId &&
+          candidate.parkedQuery && !candidate.parkedQuery.isClosed,
+        )
+      : undefined;
+    if (parkedRuntime) {
       // A park kept alive across a session switch. Keep the live runtime rather
       // than replacing it with a cold one and orphaning the CLI still working.
-      existing.hasLiveProviderSession = true;
-      existing.descriptor.displayName = session.displayName ?? existing.descriptor.displayName;
-      existing.descriptor.updatedAt = Math.max(existing.descriptor.updatedAt, session.updatedAt);
-      bridgeLog("park", `resume kept the live parked runtime session=${existing.providerSessionId}`);
-      return { ...existing.descriptor };
+      // A fresh query may reveal a different provider id than the one used to
+      // create the descriptor, so the descriptor id alone cannot identify it.
+      parkedRuntime.hasLiveProviderSession = true;
+      parkedRuntime.descriptor.displayName = session.displayName ?? parkedRuntime.descriptor.displayName;
+      parkedRuntime.descriptor.updatedAt = Math.max(parkedRuntime.descriptor.updatedAt, session.updatedAt);
+      bridgeLog("park", `resume kept the live parked runtime session=${parkedRuntime.providerSessionId}`);
+      return { ...parkedRuntime.descriptor };
     }
     const running = [...this.sessions.values()].find((candidate) =>
       candidate.busy && candidate.providerSessionId === session.providerSessionId,

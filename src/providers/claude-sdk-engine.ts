@@ -128,6 +128,12 @@ export interface SdkMessageLike {
   api_refusal_category?: string | null;
   api_refusal_explanation?: string | null;
   scope?: "session" | "local";
+  state?: "idle" | "running" | "requires_action";
+  task_id?: string;
+  status?: string | null;
+  is_backgrounded?: boolean;
+  ambient?: boolean;
+  skip_transcript?: boolean;
   message?: {
     model?: string;
     content?: Array<Record<string, unknown>>;
@@ -448,6 +454,17 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
    * CLI is re-entered with.
    */
   trackMessage(message: SdkMessageLike): void {
+    if (message.type === "system" && message.task_id) {
+      if (message.subtype === "task_notification") {
+        this.pendingTasks.delete(message.task_id);
+      } else if (
+        message.subtype === "task_started" && message.is_backgrounded === true &&
+        !message.ambient && !message.skip_transcript
+      ) {
+        this.pendingTasks.add(message.task_id);
+      }
+      return;
+    }
     if (message.type !== "user") {
       return;
     }
@@ -674,6 +691,7 @@ async function drainParkedSdkQuery(args: {
   };
   try {
     let bufferedText = "";
+    let finalAssistantText = "";
     let flushDeadline: number | undefined;
     let flushHardDeadline: number | undefined;
     const flushText = (): void => {
@@ -683,7 +701,7 @@ async function drainParkedSdkQuery(args: {
       flushHardDeadline = undefined;
       if (text) {
         args.onEvent({
-          type: "assistant_message_complete",
+          type: "assistant_text_delta",
           sessionId: args.sessionId,
           jobId: args.jobId,
           text,
@@ -741,8 +759,11 @@ async function drainParkedSdkQuery(args: {
       }
       const message = outcome.result.value;
       args.handle.trackMessage(message);
-      if (message.type !== "result") {
-        setActive(true);
+      if (message.type === "system" && message.subtype === "session_state_changed") {
+        // The SDK's idle state is authoritative. Metadata and ambient task
+        // notifications after a result must not invent another running turn.
+        setActive(message.state === "running" || message.state === "requires_action");
+        continue;
       }
       if (message.type === "assistant") {
         const model = message.message?.model;
@@ -754,6 +775,11 @@ async function drainParkedSdkQuery(args: {
         // looked like Claude simply going quiet. Deliver them; only the boilerplate
         // reply to an injected rescue prompt stays out.
         const synthetic = model === "<synthetic>";
+        if (!synthetic && (message.message?.content ?? []).some((block) =>
+          block.type === "text" || block.type === "thinking" || block.type === "tool_use",
+        )) {
+          setActive(true);
+        }
         for (const block of message.message?.content ?? []) {
           const blockType = typeof block.type === "string" ? block.type : "";
           if (synthetic && (blockType !== "text" || typeof block.text !== "string" || SYNTHETIC_BOILERPLATE.has(block.text.trim()))) {
@@ -761,9 +787,12 @@ async function drainParkedSdkQuery(args: {
           }
           if (blockType === "text" && typeof block.text === "string" && block.text.trim()) {
             bufferedText += `${bufferedText ? "\n\n" : ""}${block.text.trim()}`;
+            finalAssistantText += `${finalAssistantText ? "\n\n" : ""}${block.text.trim()}`;
             flushDeadline = Date.now() + flushDebounceMs;
             flushHardDeadline = flushHardDeadline ?? Date.now() + flushMaxHoldMs;
           } else if (blockType === "tool_use") {
+            flushText();
+            finalAssistantText = "";
             args.onEvent({
               type: "tool_started",
               sessionId: args.sessionId,
@@ -794,19 +823,26 @@ async function drainParkedSdkQuery(args: {
           bridgeLog("park", `parked sdk turn ended: ${detail} session=${sessionLabel}`);
           // The user must hear this, not just the log: a park dying on a spend
           // limit or API error otherwise looks like Claude losing its track.
-          bufferedText += `${bufferedText ? "\n\n" : ""}Claude's background turn ended with an error: ${detail}`;
+          flushText();
+          setActive(false);
+          args.onEvent({ type: "error", sessionId: args.sessionId, jobId: args.jobId, message: detail });
           break;
         }
-        // A result closes an injected turn and repeats the assistant text it
-        // closed. Append only what is genuinely new: comparing the result against
-        // the whole accumulated buffer instead of its contents duplicated the last
-        // paragraph of every multi-block parked delivery.
-        const resultText = (message.result ?? "").trim();
-        if (resultText && !bufferedText.includes(resultText)) {
-          bufferedText += `${bufferedText ? "\n\n" : ""}${resultText}`;
+        // Debounced blocks are commentary, not completed turns. Always publish
+        // the actual result separately, even if its text was already flushed.
+        // This lets an unselected session stay quiet until it really finishes.
+        const resultText = (message.result ?? "").trim() || finalAssistantText.trim();
+        if (resultText && bufferedText.trimEnd().endsWith(resultText)) {
+          bufferedText = bufferedText.trimEnd().slice(0, -resultText.length).trim();
         }
         flushText();
         setActive(false);
+        if (resultText) {
+          args.onEvent({
+            type: "assistant_message_complete", sessionId: args.sessionId, jobId: args.jobId, text: resultText,
+          });
+        }
+        finalAssistantText = "";
         continue;
       }
     }

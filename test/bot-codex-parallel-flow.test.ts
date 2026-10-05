@@ -52,6 +52,7 @@ class FakeRuntime {
   private goalHold = "";
   readonly dispose = vi.fn();
   readonly prompts: string[] = [];
+  callbacks?: CodexSessionCallbacks;
 
   constructor(public threadId: string | null) {}
 
@@ -165,6 +166,7 @@ class FakeRuntime {
   }
 
   async prompt(input: unknown, callbacks: CodexSessionCallbacks): Promise<void> {
+    this.callbacks = callbacks;
     const text = (typeof input === "string" ? input : JSON.stringify(input)).match(/(hold \w+|quick \w+)/)?.[1] ?? "?";
     this.prompts.push(text);
     this.processing = true;
@@ -241,6 +243,25 @@ describe("background Codex turns", () => {
     expect(runtimes).toHaveLength(1);
     holds.get("hold A")!();
     await waitFor(() => sent.includes("FINAL hold A"));
+  });
+
+  it("keeps another Codex session's commentary and plan quiet until replay", async () => {
+    const { bot, sent } = createHarness();
+    await startHeldTurnInSecondSession(bot, sent);
+    const background = runtimes[0];
+    await bot.handleUpdate(textUpdate(10, "/use previous"));
+    background.callbacks!.onTextDelta("CODEX_HIDDEN_INTERIM", { phase: "commentary" });
+    background.callbacks!.onToolStart("Read", "background-read");
+    background.callbacks!.onTodoUpdate?.([{ text: "CODEX_HIDDEN_PLAN", completed: false }]);
+    holds.get("hold A")!();
+    await waitFor(() => sent.some((text) => text.includes("FINAL hold A")));
+    expect(sent.join("\n")).not.toContain("CODEX_HIDDEN_INTERIM");
+    expect(sent.join("\n")).not.toContain("CODEX_HIDDEN_PLAN");
+    await bot.handleUpdate(textUpdate(11, "/use thread-2"));
+    await bot.handleUpdate(textUpdate(12, "/replay all"));
+    expect(sent.join("\n")).toContain("CODEX_HIDDEN_INTERIM");
+    expect(sent.join("\n")).toContain("CODEX_HIDDEN_PLAN");
+    expect(sent.filter((text) => text.includes("FINAL hold A"))).toHaveLength(1);
   });
 
   it("picks the running turn back up when switching back to it", async () => {
