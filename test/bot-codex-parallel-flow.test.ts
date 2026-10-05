@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile } from "../src/codex-launch.js";
+import { AgentSessionManager } from "../src/agent-session-manager.js";
+import type { CodexThreadRecord } from "../src/codex-state.js";
 import type { CodexSessionCallbacks, CodexSessionInfo, CodexThreadGoal, CodexThreadGoalSetParams } from "../src/codex-session.js";
 import type { TeleCodeConfig } from "../src/config.js";
 import { SessionRegistry } from "../src/session-registry.js";
@@ -17,11 +19,12 @@ vi.mock("../src/codex-auth.js", () => ({
 }));
 
 // Keep the machine's real Codex threads out of /sessions.
+const codexThreads = vi.hoisted(() => new Map<string, CodexThreadRecord>());
 vi.mock("../src/codex-state.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/codex-state.js")>()),
-  listThreads: () => [],
+  listThreads: () => [...codexThreads.values()],
   listSpawnedThreadIds: () => [],
-  getThread: () => undefined,
+  getThread: (id: string) => codexThreads.get(id),
 }));
 
 const runtimes: FakeRuntime[] = [];
@@ -204,6 +207,7 @@ describe("background Codex turns", () => {
     workspaceDir = mkdtempSync(path.join(tmpdir(), "telecode-codex-parallel-"));
     runtimes.length = 0;
     holds.clear();
+    codexThreads.clear();
     threadCounter = 0;
   });
 
@@ -262,6 +266,50 @@ describe("background Codex turns", () => {
     expect(sent.join("\n")).toContain("CODEX_HIDDEN_INTERIM");
     expect(sent.join("\n")).toContain("CODEX_HIDDEN_PLAN");
     expect(sent.filter((text) => text.includes("FINAL hold A"))).toHaveLength(1);
+  });
+
+  it("uses the current native title for a completion after switching providers", async () => {
+    const manager = new AgentSessionManager();
+    const saved = manager.createSession("123", "codex", {
+      workspace: workspaceDir, providerSessionId: "thread-1", displayName: "Continue the DJ pro work",
+    });
+    mkdirSync(path.join(workspaceDir, ".telecode"), { recursive: true });
+    writeFileSync(path.join(workspaceDir, ".telecode", "agent-sessions.json"), JSON.stringify(manager.serialize()));
+    codexThreads.set("thread-1", threadRecord("thread-1", "TeleCode parallel sessions"));
+    const { bot, sent, registry } = createHarness();
+    await bot.handleUpdate(textUpdate(1, "hold A"));
+    await waitFor(() => holds.has("hold A"));
+    // A native rename may happen while the answer is still being generated.
+    codexThreads.set("thread-1", threadRecord("thread-1", "TeleCode routing fix"));
+    registry.setActiveProvider("123", "claude");
+    holds.get("hold A")!();
+    await waitFor(() => sent.some((text) => text.includes("finished in background")));
+    const answer = sent.find((text) => text.includes("finished in background"))!;
+    expect(answer).toContain("TeleCode routing fix");
+    expect(answer).not.toContain("DJ pro");
+    expect(answer).toContain("FINAL hold A");
+    const state = JSON.parse(readFileSync(path.join(workspaceDir, ".telecode", "agent-sessions.json"), "utf8"));
+    expect(state.sessions.find((session: { id: string }) => session.id === saved.id)?.displayName)
+      .toBe("TeleCode routing fix");
+  });
+
+  it("keeps the title shown by /sessions when the native database becomes unavailable", async () => {
+    const manager = new AgentSessionManager();
+    manager.createSession("123", "codex", {
+      workspace: workspaceDir, providerSessionId: "thread-2", displayName: "Continue the DJ pro work",
+    });
+    mkdirSync(path.join(workspaceDir, ".telecode"), { recursive: true });
+    writeFileSync(path.join(workspaceDir, ".telecode", "agent-sessions.json"), JSON.stringify(manager.serialize()));
+    const { bot, sent } = createHarness();
+    await startHeldTurnInSecondSession(bot, sent);
+    codexThreads.set("thread-2", threadRecord("thread-2", "TeleCode background routing"));
+    await bot.handleUpdate(textUpdate(9, "/sessions"));
+    expect(sent.at(-1)).toContain("TeleCode background routing");
+    await bot.handleUpdate(textUpdate(10, "/use previous"));
+    codexThreads.clear();
+    holds.get("hold A")!();
+    await waitFor(() => sent.some((text) => text.includes("FINAL hold A")));
+    expect(sent.find((text) => text.includes("FINAL hold A"))).toContain('"TeleCode background routing"');
   });
 
   it("picks the running turn back up when switching back to it", async () => {
@@ -370,6 +418,13 @@ describe("background Codex turns", () => {
     await waitFor(() => runtimes[0].dispose.mock.calls.length === 1);
   });
 });
+
+function threadRecord(id: string, title: string): CodexThreadRecord {
+  return {
+    id, title, cwd: workspaceDir, model: "gpt-5.5",
+    createdAt: new Date(1000), updatedAt: new Date(2000), firstUserMessage: "Continue the DJ pro work",
+  };
+}
 
 /** Like startHeldTurnInSecondSession, but session 2 runs a goal that holds. */
 async function startHeldGoalInSecondSession(bot: ReturnType<typeof createBot>, sent: string[]): Promise<void> {

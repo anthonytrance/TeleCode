@@ -280,11 +280,15 @@ export class AgentSessionManager {
         defaultProvider: options.defaultProvider ?? "codex",
       });
       const sessionId = `legacy-codex-${shortHash(context.contextKey)}`;
-      const existing = this.sessions.get(sessionId);
+      const legacy = this.sessions.get(sessionId);
+      const existing = this.listLaneSessions(context.contextKey).find((session) =>
+        session.provider === "codex" && session.providerSessionId === (context.threadId ?? undefined),
+      );
       if (existing) {
-        existing.providerSessionId = context.threadId ?? undefined;
-        existing.workspace = context.workspace;
-        existing.metadata = {
+        const current = this.requireSession(existing.id);
+        current.workspace = context.workspace;
+        current.metadata = {
+          ...current.metadata,
           backend: context.backend,
           launchProfileId: context.launchProfileId,
           model: context.model,
@@ -292,16 +296,18 @@ export class AgentSessionManager {
           reasoningEffort: context.reasoningEffort,
           legacyContextKey: context.contextKey,
         };
-        existing.updatedAt = this.now();
+        current.updatedAt = this.now();
         if (options.selectImported ?? true) {
-          this.selectSession(context.contextKey, sessionId);
+          this.selectSession(context.contextKey, current.id);
         }
-        imported.push(cloneSession(existing));
+        imported.push(cloneSession(current));
         continue;
       }
 
       const session = this.createSession(context.contextKey, "codex", {
-        id: sessionId,
+        // The context points at the currently attached thread, not permanently
+        // at one legacy conversation. Keep old titles and jobs with their thread.
+        id: legacy ? undefined : sessionId,
         workspace: context.workspace,
         providerSessionId: context.threadId ?? undefined,
         select: options.selectImported ?? true,

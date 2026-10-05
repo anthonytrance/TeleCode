@@ -215,6 +215,42 @@ describe("AgentSessionManager", () => {
     expect(manager.getSelectedSession("123")?.id).toBe(restored!.id);
   });
 
+  it("preserves a legacy conversation's identity and title when a different thread is restored", () => {
+    const manager = createManager();
+    const [legacy] = manager.importLegacyContexts([{
+      contextKey: "123", threadId: "djay-thread", workspace: "/workspace", updatedAt: 1,
+    }]);
+    manager.updateDisplayName(legacy!.id, "DJ pro accessibility");
+    const [restored] = manager.importLegacyContexts([{
+      contextKey: "123", threadId: "telecode-thread", workspace: "/workspace", updatedAt: 2,
+    }]);
+
+    expect(restored!.id).not.toBe(legacy!.id);
+    expect(restored!.displayName).not.toBe("DJ pro accessibility");
+    expect(manager.getSession(legacy!.id)).toMatchObject({
+      providerSessionId: "djay-thread", displayName: "DJ pro accessibility",
+    });
+    expect(manager.getSelectedSession("123")?.providerSessionId).toBe("telecode-thread");
+  });
+
+  it("restores the existing record for the exact thread rather than repointing the legacy record", () => {
+    const manager = createManager();
+    const [legacy] = manager.importLegacyContexts([{
+      contextKey: "123", threadId: "djay-thread", workspace: "/workspace", updatedAt: 1,
+    }]);
+    const current = manager.createSession("123", "codex", {
+      workspace: "/workspace", providerSessionId: "telecode-thread", displayName: "TeleCode routing",
+    });
+    const [restored] = manager.importLegacyContexts([{
+      contextKey: "123", threadId: "telecode-thread", workspace: "/workspace", updatedAt: 2,
+    }]);
+
+    expect(restored!.id).toBe(current.id);
+    expect(restored!.displayName).toBe("TeleCode routing");
+    expect(manager.getSession(legacy!.id)?.providerSessionId).toBe("djay-thread");
+    expect(manager.listLaneSessions("123")).toHaveLength(2);
+  });
+
   it("serializes and reloads state", () => {
     const manager = createManager();
     const session = manager.createSession("123", "claude", { workspace: "/workspace" });

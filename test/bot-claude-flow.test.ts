@@ -1761,6 +1761,69 @@ describe("Claude bot flow", () => {
     expect(sent.some((entry) => entry.text?.includes("QUEUED_PARK_PROGRESS"))).toBe(true);
   });
 
+  it.each([false, true])("uses the same Claude title for /sessions and parked completion, renamed=%s", async (renamed) => {
+    const { bot, sent } = await createTestBot(tempDir, { claudeStrictMcpConfig: false });
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    const transcriptDir = path.join(tempDir, ".claude-config", "projects", "project");
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(path.join(transcriptDir, "provider-session-1.jsonl"), [
+      JSON.stringify({ type: "user", cwd: "C:\\workspace", message: { content: "first turn" } }),
+      JSON.stringify({ type: "ai-title", aiTitle: "TeleCode native title" }),
+    ].join("\n"));
+    writeFileSync(path.join(transcriptDir, "other-session.jsonl"), [
+      JSON.stringify({ type: "user", cwd: "C:\\workspace", message: { content: "another topic" } }),
+      JSON.stringify({ type: "ai-title", aiTitle: "DJ pro accessibility" }),
+    ].join("\n"));
+    if (renamed) {
+      await bot.handleUpdate(textUpdate(2, "/rename TeleCode custom name"));
+    }
+    const expectedTitle = renamed ? "TeleCode custom name" : "TeleCode native title";
+    await bot.handleUpdate(textUpdate(3, "/sessions"));
+    expect(sent.map((entry) => entry.text).at(-1)).toContain(expectedTitle);
+    await bot.handleUpdate(textUpdate(4, "/codex"));
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "parked-job", text: "NATIVE_TITLE_FINAL",
+    });
+    await waitFor(() => sent.some((entry) => entry.text?.includes("NATIVE_TITLE_FINAL")));
+    const answer = sent.find((entry) => entry.text?.includes("NATIVE_TITLE_FINAL"))?.text ?? "";
+    expect(answer).toContain(`From "${expectedTitle}":`);
+    expect(answer).not.toContain("DJ pro");
+  });
+
+  it("uses a rename made after a parked final entered the delivery queue", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    let releaseSend!: () => void;
+    const sendGate = new Promise<void>((resolve) => { releaseSend = resolve; });
+    let sendStarted = false;
+    bot.api.config.use(async (prev, method, payload: { text?: string }) => {
+      if (method === "sendMessage" && payload.text?.includes("HELD_PARK_PROGRESS")) {
+        sendStarted = true;
+        await sendGate;
+      }
+      return prev(method, payload);
+    });
+    mockClaude.emitOutOfBand("claude-provider-1", {
+      type: "assistant_text_delta", sessionId: "claude-provider-1", jobId: "parked-job", text: "HELD_PARK_PROGRESS",
+    });
+    await waitFor(() => sendStarted);
+    try {
+      mockClaude.emitOutOfBand("claude-provider-1", {
+        type: "assistant_message_complete", sessionId: "claude-provider-1", jobId: "parked-job", text: "RENAMED_PARK_FINAL",
+      });
+      await bot.handleUpdate(textUpdate(2, "/rename TeleCode parked fix"));
+      await bot.handleUpdate(textUpdate(3, "/codex"));
+    } finally {
+      releaseSend();
+    }
+    await waitFor(() => sent.some((entry) => entry.text?.includes("RENAMED_PARK_FINAL")));
+    const answer = sent.find((entry) => entry.text?.includes("RENAMED_PARK_FINAL"))?.text ?? "";
+    expect(answer).toContain('From "TeleCode parked fix":');
+    expect(answer).not.toContain("first turn");
+  });
+
   it("keeps an undelivered parked final available when Telegram rejects it", async () => {
     const { bot, sent } = await createTestBot(tempDir);
     await bot.handleUpdate(textUpdate(1, "/claude first turn"));
@@ -2072,6 +2135,21 @@ describe("Claude bot flow", () => {
       expect(forkLine).toContain(", running");
       return { originalNumber: originalNumber!, forkNumber: forkNumber!, forkSessionId };
     };
+
+    it("keeps a rename made during a turn on its background answer", async () => {
+      const { bot, sent } = await createTestBot(tempDir);
+      const { originalNumber, forkSessionId } = await startLongTurnOnFork(bot, sent);
+      await bot.handleUpdate(textUpdate(5, "/rename TeleCode routing fix"));
+      await bot.handleUpdate(textUpdate(6, `/use ${originalNumber}`));
+      mockClaude.releaseBlockedPrompt();
+      await waitFor(() => sent.some((entry) => entry.text?.includes("mock reply to long task on the fork")));
+      const answer = sent.find((entry) => entry.text?.includes("mock reply to long task on the fork"))?.text ?? "";
+      expect(answer).toContain('"TeleCode routing fix"');
+      expect(answer).not.toContain("second conversation");
+      await waitFor(() => mockClaude.dispose.mock.calls.some((call) => call[0] === forkSessionId));
+      await bot.handleUpdate(textUpdate(7, "/sessions"));
+      expect(sent.map((entry) => entry.text).at(-1)).toContain("TeleCode routing fix");
+    });
 
     it("keeps a running turn going in the background after /use and labels its answer", async () => {
       const { bot, sent } = await createTestBot(tempDir);

@@ -49,6 +49,7 @@ Runtime rules:
 - In the foreground, Claude model fallbacks and safeguard refusals are reported before held narration, including the models and reason when supplied. Background status notices and commentary stay buffered for `/replay`.
 - If Claude finishes while another provider or Claude session is selected, TeleCode sends the final answer directly with a session header. This also applies to follow-up work from a kept-alive SDK query. Select the session and use `/replay all` to read its interim messages; selecting it alone does not release background commentary.
 - SDK idle and running session-state events determine whether a kept-alive Claude query is working. Idle metadata and task progress do not start a new turn.
+- Background reply headers use the current title of the conversation that produced the reply, including native transcript titles and names set with `/rename`. Renaming during a running turn or while output is awaiting delivery keeps the new name. Restoring another Codex thread does not reuse an old conversation's record or title.
 
 Self-test:
 

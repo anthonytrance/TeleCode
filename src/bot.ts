@@ -1092,7 +1092,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         lastParkedClaudeProgress.delete(sessionId);
         return;
       }
-      const textToSend = foreground ? text : `${formatBackgroundClaudeLabel(descriptor)}\n\n${text}`;
+      const textToSend = foreground ? text : `${formatBackgroundClaudeLabel({
+        ...descriptor,
+        displayName: resolveAgentSessionDisplayName("claude", descriptor.providerSessionId, descriptor.displayName, bufferKey),
+      })}\n\n${text}`;
       for (const chunk of splitMarkdownForTelegram(textToSend)) {
         await sendTextMessage(bot.api, parsed.chatId, chunk.text, {
           parseMode: chunk.parseMode,
@@ -1241,14 +1244,21 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
     if (existing) {
       let next = existing;
+      const nativeThread = provider === "codex" && options.providerSessionId
+        ? getThread(options.providerSessionId)
+        : undefined;
+      const candidateName = nativeThread ? resolveCodexThreadTitle(nativeThread) : options.displayName;
       if (
-        options.displayName &&
-        shouldReplaceSessionDisplayName(existing.displayName, options.displayName, existing.providerSessionId, provider)
+        candidateName && candidateName !== "(untitled)" && candidateName !== existing.displayName &&
+        (nativeThread || shouldReplaceSessionDisplayName(existing.displayName, candidateName, existing.providerSessionId, provider))
       ) {
-        next = agentSessions.updateDisplayName(existing.id, options.displayName);
+        next = agentSessions.updateDisplayName(existing.id, candidateName);
       }
       if (options.metadata) {
-        next = agentSessions.updateMetadata(existing.id, options.metadata);
+        next = agentSessions.updateMetadata(existing.id, {
+          ...options.metadata,
+          ...(typeof existing.metadata?.customTitle === "string" ? { customTitle: existing.metadata.customTitle } : {}),
+        });
       }
       if (options.select) {
         agentSessions.selectSession(contextKey, existing.id);
@@ -3320,6 +3330,13 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const turnBackgrounded = (): boolean => descriptor !== undefined && backgroundClaudeTurns.has(descriptor.id);
     const turnForeground = (): boolean => !turnBackgrounded() && isProviderForeground(contextKey, "claude");
     const storeTurnDescriptor = (next: AgentSessionDescriptor): void => {
+      const record = agentSessions.getSession(claudeAgentSession?.id ?? outputBufferSessionId(contextKey, next));
+      if (typeof record?.metadata?.customTitle === "string") {
+        next = {
+          ...next, displayName: record.metadata.customTitle,
+          metadata: { ...next.metadata, customTitle: record.metadata.customTitle },
+        };
+      }
       descriptor = next;
       const background = backgroundClaudeTurns.get(next.id);
       if (background) {
@@ -3683,10 +3700,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         if (providerSessionChanged && refreshed.providerSessionId) {
           agentSessions.updateProviderSessionId(agentSession.id, refreshed.providerSessionId);
         }
-        if (refreshedDisplayName) {
-          agentSessions.updateDisplayName(agentSession.id, refreshedDisplayName);
+        if (descriptor.displayName) {
+          agentSessions.updateDisplayName(agentSession.id, descriptor.displayName);
         }
-        agentSessions.updateMetadata(agentSession.id, refreshed.metadata);
+        agentSessions.updateMetadata(agentSession.id, descriptor.metadata);
         persistAgentSessionState();
       } catch {
         // Non-fatal: keep the existing descriptor if the adapter cannot be queried.
@@ -3749,7 +3766,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
             await deliverClaudeFinal(finalTextToDeliver);
             finalDelivered = true;
           } else if (!finalDelivered && !source.ctx) {
-            const label = descriptor?.displayName || descriptor?.providerSessionId?.slice(0, 8);
+            const label = descriptor && resolveAgentSessionDisplayName(
+              "claude", descriptor.providerSessionId, descriptor.displayName, claudeAgentSession?.id,
+            );
             const header = label
               ? `Claude Code finished in background: ${label}`
               : "Claude Code finished in background.";
@@ -3847,7 +3866,9 @@ ${message}`,
           if (source.ctx) {
             await sendBackgroundCompletionNotice(source.ctx, contextKey, descriptor, message, messageThreadId);
           } else {
-            const label = descriptor.displayName || descriptor.providerSessionId?.slice(0, 8);
+            const label = resolveAgentSessionDisplayName(
+              "claude", descriptor.providerSessionId, descriptor.displayName, claudeAgentSession?.id,
+            );
             const header = label
               ? `Claude Code finished in background: ${label}`
               : "Claude Code finished in background.";
@@ -3995,6 +4016,34 @@ ${message}`,
     return matchingSession?.id ?? descriptor.id;
   };
 
+  const resolveAgentSessionDisplayName = (
+    provider: AgentProviderKind,
+    providerSessionId: string | undefined,
+    fallback: string | undefined,
+    agentSessionId?: string,
+  ): string => {
+    const saved = agentSessionId ? agentSessions.getSession(agentSessionId) : undefined;
+    const session = saved?.provider === provider && saved.providerSessionId === providerSessionId ? saved : undefined;
+    const customTitle = typeof session?.metadata?.customTitle === "string" ? session.metadata.customTitle : undefined;
+    // Resolve the emitting conversation's current title, never the selected
+    // lane's name or the descriptor copy captured at the beginning of a turn.
+    const claudeTranscript = provider === "claude" && providerSessionId && !customTitle
+      ? listClaudeTranscriptSessions(
+          MAX_PROVIDER_SESSION_LIST_LIMIT,
+          config.claudeStrictMcpConfig ? path.join(homedir(), ".claude", "projects") : path.join(config.claudeConfigDir, "projects"),
+        ).find((transcript) => transcript.sessionId === providerSessionId)
+      : undefined;
+    const title = provider === "codex"
+      ? resolveCodexSessionDisplayName(providerSessionId, session?.displayName || fallback || "Codex")
+      : cleanProviderSessionTitle(customTitle || claudeTranscript?.title || session?.displayName || fallback ||
+          `Claude ${providerSessionId?.slice(0, 8) ?? agentSessionId}`);
+    if (session && title !== session.displayName) {
+      agentSessions.updateDisplayName(session.id, title);
+      persistAgentSessionState();
+    }
+    return title;
+  };
+
   const sendBackgroundCompletionNotice = async (
     ctx: Context,
     contextKey: TelegramContextKey,
@@ -4019,7 +4068,10 @@ ${message}`,
     const providerName = descriptor.provider === "claude"
       ? "Claude Code"
       : formatProviderDisplayName(descriptor.provider);
-    const label = descriptor.displayName || descriptor.providerSessionId?.slice(0, 8) || descriptor.id;
+    const label = resolveAgentSessionDisplayName(
+      descriptor.provider, descriptor.providerSessionId, descriptor.displayName,
+      outputBufferSessionId(contextKey, descriptor),
+    );
     const completionText = `${providerName} finished in background: ${label}\n\n${finalText}`.trim();
     for (const chunk of splitMarkdownForTelegram(completionText)) {
       await sendTextMessage(ctx.api, chatId, chunk.text, {
@@ -4330,11 +4382,12 @@ ${message}`,
         await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
         return;
       }
-      const renamed = { ...descriptor, displayName: name };
+      const renamed = { ...descriptor, displayName: name, metadata: { ...descriptor.metadata, customTitle: name } };
       claudeSessions.set(contextKey, renamed);
-      const selected = agentSessions.getSelectedSession(contextKey);
+      const selected = agentSessions.getSession(outputBufferSessionId(contextKey, descriptor));
       if (selected && selected.provider === "claude") {
         agentSessions.updateDisplayName(selected.id, name);
+        agentSessions.updateMetadata(selected.id, { ...selected.metadata, customTitle: name });
         persistAgentSessionState();
       }
       persistClaudeSession(contextKey, renamed);
@@ -4561,7 +4614,7 @@ ${message}`,
       let sessionForPick = session;
       if (session.provider === "claude" && session.providerSessionId) {
         const transcript = claudeTranscriptsBySessionId.get(session.providerSessionId);
-        if (transcript && shouldPreferClaudeTranscriptTitle(session.displayName, transcript.title)) {
+        if (transcript && !session.metadata?.customTitle && shouldPreferClaudeTranscriptTitle(session.displayName, transcript.title)) {
           sessionForPick = agentSessions.updateDisplayName(session.id, transcript.title);
           repairedClaudeTitle = true;
         }
@@ -4582,7 +4635,7 @@ ${message}`,
         if (transcript) {
           pick = {
             ...pick,
-            title: transcript.title,
+            title: typeof session.metadata?.customTitle === "string" ? session.metadata.customTitle : transcript.title,
             workspace: transcript.workspace,
             updatedAt: transcript.updatedAt,
           };
@@ -4689,7 +4742,7 @@ ${message}`,
     "claude",
     agentSessionId,
     descriptor.providerSessionId,
-    descriptor.displayName || agentSessions.getSession(agentSessionId)?.displayName || "",
+    resolveAgentSessionDisplayName("claude", descriptor.providerSessionId, descriptor.displayName, agentSessionId),
   );
 
   const describeBackgroundCodexTurn = (
@@ -4700,7 +4753,7 @@ ${message}`,
     "codex",
     turn.agentSessionId,
     turn.threadId ?? undefined,
-    resolveCodexSessionDisplayName(turn.threadId, agentSessions.getSession(turn.agentSessionId)?.displayName ?? ""),
+    resolveAgentSessionDisplayName("codex", turn.threadId ?? undefined, undefined, turn.agentSessionId),
   );
 
   const describeBackgroundTurn = (
