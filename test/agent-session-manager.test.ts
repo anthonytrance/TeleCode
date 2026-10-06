@@ -262,4 +262,46 @@ describe("AgentSessionManager", () => {
     expect(reloaded.getSelectedSession("123")).toEqual(manager.getSelectedSession("123"));
     expect(reloaded.listJobs()).toEqual([job]);
   });
+
+  it("persists the ordering preference independently for each lane", () => {
+    const manager = createManager();
+    manager.ensureLane("123");
+    manager.ensureLane("456");
+    expect(manager.getSessionOrder("123")).toBe("used");
+    manager.setSessionOrder("123", "created");
+    const reloaded = new AgentSessionManager({ state: manager.serialize() });
+    expect(reloaded.getSessionOrder("123")).toBe("created");
+    expect(reloaded.getSessionOrder("456")).toBe("used");
+  });
+
+  it("records successful selections monotonically without counting background activity", () => {
+    const manager = new AgentSessionManager({ now: () => 1000 });
+    const first = manager.createSession("123", "codex", { workspace: "/workspace" });
+    const second = manager.createSession("123", "claude", { workspace: "/workspace" });
+    expect(second.lastSelectedAt).toBeGreaterThan(first.lastSelectedAt!);
+    const before = manager.getSession(first.id)?.lastSelectedAt;
+    const job = manager.startJob(first.id);
+    manager.completeJob(job.id);
+    manager.updateDisplayName(first.id, "Background answer");
+    manager.updateMetadata(first.id, { model: "test" });
+    expect(manager.getSession(first.id)?.lastSelectedAt).toBe(before);
+    manager.selectSession("123", first.id);
+    const selectedAt = manager.getSession(first.id)!.lastSelectedAt!;
+    expect(selectedAt).toBeGreaterThan(second.lastSelectedAt!);
+    manager.selectSession("123", first.id);
+    expect(manager.getSession(first.id)?.lastSelectedAt).toBe(selectedAt);
+  });
+
+  it("restores legacy state and preserves selection recency across metadata import", () => {
+    const manager = createManager();
+    const first = manager.createSession("123", "codex", { workspace: "/workspace", providerSessionId: "thread-1" });
+    const second = manager.createSession("123", "codex", { workspace: "/workspace", providerSessionId: "thread-2" });
+    const state = manager.serialize();
+    delete state.sessions[0].lastSelectedAt;
+    const restored = new AgentSessionManager({ state });
+    restored.importLegacyContexts([{ contextKey: "123", threadId: "thread-2", workspace: "/workspace", updatedAt: 9999 }]);
+    expect(restored.getSession(second.id)?.lastSelectedAt).toBe(second.lastSelectedAt);
+    restored.selectSession("123", first.id);
+    expect(restored.getSession(first.id)?.lastSelectedAt).toBeGreaterThan(second.lastSelectedAt!);
+  });
 });

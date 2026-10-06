@@ -347,15 +347,23 @@ export class CodexAppServerClient {
 
     this.closing = true;
     this.rejectAllPending(new Error("Codex app-server client closed"));
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
+      let exitTimer: NodeJS.Timeout | undefined;
       const timer = setTimeout(() => {
+        // Issuing a kill does not mean the process has exited or released its
+        // thread writers. Never let a replacement attach before the exit event.
+        exitTimer = setTimeout(() => {
+          child.removeListener("exit", onExit);
+          reject(new Error("Codex app-server did not exit after being stopped"));
+        }, 1000);
         child.kill();
-        resolve();
       }, 1000);
-      child.once("exit", () => {
+      const onExit = () => {
         clearTimeout(timer);
+        clearTimeout(exitTimer);
         resolve();
-      });
+      };
+      child.once("exit", onExit);
       child.stdin.end();
     });
     this.readlineInterface?.close();

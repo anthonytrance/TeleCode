@@ -215,6 +215,24 @@ describe("SessionRegistry", () => {
     expect(mockSessionState.create).toHaveBeenCalledTimes(2);
   });
 
+  it("stages a replacement without changing the selection and disposes it on shutdown", async () => {
+    const registry = new SessionRegistry(createConfig());
+    const selected = await registry.getOrCreate("123");
+    selected.setInfo({ threadId: "thread-old" });
+    registry.updateMetadata("123", selected as never);
+    const staged = await registry.createDetached("123", {
+      workspace: "/workspace/target",
+      skipThreadResume: true,
+      deferThreadStart: true,
+    });
+    expect(registry.get("123")).toBe(selected);
+    expect(registry.listContexts()[0].threadId).toBe("thread-old");
+    expect(staged.getInfo()).toMatchObject({ threadId: null, workspace: "/workspace/target" });
+    registry.disposeAll();
+    expect(selected.dispose).toHaveBeenCalledOnce();
+    expect(staged.dispose).toHaveBeenCalledOnce();
+  });
+
   it("two topic contexts in the same chat maintain independent sessions", async () => {
     const registry = new SessionRegistry(createConfig());
 

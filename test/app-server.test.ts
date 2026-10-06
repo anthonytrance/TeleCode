@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   CodexAppServerClient,
@@ -199,6 +199,30 @@ describe("CodexAppServerClient", () => {
       "--listen",
       "stdio://",
     ]);
+  });
+
+  it("waits for process exit after a forced stop before releasing the client", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = new FakeAppServerProcess(() => undefined);
+      child.stdin.removeAllListeners("finish");
+      const kill = vi.spyOn(child, "kill").mockReturnValue(true);
+      const client = new CodexAppServerClient({
+        codexPath: "fake-codex",
+        spawnProcess: () => child,
+      });
+      await client.start();
+      let closed = false;
+      const closing = client.close().then(() => { closed = true; });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(kill).toHaveBeenCalledOnce();
+      expect(closed).toBe(false);
+      child.emit("exit", null, "SIGTERM");
+      await closing;
+      expect(closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

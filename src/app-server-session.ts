@@ -113,6 +113,7 @@ type ProviderHandoff = {
 
 export class AppServerSessionService {
   private client: AppServerClientLike | null = null;
+  private clientClosePromise: Promise<void> = Promise.resolve();
   private appServerAttachedThreadId: string | null = null;
   private currentWorkspace: string;
   private currentThreadId: string | null = null;
@@ -551,10 +552,13 @@ export class AppServerSessionService {
       }),
     );
 
+    // Forking leaves both conversations loaded in the child. Release its writers
+    // before another runtime can resume the parent, then attach only the fork.
+    this.closeClient();
+    await this.clientClosePromise;
     this.resetSessionTokens();
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentThreadId = response.thread.id;
-    this.appServerAttachedThreadId = response.thread.id;
     this.currentWorkspace = response.cwd ?? response.thread.cwd ?? this.currentWorkspace;
     if (response.model) {
       this.applyModel(response.model);
@@ -617,6 +621,7 @@ export class AppServerSessionService {
 
   prepareNewThread(workspace?: string, model?: string): CodexSessionInfo {
     this.ensureIdle("prepare a new thread");
+    this.closeClient();
     this.currentThreadId = null;
     this.appServerAttachedThreadId = null;
     this.activeThreadLaunchProfile = null;
@@ -630,6 +635,7 @@ export class AppServerSessionService {
 
   async newThread(workspace?: string, model?: string): Promise<CodexSessionInfo> {
     this.ensureIdle("start a new thread");
+    this.closeClient();
 
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const effectiveModel = model ?? this.currentModel;
@@ -661,6 +667,9 @@ export class AppServerSessionService {
 
   async resumeThread(threadId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("resume a thread");
+    if (this.currentThreadId !== threadId) {
+      this.closeClient();
+    }
 
     const client = await this.getClient();
     const response = await client.request<{ thread: AppServerThread; model?: string; cwd?: string }>(
@@ -685,14 +694,22 @@ export class AppServerSessionService {
 
     const record = this.resolveThread(threadId);
     const resolvedThreadId = record?.id ?? threadId;
-    if (record?.cwd) {
-      this.currentWorkspace = record.cwd;
+    const previousWorkspace = this.currentWorkspace;
+    const previousModel = this.currentModel;
+    try {
+      if (record?.cwd) {
+        this.currentWorkspace = record.cwd;
+      }
+      if (record?.model) {
+        // Before the resume, so the client spawns against the thread's own vendor.
+        this.applyModel(record.model);
+      }
+      return await this.resumeThread(resolvedThreadId);
+    } catch (error) {
+      this.currentWorkspace = previousWorkspace;
+      this.applyModel(previousModel);
+      throw error;
     }
-    if (record?.model) {
-      // Before the resume, so the client spawns against the thread's own vendor.
-      this.applyModel(record.model);
-    }
-    return await this.resumeThread(resolvedThreadId);
   }
 
   listAllSessions(limit?: number): CodexThreadRecord[] {
@@ -743,10 +760,18 @@ export class AppServerSessionService {
     }
   }
 
-  private closeClient(): void {
-    void this.client?.close();
-    this.client = null;
+  private closeClient(client: AppServerClientLike | null = this.client): void {
+    const closing = client?.close();
+    if (this.client === client) {
+      this.client = null;
+    }
     this.appServerAttachedThreadId = null;
+    if (closing) {
+      // prepareNewThread and model changes are synchronous. The next attachment
+      // must still wait until the old process has released its exclusive writers.
+      this.clientClosePromise = Promise.all([this.clientClosePromise, closing]).then(() => undefined);
+      void this.clientClosePromise.catch(() => undefined);
+    }
   }
 
   async runText(input: CodexPromptInput): Promise<string> {
@@ -793,22 +818,19 @@ export class AppServerSessionService {
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
     this.clearActiveRunState();
-    void this.client?.close();
-    this.client = null;
-    this.appServerAttachedThreadId = null;
+    this.closeClient();
     return info;
   }
 
   dispose(): void {
-    void this.client?.close();
-    this.client = null;
-    this.appServerAttachedThreadId = null;
+    this.closeClient();
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
     this.clearActiveRunState();
   }
 
   private async getClient(): Promise<AppServerClientLike> {
+    await this.clientClosePromise;
     if (this.client) {
       return this.client;
     }
@@ -827,11 +849,17 @@ export class AppServerSessionService {
     client.onNotification((notification) => this.handleNotification(notification));
     client.onRequest((request) => this.handleServerRequest(request));
     client.onExit?.((error) => this.handleClientExit(client, error));
-    await client.start();
-    await client.initialize(DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS);
-    client.notifyInitialized();
-    this.client = client;
-    return client;
+    try {
+      await client.start();
+      await client.initialize(DEFAULT_APP_SERVER_NOTIFICATION_OPTOUTS);
+      client.notifyInitialized();
+      this.client = client;
+      return client;
+    } catch (error) {
+      // A failed staged switch must not leave an unregistered child behind.
+      this.closeClient(client);
+      throw error;
+    }
   }
 
   private async requestCurrentThread<T = unknown>(

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -1461,6 +1461,58 @@ describe("Claude bot flow", () => {
     expect(selection).toBeDefined();
   });
 
+  it("toggles Claude and Codex with /prev without listing or starting an extra turn", async () => {
+    const { bot, sent, registry } = await createTestBot(tempDir);
+    const codexSession = {
+      getInfo: () => ({ workspace: tempDir, threadId: "existing-codex", model: "gpt-5.5" }),
+      getCurrentWorkspace: () => tempDir,
+      isProcessing: () => false,
+    };
+    vi.spyOn(registry, "get").mockReturnValue(codexSession as never);
+    const selected = () => {
+      const state = JSON.parse(readFileSync(path.join(tempDir, ".telecode", "agent-sessions.json"), "utf8"));
+      return state.sessions.find((session: { id: string }) => session.id === state.lanes[0].selectedSessionId);
+    };
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => sent.some((entry) => entry.text === "mock reply to hello"));
+    await waitForAgentSessionsIdle(tempDir);
+    const claudeId = selected().id;
+    await bot.handleUpdate(textUpdate(20, "/sessionorder created"));
+    expect(sent.at(-1)?.text).toContain("Session order: recently created");
+    await bot.handleUpdate(textUpdate(21, "/sessionorder used"));
+    await bot.handleUpdate(textUpdate(2, "/codex"));
+    expect(selected().provider).toBe("codex");
+    const codexId = selected().id;
+    await bot.handleUpdate(textUpdate(3, "/prev"));
+    expect(selected().id).toBe(claudeId);
+    await bot.handleUpdate(textUpdate(4, "/prev"));
+    expect(selected().id).toBe(codexId);
+    expect(mockClaude.prompts).toEqual(["hello"]);
+  });
+
+  it("orders Claude transcripts by creation time rather than file activity", async () => {
+    const transcriptDir = path.join(tempDir, ".claude-config", "projects", "project");
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(path.join(transcriptDir, "11111111-1111-4111-8111-111111111111.jsonl"), JSON.stringify({
+      type: "user", timestamp: "2020-01-01T00:00:00Z", cwd: tempDir,
+      message: { content: "Old creation transcript" },
+    }));
+    writeFileSync(path.join(transcriptDir, "22222222-2222-4222-8222-222222222222.jsonl"), JSON.stringify({
+      type: "user", timestamp: "2021-01-01T00:00:00Z", cwd: tempDir,
+      message: { content: "New creation transcript" },
+    }));
+    const future = new Date(Date.now() + 10000);
+    utimesSync(path.join(transcriptDir, "11111111-1111-4111-8111-111111111111.jsonl"), future, future);
+    const { bot, sent } = await createTestBot(tempDir, { claudeStrictMcpConfig: false });
+    await bot.handleUpdate(textUpdate(1, "/sessionorder created"));
+    await bot.handleUpdate(textUpdate(2, "/sessions all"));
+    const list = sent.map((entry) => entry.text ?? "").join("\n");
+    expect(list).toContain("New creation transcript");
+    expect(list).toContain("Old creation transcript");
+    expect(list.indexOf("New creation transcript")).toBeLessThan(list.indexOf("Old creation transcript"));
+    expect(list).toContain("created");
+  });
+
   it("lists sessions for bare /resume and selects with /resume <n> while Claude is active", async () => {
     const { bot, sent } = await createTestBot(tempDir);
 
@@ -2190,11 +2242,11 @@ describe("Claude bot flow", () => {
 
     it("picks a background turn back up when the user switches to it again", async () => {
       const { bot, sent } = await createTestBot(tempDir);
-      const { originalNumber, forkNumber, forkSessionId } = await startLongTurnOnFork(bot, sent);
+      const { originalNumber, forkSessionId } = await startLongTurnOnFork(bot, sent);
 
       await bot.handleUpdate(textUpdate(5, `/use ${originalNumber}`));
       await waitFor(() => sent.some((entry) => entry.text?.includes("keeps running")));
-      await bot.handleUpdate(textUpdate(6, `/use ${forkNumber}`));
+      await bot.handleUpdate(textUpdate(6, "/prev"));
       await waitFor(() => sent.some((entry) => entry.text?.includes("This session is still working")));
 
       // Selected again, so its answer arrives as a normal reply and a new message queues behind it.
@@ -2208,11 +2260,15 @@ describe("Claude bot flow", () => {
 
     it("stops a background turn by its /sessions number", async () => {
       const { bot, sent } = await createTestBot(tempDir);
-      const { originalNumber, forkNumber, forkSessionId } = await startLongTurnOnFork(bot, sent);
+      const { originalNumber, forkSessionId } = await startLongTurnOnFork(bot, sent);
 
       await bot.handleUpdate(textUpdate(5, `/use ${originalNumber}`));
       await waitFor(() => sent.some((entry) => entry.text?.includes("keeps running")));
-      await bot.handleUpdate(textUpdate(6, `/stop ${forkNumber}`));
+      await bot.handleUpdate(textUpdate(6, "/sessions"));
+      const list = sent.map((entry) => entry.text ?? "").at(-1) ?? "";
+      const forkNumber = list.split("\n").find((line) => /^\d+\. Claude, running/u.test(line))?.match(/^(\d+)\./u)?.[1];
+      expect(forkNumber).toBeDefined();
+      await bot.handleUpdate(textUpdate(7, `/stop ${forkNumber}`));
       await waitFor(() => sent.some((entry) => entry.text?.startsWith("Stop sent to Background Claude")));
       expect(mockClaude.aborts).toEqual([forkSessionId]);
       await waitFor(() => sent.some((entry) => entry.text?.includes("stopped after")));

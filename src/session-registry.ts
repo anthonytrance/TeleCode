@@ -37,7 +37,7 @@ interface LegacyPersistedContexts {
 
 export class SessionRegistry {
   private readonly sessions = new Map<TelegramContextKey, CodexSessionRuntime>();
-  /** Runtimes taken out by detach() and not yet attached or disposed; shutdown disposes them too. */
+  /** Background or staged runtimes not yet attached or disposed; shutdown disposes them too. */
   private readonly detached = new Set<CodexSessionRuntime>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
@@ -57,19 +57,30 @@ export class SessionRegistry {
     contextKey: TelegramContextKey,
     options?: { deferThreadStart?: boolean; skipThreadResume?: boolean },
   ): Promise<CodexSessionRuntime> {
-    let session = this.sessions.get(contextKey);
-    if (session) {
-      return session;
+    const existing = this.sessions.get(contextKey);
+    if (existing) {
+      return existing;
     }
 
+    const session = await this.createDetached(contextKey, options);
+    this.detached.delete(session);
+    this.sessions.set(contextKey, session);
+    return session;
+  }
+
+  /** Prepare a switch without replacing the selected runtime until it succeeds. */
+  async createDetached(
+    contextKey: TelegramContextKey,
+    options?: { deferThreadStart?: boolean; skipThreadResume?: boolean; workspace?: string },
+  ): Promise<CodexSessionRuntime> {
     const meta = this.metadata.get(contextKey);
     const launchProfileId = resolveLaunchProfileId(this.config, meta);
     const effectiveConfig = {
       ...this.config,
       codexBackend: meta?.backend ?? this.config.codexBackend,
     };
-    session = await createCodexSession(effectiveConfig, {
-      workspace: meta?.workspace,
+    const session = await createCodexSession(effectiveConfig, {
+      workspace: options?.workspace ?? meta?.workspace,
       model: meta?.model ?? this.selectedCodexModel,
       reasoningEffort: meta?.reasoningEffort,
       launchProfileId,
@@ -77,7 +88,7 @@ export class SessionRegistry {
       resumeThreadId: options?.skipThreadResume ? undefined : meta?.threadId ?? undefined,
     });
 
-    this.sessions.set(contextKey, session);
+    this.detached.add(session);
     return session;
   }
 

@@ -124,7 +124,10 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
 | `/rollbackthread <n>` | Switch to a truncated fork without the last `n` turns; the original thread remains available and file changes are not reverted |
 | `/session` | Current thread ID, workspace, model, effort, and token totals (`/status` alias) |
 | `/sessions [all]` | Browse top-level Codex and Claude sessions; `all` shows up to 500 sessions |
-| `/use <n\|previous\|latest>` | Switch sessions after `/sessions` |
+| `/use <n\|previous\|latest>` | Open a session directly in the chosen order; after `/find`, numbers open search results. `/switch` is an alias |
+| `/sessionorder used\|created` | Save the session ordering for this chat (default `used`) |
+| `/prev` | Move to the previous session; in `used` order, repeated calls toggle the last two selections |
+| `/next` | Move to a newer session in `created` order |
 | `/switch <id>` | Switch directly to a thread by ID |
 | `/history` | Show recent local thread history |
 | `/attach <id>` | Bind an existing Codex thread to this forum topic |
@@ -214,7 +217,9 @@ Each Telegram chat or forum topic is identified by a **context key** — the cha
 
 Within a context, TeleCode keeps a lane of provider sessions. The **selected** session receives your messages; other sessions keep running in the background and buffer their output. `/sessions`, `/use`, `/switch`, and `/provider` move the selection.
 
-The main session browser uses the providers' canonical thread or transcript timestamps, so startup metadata repairs do not make old sessions appear new. Spawned Codex subagent threads are omitted from `/sessions` and remain available through `/children` while their parent Codex session is selected. Long first prompts are reduced to concise topic labels, while explicit thread names from `/renamethread` are preserved.
+The main session browser defaults to recently selected sessions first. Selection recency is saved separately from job activity, so background replies and startup metadata repairs do not reorder those sessions. `/sessionorder created` instead sorts by the providers' canonical creation timestamps and leaves the selected session in its chronological position. `/sessions`, direct numbered `/use` or `/switch`, `/prev`, and `/next` share that ordering. After `/find`, numbered selections keep referring to the displayed search results, including successive result selections. `/sessions`, `/prev`, `/next`, symbolic selections such as `/use previous`, changing the order or provider, creating or forking a session, or sending a normal prompt (text, voice, or upload) returns numbering to the normal session order. IDs and names always resolve across the available sessions.
+
+Spawned Codex subagent threads are omitted from `/sessions` and remain available through `/children` while their parent Codex session is selected. Long first prompts are reduced to concise topic labels, while explicit thread names from `/renamethread` are preserved.
 
 Session metadata (thread ID, workspace, launch profile, model, effort, backend, active provider) is persisted to `.telecode/contexts.json` and restored on restart, so threads survive bot reboots. On first startup after upgrading from the legacy TeleCodex naming, a `.telecodex` state directory is migrated automatically; legacy `TELECODEX_*` environment variables remain accepted.
 

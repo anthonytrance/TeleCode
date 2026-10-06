@@ -5,12 +5,14 @@ import type { ContextMetadata } from "./session-registry.js";
 import type { AgentJobStatus, AgentProviderKind, AgentSessionStatus } from "./providers/types.js";
 
 export type AgentLaneDeliveryMode = "foreground" | "buffer-background";
+export type AgentSessionOrder = "used" | "created";
 
 export interface AgentLaneRecord {
   laneKey: TelegramContextKey;
   selectedSessionId?: string;
   defaultProvider: AgentProviderKind;
   sessionIds: string[];
+  sessionOrder?: AgentSessionOrder;
   deliveryMode: AgentLaneDeliveryMode;
   notifyOnBackgroundCompletion: boolean;
   createdAt: number;
@@ -28,6 +30,7 @@ export interface AgentSessionRecord {
   currentJobId?: string;
   createdAt: number;
   updatedAt: number;
+  lastSelectedAt?: number;
   metadata?: Record<string, unknown>;
 }
 
@@ -99,6 +102,17 @@ export class AgentSessionManager {
     return cloneLane(lane);
   }
 
+  getSessionOrder(laneKey: TelegramContextKey): AgentSessionOrder {
+    return this.lanes.get(laneKey)?.sessionOrder ?? "used";
+  }
+
+  setSessionOrder(laneKey: TelegramContextKey, order: AgentSessionOrder): void {
+    this.ensureLane(laneKey);
+    const lane = this.requireLane(laneKey);
+    lane.sessionOrder = order;
+    lane.updatedAt = this.now();
+  }
+
   createSession(
     laneKey: TelegramContextKey,
     provider: AgentProviderKind,
@@ -137,7 +151,7 @@ export class AgentSessionManager {
     this.sessions.set(sessionId, session);
     lane.sessionIds.push(sessionId);
     if (options.select !== false || !lane.selectedSessionId) {
-      lane.selectedSessionId = sessionId;
+      this.selectSession(laneKey, sessionId);
     }
     lane.updatedAt = timestamp;
     return cloneSession(session);
@@ -178,8 +192,20 @@ export class AgentSessionManager {
       throw new Error(`Agent session ${sessionId} does not belong to lane ${laneKey}`);
     }
 
+    const timestamp = this.now();
+    if (lane.selectedSessionId !== sessionId || session.lastSelectedAt === undefined) {
+      // Selection recency is independent of replies, title repairs and job state.
+      // Keep it monotonic even when two switches happen within one millisecond.
+      const latestSelection = Math.max(0, ...lane.sessionIds.map((id) => this.sessions.get(id)?.lastSelectedAt ?? 0));
+      const selectedAt = Math.max(timestamp, latestSelection + 1);
+      const previous = lane.selectedSessionId ? this.sessions.get(lane.selectedSessionId) : undefined;
+      if (previous && previous.lastSelectedAt === undefined && previous !== session) {
+        previous.lastSelectedAt = selectedAt - 1;
+      }
+      session.lastSelectedAt = selectedAt;
+    }
     lane.selectedSessionId = sessionId;
-    lane.updatedAt = this.now();
+    lane.updatedAt = timestamp;
     return cloneSession(session);
   }
 

@@ -187,6 +187,10 @@ const TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "new",
   "fork",
   "sessions",
+  "sessionorder",
+  "prev",
+  "previous",
+  "next",
   "switch",
   "use",
   "find",
@@ -271,7 +275,10 @@ type PendingClaudeLogin = {
   timeout: ReturnType<typeof setTimeout>;
 };
 
-type ProviderSessionPick =
+type ProviderSessionPick = {
+  createdAt: number;
+  lastSelectedAt?: number;
+} & (
   | {
       kind: "agent";
       session: AgentSessionRecord;
@@ -301,7 +308,7 @@ type ProviderSessionPick =
       status: "old";
       providerSessionId: string;
       metadata?: Record<string, unknown>;
-    };
+    });
 
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
@@ -366,6 +373,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   >();
   const pendingSessionPicks = new Map<TelegramContextKey, string[]>();
   const pendingAgentSessionPicks = new Map<TelegramContextKey, ProviderSessionPick[]>();
+  const pendingAgentSessionPickSources = new Map<TelegramContextKey, "sessions" | "search">();
   const pendingChildPicks = new Map<TelegramContextKey, string[]>();
   const pendingWorkspacePicks = new Map<TelegramContextKey, string[]>();
   const pendingSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
@@ -806,6 +814,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     busyProviders.delete(key);
     pendingSessionPicks.delete(key);
     pendingAgentSessionPicks.delete(key);
+    pendingAgentSessionPickSources.delete(key);
     pendingChildPicks.delete(key);
     pendingSessionButtons.delete(key);
     pendingLaunchPicks.delete(key);
@@ -1258,6 +1267,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         next = agentSessions.updateMetadata(existing.id, {
           ...options.metadata,
           ...(typeof existing.metadata?.customTitle === "string" ? { customTitle: existing.metadata.customTitle } : {}),
+          ...(typeof existing.metadata?.providerCreatedAt === "number" ? { providerCreatedAt: existing.metadata.providerCreatedAt } : {}),
         });
       }
       if (options.select) {
@@ -1566,6 +1576,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         metadata: forked.metadata,
       });
       persistClaudeSession(contextKey, forked);
+      clearSessionSelectionState(contextKey);
       const message = "Forked this conversation. You are now on the fork; the original stays available under /sessions. Your next message continues from the fork point.";
       await safeReply(ctx, escapeHTML(message), { fallbackText: message, messageThreadId });
     } catch (error) {
@@ -1790,9 +1801,15 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     pendingUnsafeLaunchConfirmations.delete(contextKey);
   };
 
+  const clearProviderSessionPicks = (contextKey: TelegramContextKey): void => {
+    pendingAgentSessionPicks.delete(contextKey);
+    pendingAgentSessionPickSources.delete(contextKey);
+  };
+
   const clearSessionSelectionState = (contextKey: TelegramContextKey): void => {
     pendingSessionPicks.delete(contextKey);
     pendingSessionButtons.delete(contextKey);
+    clearProviderSessionPicks(contextKey);
   };
 
   const clearChildSelectionState = (contextKey: TelegramContextKey): void => {
@@ -4628,6 +4645,7 @@ ${message}`,
             title: resolveCodexThreadTitle(thread),
             workspace: thread.cwd,
             updatedAt: thread.updatedAt.getTime(),
+            createdAt: thread.createdAt.getTime(),
           };
         }
       } else if (session.provider === "claude" && session.providerSessionId) {
@@ -4638,6 +4656,7 @@ ${message}`,
             title: typeof session.metadata?.customTitle === "string" ? session.metadata.customTitle : transcript.title,
             workspace: transcript.workspace,
             updatedAt: transcript.updatedAt,
+            createdAt: transcript.createdAt,
           };
         }
       }
@@ -4666,20 +4685,37 @@ ${message}`,
       }
     }
 
+    const order = agentSessions.getSessionOrder(contextKey);
     return [...picksByKey.values()]
       .sort((left, right) => {
-        const selectedDelta = Number(providerSessionPickAgentId(right) === selectedSessionId) - Number(providerSessionPickAgentId(left) === selectedSessionId);
-        if (selectedDelta !== 0) {
-          return selectedDelta;
+        if (order === "created") {
+          return right.createdAt - left.createdAt || providerSessionPickKey(left).localeCompare(providerSessionPickKey(right));
         }
-        return right.updatedAt - left.updatedAt;
+        const selectedDelta = Number(providerSessionPickAgentId(right) === selectedSessionId) - Number(providerSessionPickAgentId(left) === selectedSessionId);
+        const recordedDelta = Number(right.lastSelectedAt !== undefined) - Number(left.lastSelectedAt !== undefined);
+        return selectedDelta || recordedDelta ||
+          (right.lastSelectedAt ?? right.updatedAt) - (left.lastSelectedAt ?? left.updatedAt) ||
+          providerSessionPickKey(left).localeCompare(providerSessionPickKey(right));
       })
       .slice(0, limit);
+  };
+
+  const sessionSelectionPicks = (contextKey: TelegramContextKey, selection: string): ProviderSessionPick[] => {
+    const searchPicks = pendingAgentSessionPickSources.get(contextKey) === "search"
+      ? pendingAgentSessionPicks.get(contextKey) ?? []
+      : [];
+    if (/^\d+$/.test(selection.trim()) && pendingAgentSessionPickSources.get(contextKey) === "search") {
+      return searchPicks;
+    }
+    const picks = buildRecentProviderSessionPicks(contextKey, MAX_PROVIDER_SESSION_LIST_LIMIT);
+    const keys = new Set(picks.map(providerSessionPickKey));
+    return [...picks, ...searchPicks.filter((pick) => !keys.has(providerSessionPickKey(pick)))];
   };
 
   const materializeProviderSessionPick = async (
     contextKey: TelegramContextKey,
     pick: ProviderSessionPick,
+    select = true,
   ): Promise<AgentSessionRecord> => {
     if (pick.kind === "agent") {
       return pick.session;
@@ -4690,10 +4726,11 @@ ${message}`,
         workspace: pick.workspace,
         displayName: pick.title,
         providerSessionId: pick.providerSessionId,
-        select: true,
+        select,
         metadata: {
           model: pick.thread.model,
           importedFrom: "codex-state",
+          providerCreatedAt: pick.createdAt,
         },
       });
     }
@@ -4702,8 +4739,8 @@ ${message}`,
       workspace: pick.workspace,
       displayName: pick.title,
       providerSessionId: pick.providerSessionId,
-      select: true,
-      metadata: pick.metadata,
+      select,
+      metadata: { ...pick.metadata, providerCreatedAt: pick.createdAt },
     });
   };
 
@@ -4717,21 +4754,24 @@ ${message}`,
     }
 
     pendingAgentSessionPicks.set(contextKey, picks);
+    pendingAgentSessionPickSources.set(contextKey, "sessions");
+    const order = agentSessions.getSessionOrder(contextKey);
     const lines = [
       `Recent provider sessions (top-level only). Showing ${picks.length}. Selected: ${formatSelectedProviderSessionLabel(picks, lane.selectedSessionId)}.`,
-      ...picks.map((pick, index) => formatProviderSessionPickLine(index + 1, pick, lane.selectedSessionId)),
+      `Order: recently ${order === "used" ? "used" : "created"}. Change with /sessionorder used or /sessionorder created.`,
+      ...picks.map((pick, index) => formatProviderSessionPickLine(index + 1, pick, lane.selectedSessionId, order)),
       "",
       limit < MAX_PROVIDER_SESSION_LIST_LIMIT ? `Use /sessions all for up to ${MAX_PROVIDER_SESSION_LIST_LIMIT} sessions.` : undefined,
       "Subagent child threads are omitted here; use /children while a Codex session is selected.",
-      "Use /switch 1 or /use 1. Use /session for technical IDs.",
+      "Use /switch 1 or /use 1 without listing first. /prev goes older; /next goes newer. Use /session for technical IDs.",
     ];
     return lines.filter((line): line is string => Boolean(line)).join("\n");
   };
 
   /**
-   * "Background Claude, session 3 "title"", numbered from the /sessions list the
-   * user last saw so /use with that number reaches it. Rebuilds the list when the
-   * session is not on it, and keeps the rebuilt list so the number stays valid.
+   * Background session numbers follow the current order, or the active /find
+   * results. Missing background sessions are appended to search results without
+   * changing the numbers the user already received.
    */
   const describeBackgroundClaudeTurn = (
     contextKey: TelegramContextKey,
@@ -4769,12 +4809,17 @@ ${message}`,
         providerSessionPickAgentId(pick) === agentSessionId ||
         (Boolean(providerSessionId) && pick.providerSessionId === providerSessionId)
       );
-    let index = pendingAgentSessionPicks.get(contextKey)?.findIndex(matches) ?? -1;
+    const existingPicks = pendingAgentSessionPickSources.get(contextKey) === "search"
+      ? pendingAgentSessionPicks.get(contextKey)
+      : buildRecentProviderSessionPicks(contextKey, MAX_PROVIDER_SESSION_LIST_LIMIT);
+    let index = existingPicks?.findIndex(matches) ?? -1;
     if (index < 0) {
       try {
-        const picks = buildRecentProviderSessionPicks(contextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
-        index = picks.findIndex(matches);
-        if (index >= 0) {
+        const recentPicks = buildRecentProviderSessionPicks(contextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
+        const missingPick = recentPicks.find(matches);
+        if (missingPick) {
+          const picks = existingPicks ? [...existingPicks, missingPick] : recentPicks;
+          index = picks.findIndex(matches);
           pendingAgentSessionPicks.set(contextKey, picks);
         }
       } catch {
@@ -4903,12 +4948,7 @@ ${message}`,
     return entry.descriptor;
   };
 
-  /**
-   * Moves the lane's running Codex turn to the background: its runtime leaves the
-   * registry and keeps going, and the lane is free for a new runtime. Returns why
-   * it refused, or undefined once the lane is free.
-   */
-  const moveRunningCodexTurnToBackground = (
+  const codexBackgroundSwitchRefusal = (
     contextKey: TelegramContextKey,
     options: { swapping: boolean },
   ): string | undefined => {
@@ -4924,6 +4964,25 @@ ${message}`,
     if (!options.swapping && runningTurns >= maxParallelCodexTurns) {
       return `Codex is already running ${runningTurns} turns at once, and the limit is ${maxParallelCodexTurns}. Wait for one to finish, or stop one with /stop and its /sessions number, then try again.`;
     }
+    return undefined;
+  };
+
+  /**
+   * Moves the lane's running Codex turn to the background: its runtime leaves the
+   * registry and keeps going, and the lane is free for a new runtime. Returns why
+   * it refused, or undefined once the lane is free.
+   */
+  const moveRunningCodexTurnToBackground = (
+    contextKey: TelegramContextKey,
+    options: { swapping: boolean },
+  ): string | undefined => {
+    const refusal = codexBackgroundSwitchRefusal(contextKey, options);
+    if (refusal) {
+      return refusal;
+    }
+    const running = runningCodexTurnByLane.get(contextKey)!;
+    const runtime = registry.get(contextKey)!;
+    const runningTurns = runningCodexTurnByLane.size + backgroundCodexTurns.size;
     registry.detach(contextKey);
     codexTurnBackgroundHooks.get(runtime)?.();
     backgroundCodexTurns.set(runtime, {
@@ -4990,12 +5049,24 @@ ${message}`,
     ctx: Context,
     contextKey: TelegramContextKey,
     rawSelection: string,
+    options: { concise?: boolean } = {},
   ): Promise<boolean> => {
-    const picks = pendingAgentSessionPicks.get(contextKey) ?? buildRecentProviderSessionPicks(contextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
+    if (getBusyState(contextKey).switching) {
+      const message = "A session switch is already in progress. Try again when it finishes.";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return true;
+    }
+    if (/^(?:prev|previous|next|latest)$/i.test(rawSelection.trim())) {
+      clearProviderSessionPicks(contextKey);
+    }
+    const picks = sessionSelectionPicks(contextKey, rawSelection);
     const targetPick = resolveProviderSessionPick(rawSelection, picks, agentSessions.getLane(contextKey)?.selectedSessionId);
     if (!targetPick) {
       const matches = findProviderSessionPickMatches(rawSelection, picks);
-      const message = matches.length > 1
+      const value = rawSelection.trim().toLowerCase();
+      const message = /^(prev|previous|next)$/.test(value)
+        ? `There is no ${value === "next" ? "newer" : "older"} session in the current order.`
+        : matches.length > 1
         ? "Ambiguous provider session. Use more characters or a list number from /sessions."
         : "Unknown provider session. Run /sessions, then use /switch 1.";
       await safeReply(ctx, escapeHTML(message), { fallbackText: message });
@@ -5008,7 +5079,7 @@ ${message}`,
       const runningTargetId = await findBackgroundClaudeTurnId(contextKey, targetPick);
       const switchingClaudeSession = runningTargetId !== undefined ||
         currentClaude?.providerSessionId !== targetPick.providerSessionId;
-      let backgroundNote: string | undefined;
+      let backgroundNote: (() => string) | undefined;
       if (isProviderBusy(contextKey, "claude") && switchingClaudeSession) {
         const leaving = currentClaude;
         const refusal = await moveRunningClaudeTurnToBackground(contextKey, { swapping: runningTargetId !== undefined });
@@ -5018,80 +5089,124 @@ ${message}`,
         }
         const leavingTurn = leaving ? backgroundClaudeTurns.get(leaving.id) : undefined;
         if (leaving && leavingTurn) {
-          backgroundNote = `${describeBackgroundClaudeTurn(contextKey, leavingTurn.descriptor, leavingTurn.agentSessionId)} keeps running. Its answer arrives here with its name in front when it finishes.`;
+          backgroundNote = () => `${describeBackgroundClaudeTurn(contextKey, leavingTurn.descriptor, leavingTurn.agentSessionId)} keeps running. Its answer arrives here with its name in front when it finishes.`;
         }
       }
 
-      const target = await materializeProviderSessionPick(contextKey, targetPick);
-      registry.setActiveProvider(contextKey, "claude");
-      agentSessions.selectSession(contextKey, target.id);
-      persistAgentSessionState();
+      const target = await materializeProviderSessionPick(contextKey, targetPick, false);
       const adopted = runningTargetId !== undefined
         ? adoptBackgroundClaudeTurn(contextKey, runningTargetId)
         : undefined;
       const descriptor = adopted ?? (switchingClaudeSession
         ? await resumeClaudeAgentSession(contextKey, target)
         : currentClaude ?? await resumeClaudeAgentSession(contextKey, target));
+      registry.setActiveProvider(contextKey, "claude");
+      agentSessions.selectSession(contextKey, target.id);
+      persistAgentSessionState();
       await flushBufferedPriority(ctx, contextKey, descriptor, parseContextKey(contextKey).messageThreadId);
-      const selection = formatProviderSessionSelectionMessage(target, listNumber);
+      const selection = options.concise
+        ? formatBriefProviderSessionSelection(target)
+        : formatProviderSessionSelectionMessage(target, listNumber);
       const adoptedNote = adopted
         ? "This session is still working. Its answer arrives here as usual; use /replay for what it did while you were away."
         : undefined;
-      const message = [backgroundNote, selection, adoptedNote].filter(Boolean).join("\n\n");
+      const message = [backgroundNote?.(), selection, adoptedNote].filter(Boolean).join("\n\n");
       await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
       return true;
     }
 
     if (targetPick.provider === "codex") {
+      const busyState = getBusyState(contextKey);
+      busyState.switching = true;
       const runningTarget = findBackgroundCodexTurn(contextKey, targetPick);
-      const currentThreadId = registry.get(contextKey)?.getInfo().threadId ?? null;
+      const previousRuntime = registry.get(contextKey);
+      const currentThreadId = previousRuntime?.getInfo().threadId ?? null;
       const switchingCodexSession = runningTarget !== undefined ||
         currentThreadId !== (targetPick.providerSessionId ?? null);
-      let backgroundNote: string | undefined;
-      let movedToBackground = false;
-      if (isProviderBusy(contextKey, "codex") && switchingCodexSession) {
-        const leaving = registry.get(contextKey);
-        const refusal = moveRunningCodexTurnToBackground(contextKey, { swapping: runningTarget !== undefined });
-        if (refusal) {
-          await safeReply(ctx, escapeHTML(refusal), { fallbackText: refusal });
-          return true;
+      let stagedRuntime: CodexSessionRuntime | undefined;
+      let switchCommitted = false;
+      try {
+        if (isProviderBusy(contextKey, "codex") && switchingCodexSession) {
+          const refusal = codexBackgroundSwitchRefusal(contextKey, { swapping: runningTarget !== undefined });
+          if (refusal) {
+            await safeReply(ctx, escapeHTML(refusal), { fallbackText: refusal });
+            return true;
+          }
         }
-        const leavingTurn = leaving ? backgroundCodexTurns.get(leaving) : undefined;
-        if (leavingTurn) {
-          movedToBackground = true;
-          backgroundNote = `${describeBackgroundCodexTurn(contextKey, leavingTurn)} keeps running. Its answer arrives here with its name in front when it finishes.`;
+        let codexSession = previousRuntime;
+        if (!runningTarget) {
+          if (!codexSession || (switchingCodexSession && isProviderBusy(contextKey, "codex"))) {
+            // Reopen the requested conversation before moving the current turn.
+            // A failed resume must never install an empty runtime in the lane.
+            stagedRuntime = await registry.createDetached(contextKey, {
+              deferThreadStart: true,
+              skipThreadResume: true,
+              workspace: targetPick.workspace,
+            });
+            codexSession = stagedRuntime;
+          }
+          if (targetPick.providerSessionId && codexSession.getInfo().threadId !== targetPick.providerSessionId) {
+            await codexSession.switchSession(targetPick.providerSessionId);
+          }
         }
-      }
 
-      const target = await materializeProviderSessionPick(contextKey, targetPick);
-      const adopted = runningTarget !== undefined && adoptBackgroundCodexTurn(contextKey, runningTarget);
-      if (!adopted) {
-        // After a move to the background the lane needs a fresh runtime, and it
-        // must not resume the thread the background turn is still running.
-        const contextSession = await getContextSession(ctx, {
-          deferThreadStart: true,
-          ...(movedToBackground ? { skipThreadResume: true } : {}),
-        });
-        if (!contextSession) {
-          return true;
+        let backgroundNote: (() => string) | undefined;
+        if (isProviderBusy(contextKey, "codex") && switchingCodexSession) {
+          const leaving = registry.get(contextKey);
+          const refusal = moveRunningCodexTurnToBackground(contextKey, { swapping: runningTarget !== undefined });
+          if (refusal) {
+            await safeReply(ctx, escapeHTML(refusal), { fallbackText: refusal });
+            return true;
+          }
+          const leavingTurn = leaving ? backgroundCodexTurns.get(leaving) : undefined;
+          if (leavingTurn) {
+            backgroundNote = () => `${describeBackgroundCodexTurn(contextKey, leavingTurn)} keeps running. Its answer arrives here with its name in front when it finishes.`;
+          }
         }
-        const codexSession = contextSession.session;
-        if (target.providerSessionId && codexSession.getInfo().threadId !== target.providerSessionId) {
-          await codexSession.switchSession(target.providerSessionId);
+
+        // Adoption is synchronous: reuse the writer of a running background
+        // conversation instead of trying to resume it in a second app-server.
+        const adopted = runningTarget !== undefined && adoptBackgroundCodexTurn(contextKey, runningTarget);
+        if (!adopted && codexSession) {
+          if (stagedRuntime) {
+            const replaced = registry.detach(contextKey);
+            if (replaced) {
+              registry.disposeDetached(replaced);
+            }
+            registry.attach(contextKey, stagedRuntime);
+            stagedRuntime = undefined;
+          } else {
+            updateSessionMetadata(contextKey, codexSession);
+          }
         }
-        updateSessionMetadata(contextKey, codexSession);
+        switchCommitted = true;
+        const target = await materializeProviderSessionPick(contextKey, targetPick, false);
+        registry.setActiveProvider(contextKey, "codex");
+        agentSessions.selectSession(contextKey, target.id);
+        persistAgentSessionState();
+        await flushBufferedPriority(ctx, contextKey, target, parseContextKey(contextKey).messageThreadId);
+        const selection = options.concise
+          ? formatBriefProviderSessionSelection(target)
+          : formatProviderSessionSelectionMessage(target, listNumber);
+        const adoptedNote = adopted
+          ? "This session is still working. Its answer arrives here as usual; use /replay for what it did while you were away."
+          : undefined;
+        const message = [backgroundNote?.(), selection, adoptedNote].filter(Boolean).join("\n\n");
+        await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
+        return true;
+      } catch (error) {
+        const message = switchCommitted
+          ? `Codex session "${targetPick.title}" was opened, but the switch could not finish: ${friendlyErrorText(error)}`
+          : `Could not open Codex session "${targetPick.title}": ${friendlyErrorText(error)}\n\nYour previous session is still selected.`;
+        bridgeLog("switch", `codex switch failed target=${targetPick.providerSessionId} lane=${contextKey} committed=${switchCommitted}: ${friendlyErrorText(error)}`);
+        await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
+        return true;
+      } finally {
+        if (stagedRuntime) {
+          registry.disposeDetached(stagedRuntime);
+        }
+        busyState.switching = false;
       }
-      registry.setActiveProvider(contextKey, "codex");
-      agentSessions.selectSession(contextKey, target.id);
-      persistAgentSessionState();
-      await flushBufferedPriority(ctx, contextKey, target, parseContextKey(contextKey).messageThreadId);
-      const selection = formatProviderSessionSelectionMessage(target, listNumber);
-      const adoptedNote = adopted
-        ? "This session is still working. Its answer arrives here as usual; use /replay for what it did while you were away."
-        : undefined;
-      const message = [backgroundNote, selection, adoptedNote].filter(Boolean).join("\n\n");
-      await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
-      return true;
     }
 
     const message = `Provider ${targetPick.provider} is not supported yet.`;
@@ -5353,6 +5468,7 @@ ${message}`,
     agentSessions.ensureLane(contextKey, { defaultProvider: provider });
     agentSessions.setDefaultProvider(contextKey, provider);
     registry.setActiveProvider(contextKey, provider);
+    clearProviderSessionPicks(contextKey);
     persistAgentSessionState();
     const message = `Provider set to ${provider}. New bare /new sessions will use ${provider}.`;
     await safeReply(ctx, escapeHTML(message), { fallbackText: message });
@@ -5378,6 +5494,7 @@ ${message}`,
     }
 
     registry.setActiveProvider(contextKey, "claude");
+    clearProviderSessionPicks(contextKey);
     const prompt = getCommandArgument(ctx);
     const descriptor = claudeSessions.get(contextKey);
     if (descriptor) {
@@ -5436,6 +5553,7 @@ ${message}`,
     }
 
     registry.setActiveProvider(contextKey, "codex");
+    clearProviderSessionPicks(contextKey);
     const codexSession = registry.get(contextKey);
     if (codexSession) {
       const info = codexSession.getInfo();
@@ -5681,6 +5799,7 @@ ${message}`,
       registry.setActiveProvider(rawContextKey, "claude");
       try {
         const descriptor = await createFreshClaudeSession(rawContextKey, { model: requestedModel });
+        clearSessionSelectionState(rawContextKey);
         const model = String(descriptor.metadata?.model ?? registry.getClaudeDefaultModel());
         const message = [
           backgroundNote,
@@ -5862,8 +5981,7 @@ ${message}`,
     if (rawContextKey && stopArgument) {
       // /stop <n>: stop a turn left running in the background, by its /sessions
       // number, without switching to it.
-      const picks = pendingAgentSessionPicks.get(rawContextKey) ??
-        buildRecentProviderSessionPicks(rawContextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
+      const picks = sessionSelectionPicks(rawContextKey, stopArgument);
       const pick = resolveProviderSessionPick(stopArgument, picks, agentSessions.getLane(rawContextKey)?.selectedSessionId);
       const backgroundCodex = pick ? findBackgroundCodexTurn(rawContextKey, pick) : undefined;
       const backgroundCodexTurn = backgroundCodex ? backgroundCodexTurns.get(backgroundCodex) : undefined;
@@ -7318,11 +7436,50 @@ ${message}`,
     await selectUnifiedAgentSession(ctx, contextKeyForAgent, agentArg);
   });
 
+  bot.command("sessionorder", async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+    const requested = getCommandArgument(ctx).trim().toLowerCase();
+    if (requested && requested !== "used" && requested !== "created") {
+      const message = "Usage: /sessionorder used or /sessionorder created";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+    if (requested) {
+      agentSessions.setSessionOrder(contextKey, requested === "created" ? "created" : "used");
+      clearProviderSessionPicks(contextKey);
+      persistAgentSessionState();
+    }
+    const order = agentSessions.getSessionOrder(contextKey);
+    const message = `Session order: recently ${order === "used" ? "used" : "created"}. ${order === "used" ? "/prev returns to the session you just left." : "/prev goes older; /next goes newer."}\nUse /sessionorder used or /sessionorder created. This preference is saved for this chat.`;
+    await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+  });
+
+  bot.command(["prev", "previous", "next"], async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+    if (getCommandArgument(ctx).trim()) {
+      const message = "Usage: /prev or /next";
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
+    const direction = commandNameFromText(ctx.message?.text ?? "") === "next" ? "next" : "previous";
+    await selectUnifiedAgentSession(ctx, contextKey, direction, { concise: true });
+  });
+
   const buildSearchResultPicks = (
+    contextKey: TelegramContextKey,
     hits: SessionSearchHit[],
     limit: number,
   ): Array<{ pick: ProviderSessionPick; snippet: string }> => {
     const spawnedThreadIds = new Set(listSpawnedThreadIds());
+    const trackedSessions = new Map(agentSessions.listLaneSessions(contextKey)
+      .filter((session) => session.providerSessionId)
+      .map((session) => [`${session.provider}:${session.providerSessionId}`, session]));
     const entries: Array<{ pick: ProviderSessionPick; snippet: string }> = [];
     for (const hit of hits) {
       if (entries.length >= limit) {
@@ -7343,7 +7500,8 @@ ${message}`,
           updatedAt: new Date(hit.updatedAt),
           firstUserMessage: "",
         };
-        const pick = providerSessionPickFromCodexThread(thread);
+        const tracked = trackedSessions.get(`codex:${hit.sessionId}`);
+        const pick = tracked ? providerSessionPickFromAgentSession(tracked) : providerSessionPickFromCodexThread(thread);
         entries.push({
           pick: hit.title ? { ...pick, title: cleanProviderSessionTitle(hit.title) } : pick,
           snippet: hit.snippet,
@@ -7354,12 +7512,14 @@ ${message}`,
       if (!config.enableClaudeProvider) {
         continue;
       }
+      const tracked = trackedSessions.get(`claude:${hit.sessionId}`);
       entries.push({
-        pick: providerSessionPickFromClaudeTranscript(
+        pick: tracked ? providerSessionPickFromAgentSession(tracked) : providerSessionPickFromClaudeTranscript(
           {
             sessionId: hit.sessionId,
             workspace: hit.workspace || config.workspace,
             title: hit.title || `Claude session ${hit.sessionId.slice(0, 8)}`,
+            createdAt: hit.updatedAt,
             updatedAt: hit.updatedAt,
           },
           {
@@ -7411,7 +7571,7 @@ ${message}`,
     }
 
     const result = sessionSearch.search(query, 30);
-    const entries = buildSearchResultPicks(result.hits, 10);
+    const entries = buildSearchResultPicks(contextKey, result.hits, 10);
     if (entries.length === 0) {
       const message = `No sessions matched "${query}". Every word must appear in the same session; try fewer or different words.`;
       await safeReply(ctx, escapeHTML(message), { fallbackText: message });
@@ -7419,6 +7579,7 @@ ${message}`,
     }
 
     pendingAgentSessionPicks.set(contextKey, entries.map((entry) => entry.pick));
+    pendingAgentSessionPickSources.set(contextKey, "search");
     const selectedSessionId = agentSessions.getLane(contextKey)?.selectedSessionId;
     const shownNote = result.totalMatches > entries.length
       ? `showing ${entries.length} of ${result.totalMatches}, newest first`
@@ -7497,8 +7658,7 @@ ${message}`,
       return;
     }
     const selection = (ctx.match[1] ?? "").trim();
-    const picks = pendingAgentSessionPicks.get(contextKey)
-      ?? buildRecentProviderSessionPicks(contextKey, DEFAULT_PROVIDER_SESSION_LIST_LIMIT);
+    const picks = sessionSelectionPicks(contextKey, selection);
     const selectedSessionId = agentSessions.getLane(contextKey)?.selectedSessionId;
     const resolved = resolveProviderSessionPick(selection, picks, selectedSessionId);
     if (!resolved && findProviderSessionPickMatches(selection, picks).length === 0) {
@@ -9025,6 +9185,7 @@ ${message}`,
       await submitClaudeLoginCode(ctx, rawContextKey, userText);
       return;
     }
+    clearProviderSessionPicks(rawContextKey);
     if (isClaudeActive(rawContextKey)) {
       lastPromptInput.set(rawContextKey, userText);
       await setReaction(ctx, "👀");
@@ -9134,6 +9295,7 @@ ${message}`,
       promptText += `\n\n[Voice message audio saved at: ${keptAudioPath}${hint ? `. ${hint}` : ""}]`;
     }
 
+    clearProviderSessionPicks(contextKey);
     lastPromptInput.set(contextKey, transcript);
     if (isClaudeActive(contextKey)) {
       // handleClaudePrompt queues internally when the Claude lane is busy.
@@ -9197,6 +9359,7 @@ ${message}`,
     const caption = ctx.message?.caption?.trim();
     const fileNote = `[The user sent a file via Telegram: ${stagedFile.safeName} (${mimeType}), saved at: ${stagedFile.localPath}. Open it from there with your own tools.]`;
     const promptText = caption ? `${caption}\n\n${fileNote}` : `The user sent a file without a message.\n\n${fileNote}`;
+    clearProviderSessionPicks(contextKey);
     lastPromptInput.set(contextKey, caption || stagedFile.safeName);
     await setReaction(ctx, "👀");
     startClaudePrompt(ctx, contextKey, chatId, promptText);
@@ -9257,6 +9420,7 @@ ${message}`,
 
     const caption = ctx.message.caption?.trim();
     const promptInput: { text?: string; imagePaths: string[] } = { imagePaths: [tempFilePath] };
+    clearProviderSessionPicks(contextKey);
     if (caption) {
       promptInput.text = caption;
       lastPromptInput.set(contextKey, caption);
@@ -9369,6 +9533,7 @@ ${message}`,
     const promptInput: CodexPromptInput = {
       stagedFileInstructions: buildFileInstructions([stagedFile], outDir),
     };
+    clearProviderSessionPicks(contextKey);
     const caption = ctx.message.caption?.trim();
     if (caption) {
       promptInput.text = caption;
@@ -9469,6 +9634,9 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "appbackendtest", description: "Smoke-test app-server backend" },
     { command: "artifacttest", description: "Send a generated test file" },
     { command: "sessions", description: "Browse provider sessions" },
+    { command: "sessionorder", description: "Order sessions by use or creation" },
+    { command: "prev", description: "Previous session in the chosen order" },
+    { command: "next", description: "Newer session in creation order" },
     { command: "find", description: "Search all sessions by content" },
     { command: "replay", description: "Release buffered background commentary" },
     { command: "history", description: "Show recent local thread history" },
@@ -10760,6 +10928,8 @@ function providerSessionPickFromAgentSession(session: AgentSessionRecord): Provi
     title,
     workspace: session.workspace,
     updatedAt: session.updatedAt,
+    createdAt: typeof session.metadata?.providerCreatedAt === "number" ? session.metadata.providerCreatedAt : session.createdAt,
+    lastSelectedAt: session.lastSelectedAt,
     status: session.status,
     providerSessionId: session.providerSessionId,
   };
@@ -10773,6 +10943,7 @@ function providerSessionPickFromCodexThread(thread: CodexThreadRecord): Provider
     title: resolveCodexThreadTitle(thread),
     workspace: thread.cwd,
     updatedAt: thread.updatedAt.getTime(),
+    createdAt: thread.createdAt.getTime(),
     status: "old",
     providerSessionId: thread.id,
   };
@@ -10788,6 +10959,7 @@ function providerSessionPickFromClaudeTranscript(
     title: cleanProviderSessionTitle(transcript.title || "Claude Code session"),
     workspace: transcript.workspace,
     updatedAt: transcript.updatedAt,
+    createdAt: transcript.createdAt,
     status: "old",
     providerSessionId: transcript.sessionId,
     metadata,
@@ -10890,16 +11062,12 @@ function resolveProviderSessionPick(
     return picks[0];
   }
 
-  if (value.toLowerCase() === "previous") {
-    // The most recent session that is not the currently selected one. Picks are
-    // sorted selected-first, then by recency.
-    if (selectedSessionId) {
-      const nonSelected = picks.find((pick) => providerSessionPickAgentId(pick) !== selectedSessionId);
-      if (nonSelected) {
-        return nonSelected;
-      }
+  if (/^(prev|previous|next)$/i.test(value)) {
+    const current = picks.findIndex((pick) => providerSessionPickAgentId(pick) === selectedSessionId);
+    if (current < 0) {
+      return value.toLowerCase() === "next" ? undefined : picks[0];
     }
-    return picks[1] ?? picks[0];
+    return picks[current + (value.toLowerCase() === "next" ? -1 : 1)];
   }
 
   const numeric = Number.parseInt(value, 10);
@@ -10947,13 +11115,15 @@ function formatUnifiedSessionLine(index: number, session: AgentSessionRecord, se
   return `${index}. ${session.provider} ${session.status}${selected}${running} - ${label}${providerSession} - ${getWorkspaceShortName(session.workspace)}`;
 }
 
-function formatProviderSessionPickLine(index: number, pick: ProviderSessionPick, selectedSessionId?: string): string {
+function formatProviderSessionPickLine(index: number, pick: ProviderSessionPick, selectedSessionId?: string, order?: "used" | "created"): string {
   const selected = providerSessionPickAgentId(pick) === selectedSessionId ? ", selected" : "";
   const running = pick.status === "running" ? ", running" : "";
   const old = pick.kind === "agent" ? "" : ", old";
   const title = trimLine(pick.title || "(untitled)", 82);
   const workspace = getWorkspaceShortName(pick.workspace);
-  return `${index}. ${formatProviderDisplayName(pick.provider)}${selected}${running}${old}, ${formatRelativeTime(new Date(pick.updatedAt))}, ${workspace}: ${title}`;
+  const timestamp = order === "created" ? pick.createdAt : order === "used" ? pick.lastSelectedAt ?? pick.updatedAt : pick.updatedAt;
+  const age = `${order === "created" ? "created " : ""}${formatRelativeTime(new Date(timestamp))}`;
+  return `${index}. ${formatProviderDisplayName(pick.provider)}${selected}${running}${old}, ${age}, ${workspace}: ${title}`;
 }
 
 function formatProviderSessionSelectionMessage(session: AgentSessionRecord, listNumber?: number): string {
@@ -10967,6 +11137,11 @@ function formatProviderSessionSelectionMessage(session: AgentSessionRecord, list
   ];
 
   return lines.join("\n");
+}
+
+function formatBriefProviderSessionSelection(session: AgentSessionRecord): string {
+  const name = cleanProviderSessionTitle(session.displayName || session.provider);
+  return `Selected ${formatProviderDisplayName(session.provider)}: ${name}. ${session.status === "running" ? "Still working." : "Ready."}`;
 }
 
 function shortSessionLabel(sessionId: string): string {
@@ -11001,6 +11176,7 @@ type ClaudeTranscriptSessionSummary = {
   sessionId: string;
   workspace: string;
   title: string;
+  createdAt: number;
   updatedAt: number;
 };
 
@@ -11023,6 +11199,7 @@ type ClaudeTranscriptScan = {
   topicWorkspace: string;
   explicitTitle: string;
   fallbackTitle: string;
+  createdAt?: number;
 };
 
 function scanClaudeTranscriptLines(
@@ -11041,6 +11218,13 @@ function scanClaudeTranscriptLines(
       entry = JSON.parse(line) as Record<string, unknown>;
     } catch {
       continue;
+    }
+
+    if (scan.createdAt === undefined && typeof entry.timestamp === "string") {
+      const timestamp = Date.parse(entry.timestamp);
+      if (Number.isFinite(timestamp)) {
+        scan.createdAt = timestamp;
+      }
     }
 
     if (typeof entry.cwd === "string" && entry.cwd.trim()) {
@@ -11156,6 +11340,7 @@ function readClaudeTranscriptSummary(
     sessionId: file.sessionId,
     workspace: scan.workspace || path.dirname(file.path),
     title: scan.explicitTitle || resolvedFallbackTitle || `Claude session ${file.sessionId.slice(0, 8)}`,
+    createdAt: scan.createdAt ?? file.updatedAt,
     updatedAt: file.updatedAt,
   };
   claudeTranscriptSummaryCache.set(file.path, { mtimeMs: file.updatedAt, size: window.size, summary });

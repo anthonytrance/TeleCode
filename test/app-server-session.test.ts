@@ -78,6 +78,74 @@ class FakeAppServerClient implements AppServerClientLike {
 }
 
 describe("AppServerSessionService", () => {
+  it("releases earlier writers before starting or resuming a different thread", async () => {
+    const { createClient, clients, owners } = createWriterHarness();
+    const service = await AppServerSessionService.create(createConfig(), { appServerClientFactory: createClient });
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => { releaseClose = resolve; });
+    const releaseWriters = clients[0].closed.getMockImplementation()!;
+    clients[0].closed.mockImplementationOnce(async () => {
+      await closeGate;
+      await releaseWriters();
+      return undefined;
+    });
+
+    const starting = service.newThread();
+    await vi.waitFor(() => expect(clients[0].closed).toHaveBeenCalledOnce());
+    expect(clients).toHaveLength(1);
+    releaseClose();
+    expect((await starting).threadId).toBe("thread-2");
+    await service.resumeThread("stored-thread");
+    expect(clients[1].closed).toHaveBeenCalledOnce();
+
+    // A new runtime can now reopen either earlier conversation without touching
+    // the current one, matching TeleCode's same-provider parallel sessions.
+    const first = await AppServerSessionService.create(createConfig(), { deferThreadStart: true, appServerClientFactory: createClient });
+    const second = await AppServerSessionService.create(createConfig(), { deferThreadStart: true, appServerClientFactory: createClient });
+    await first.resumeThread("thread-1");
+    await second.resumeThread("thread-2");
+    expect(service.getInfo().threadId).toBe("stored-thread");
+    expect(owners.size).toBe(3);
+    service.dispose();
+    first.dispose();
+    second.dispose();
+  });
+
+  it("releases the idle writer when preparing a fresh conversation", async () => {
+    const { createClient, clients, owners } = createWriterHarness();
+    const service = await AppServerSessionService.create(createConfig(), { appServerClientFactory: createClient });
+    service.prepareNewThread();
+    await vi.waitFor(() => expect(clients[0].closed).toHaveBeenCalledOnce());
+    expect(owners.has("thread-1")).toBe(false);
+    expect((await service.newThread()).threadId).toBe("thread-2");
+    service.dispose();
+  });
+
+  it("releases the parent writer after forking so another runtime can reopen it", async () => {
+    const { createClient } = createWriterHarness();
+    const service = await AppServerSessionService.create(createConfig(), { appServerClientFactory: createClient });
+    expect((await service.forkThread()).threadId).toBe("thread-2");
+    const parent = await AppServerSessionService.create(createConfig(), { deferThreadStart: true, appServerClientFactory: createClient });
+    expect((await parent.resumeThread("thread-1")).threadId).toBe("thread-1");
+    expect(service.getInfo().threadId).toBe("thread-2");
+    service.dispose();
+    parent.dispose();
+  });
+
+  it("closes a child that fails to initialize during a session switch", async () => {
+    const { createClient, clients } = createWriterHarness();
+    const failingClient = createClient();
+    failingClient.initialized.mockRejectedValueOnce(new Error("initialization failed"));
+    const service = await AppServerSessionService.create(createConfig(), {
+      deferThreadStart: true,
+      appServerClientFactory: () => failingClient,
+    });
+    await expect(service.resumeThread("stored-thread")).rejects.toThrow("initialization failed");
+    expect(clients[0].closed).toHaveBeenCalledOnce();
+    expect(service.getInfo().threadId).toBeNull();
+    service.dispose();
+  });
+
   it("prepares a fresh thread without waiting for app-server thread/start", async () => {
     const client = new FakeAppServerClient((method) => {
       if (method === "thread/start") {
@@ -462,6 +530,12 @@ describe("AppServerSessionService", () => {
     client = new FakeAppServerClient((method, params) => {
       if (method === "thread/start") {
         return { thread: { id: "thread-1", cwd: "/workspace/base" }, model: "gpt-test" };
+      }
+      if (method === "thread/resume") {
+        return {
+          thread: { id: (params as { threadId: string }).threadId, cwd: "/workspace/base" },
+          model: "gpt-test",
+        };
       }
       if (method === "thread/fork") {
         const lastTurnId = (params as { lastTurnId?: string } | undefined)?.lastTurnId;
@@ -1049,6 +1123,38 @@ describe("AppServerSessionService", () => {
     expect(text).toContain("<telecode_cross_provider_handoff>");
   });
 });
+
+function createWriterHarness() {
+  const clients: FakeAppServerClient[] = [];
+  const owners = new Map<string, FakeAppServerClient>();
+  let threadNumber = 0;
+  const createClient = () => {
+    const client = new FakeAppServerClient((method, params, requester) => {
+      const input = params as { threadId?: string };
+      const threadId = method === "thread/resume" ? input.threadId! : `thread-${++threadNumber}`;
+      if (method !== "thread/start" && method !== "thread/resume" && method !== "thread/fork") {
+        throw new Error(`unexpected request ${method}`);
+      }
+      const owner = owners.get(threadId);
+      if (owner && owner !== requester) {
+        throw new Error(`thread ${threadId} already has an active writer`);
+      }
+      owners.set(threadId, requester);
+      return { thread: { id: threadId, cwd: "/workspace/project" } };
+    });
+    client.closed.mockImplementation(async () => {
+      for (const [threadId, owner] of owners) {
+        if (owner === client) {
+          owners.delete(threadId);
+        }
+      }
+      return undefined;
+    });
+    clients.push(client);
+    return client;
+  };
+  return { createClient, clients, owners };
+}
 
 function createConfig(overrides: Partial<TeleCodeConfig> = {}): TeleCodeConfig {
   return {

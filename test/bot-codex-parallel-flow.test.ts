@@ -10,6 +10,7 @@ import type { CodexThreadRecord } from "../src/codex-state.js";
 import type { CodexSessionCallbacks, CodexSessionInfo, CodexThreadGoal, CodexThreadGoalSetParams } from "../src/codex-session.js";
 import type { TeleCodeConfig } from "../src/config.js";
 import { SessionRegistry } from "../src/session-registry.js";
+import type { SessionSearchHit } from "../src/session-search.js";
 
 vi.mock("../src/codex-auth.js", () => ({
   checkAuthStatus: vi.fn(async () => ({ authenticated: true, method: "test", detail: "authenticated" })),
@@ -27,6 +28,18 @@ vi.mock("../src/codex-state.js", async (importOriginal) => ({
   getThread: (id: string) => codexThreads.get(id),
 }));
 
+const searchState = vi.hoisted(() => ({ hits: [] as SessionSearchHit[], queries: [] as string[] }));
+vi.mock("../src/session-search.js", () => ({
+  createSessionSearchIndex: () => ({
+    status: () => ({ ready: true, refreshing: false, indexedFiles: 2, pendingFiles: 0 }),
+    refresh: async () => undefined,
+    search: (query: string) => {
+      searchState.queries.push(query);
+      return { hits: [...searchState.hits], totalMatches: searchState.hits.length };
+    },
+  }),
+}));
+
 const runtimes: FakeRuntime[] = [];
 vi.mock("../src/codex-backend.js", () => ({
   createCodexSession: async (_config: unknown, options?: { resumeThreadId?: string; workspace?: string }) => {
@@ -40,6 +53,7 @@ import { createBot } from "../src/bot.js";
 
 let threadCounter = 0;
 const holds = new Map<string, () => void>();
+const resumeFailures = new Map<string, string>();
 
 /** Prompts containing "hold" wait until released by name; others finish at once. */
 class FakeRuntime {
@@ -152,6 +166,10 @@ class FakeRuntime {
   }
 
   async resumeThread(threadId: string): Promise<CodexSessionInfo> {
+    const failure = resumeFailures.get(threadId);
+    if (failure) {
+      throw new Error(failure);
+    }
     this.threadId = threadId;
     return this.getInfo();
   }
@@ -208,11 +226,150 @@ describe("background Codex turns", () => {
     runtimes.length = 0;
     holds.clear();
     codexThreads.clear();
+    searchState.hits.length = 0;
+    searchState.queries.length = 0;
+    resumeFailures.clear();
     threadCounter = 0;
   });
 
   afterEach(() => {
     rmSync(workspaceDir, { recursive: true, force: true });
+  });
+
+  it("toggles the last two sessions with /prev and /use previous without listing first", async () => {
+    const { bot, sent, registry } = createHarness();
+    await createThreeIdleSessions(bot, sent);
+    await bot.handleUpdate(textUpdate(20, "/prev"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
+    expect(sent.at(-1)).toContain("Selected Codex");
+    await bot.handleUpdate(textUpdate(21, "/prev"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-3");
+    await bot.handleUpdate(textUpdate(22, "/use previous"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
+    await bot.handleUpdate(textUpdate(23, "/next"));
+    expect(sent.at(-1)).toContain("no newer session");
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
+    expect(runtimes.flatMap((runtime) => runtime.prompts)).toHaveLength(3);
+  });
+
+  it("uses live recent-use ranks for /use and /switch without a list or after an old list", async () => {
+    const { bot, sent, registry } = createHarness();
+    await createThreeIdleSessions(bot, sent);
+    await bot.handleUpdate(textUpdate(20, "/use 3"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-1");
+    await bot.handleUpdate(textUpdate(21, "/sessions"));
+    expect(sent.at(-1)).toContain("Order: recently used");
+    await bot.handleUpdate(textUpdate(22, "/use 3"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
+    await bot.handleUpdate(textUpdate(23, "/switch 2"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-1");
+  });
+
+  it("uses canonical creation dates and navigates older and newer without reshuffling", async () => {
+    const { bot, sent, registry } = createHarness();
+    await createThreeIdleSessions(bot, sent);
+    codexThreads.set("thread-1", threadRecord("thread-1", "Oldest", 1000, Date.now() + 10000));
+    codexThreads.set("thread-2", threadRecord("thread-2", "Middle", 2000, 2000));
+    codexThreads.set("thread-3", threadRecord("thread-3", "Newest", 3000, 1000));
+    await bot.handleUpdate(textUpdate(20, "/sessionorder created"));
+    await bot.handleUpdate(textUpdate(21, "/prev"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
+    await bot.handleUpdate(textUpdate(22, "/previous"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-1");
+    await bot.handleUpdate(textUpdate(23, "/prev"));
+    expect(sent.at(-1)).toContain("no older session");
+    await bot.handleUpdate(textUpdate(24, "/next"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
+    await bot.handleUpdate(textUpdate(25, "/sessions"));
+    const lines = sent.at(-1)!.split("\n");
+    expect(lines.find((line) => line.startsWith("1."))).toContain("Newest");
+    expect(lines.find((line) => line.startsWith("2."))).toContain("selected");
+    expect(lines.find((line) => line.startsWith("3."))).toContain("Oldest");
+    await bot.handleUpdate(textUpdate(26, "/switch 3"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-1");
+    await bot.handleUpdate(textUpdate(27, "/sessionorder used"));
+    await bot.handleUpdate(textUpdate(28, "/prev"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
+  });
+
+  it("restores the saved ordering and recent selections when the bot is recreated", async () => {
+    const first = createHarness();
+    await createThreeIdleSessions(first.bot, first.sent);
+    codexThreads.set("thread-1", threadRecord("thread-1", "Oldest", 1000));
+    codexThreads.set("thread-2", threadRecord("thread-2", "Middle", 2000));
+    codexThreads.set("thread-3", threadRecord("thread-3", "Newest", 3000));
+    await first.bot.handleUpdate(textUpdate(20, "/sessionorder created"));
+    await first.bot.handleUpdate(textUpdate(21, "/use 2"));
+    await first.bot.disposeProviders();
+    const restored = createHarness();
+    await restored.bot.handleUpdate(textUpdate(22, "/sessionorder"));
+    expect(restored.sent.at(-1)).toContain("recently created");
+    await restored.bot.handleUpdate(textUpdate(23, "/prev"));
+    expect(restored.registry.get("123")?.getInfo().threadId).toBe("thread-1");
+    await restored.bot.handleUpdate(textUpdate(24, "/sessionorder used"));
+    await restored.bot.handleUpdate(textUpdate(25, "/prev"));
+    expect(restored.registry.get("123")?.getInfo().threadId).toBe("thread-2");
+  });
+
+  it("opens successive search results with /use and /switch, then /prev returns to normal ranks", async () => {
+    const { bot, sent, registry } = createHarness();
+    await createThreeIdleSessions(bot, sent);
+    searchState.hits.push(searchHit("receipt-A", "Receipt A"), searchHit("receipt-B", "Receipt B"));
+    await bot.handleUpdate(textUpdate(20, "/find kwitantie"));
+    await bot.handleUpdate(textUpdate(21, "/use 1"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("receipt-A");
+    await bot.handleUpdate(textUpdate(22, "/switch 2"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("receipt-B");
+    await bot.handleUpdate(textUpdate(23, "/prev"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("receipt-A");
+    await bot.handleUpdate(textUpdate(24, "/use 2"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("receipt-B");
+  });
+
+  it("returns to normal numbered ranks when work resumes after a search", async () => {
+    const { bot, sent, registry } = createHarness();
+    await createThreeIdleSessions(bot, sent);
+    searchState.hits.push(searchHit("receipt-A", "Receipt A"), searchHit("receipt-B", "Receipt B"));
+    await bot.handleUpdate(textUpdate(20, "/find kwitantie"));
+    await bot.handleUpdate(textUpdate(21, "/use 1"));
+    await bot.handleUpdate(textUpdate(22, "quick four"));
+    await waitFor(() => sent.includes("FINAL quick four"));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await bot.handleUpdate(textUpdate(23, "/use 2"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-3");
+  });
+
+  it("resolves IDs outside search results while preserving numbered search selections", async () => {
+    const { bot, sent, registry } = createHarness();
+    await createThreeIdleSessions(bot, sent);
+    searchState.hits.push(searchHit("receipt-A", "Receipt A"), searchHit("receipt-B", "Receipt B"));
+    await bot.handleUpdate(textUpdate(20, "/find kwitantie"));
+    await bot.handleUpdate(textUpdate(21, "/switch thread-1"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-1");
+    await bot.handleUpdate(textUpdate(22, "/use 2"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("receipt-B");
+  });
+
+  it("clears search numbering when /use previous resumes ordinary navigation", async () => {
+    const { bot, sent, registry } = createHarness();
+    await createThreeIdleSessions(bot, sent);
+    searchState.hits.push(searchHit("receipt-A", "Receipt A"), searchHit("receipt-B", "Receipt B"));
+    await bot.handleUpdate(textUpdate(20, "/find kwitantie"));
+    await bot.handleUpdate(textUpdate(21, "/use 1"));
+    await bot.handleUpdate(textUpdate(22, "/use previous"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-3");
+    await bot.handleUpdate(textUpdate(23, "/use 3"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
+  });
+
+  it.each(["/sessions", "/sessionorder used", "/codex"])("clears search numbering after %s", async (command) => {
+    const { bot, sent, registry } = createHarness();
+    await createThreeIdleSessions(bot, sent);
+    searchState.hits.push(searchHit("receipt-A", "Receipt A"), searchHit("receipt-B", "Receipt B"));
+    await bot.handleUpdate(textUpdate(20, "/find kwitantie"));
+    await bot.handleUpdate(textUpdate(21, command));
+    await bot.handleUpdate(textUpdate(22, "/switch 2"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-2");
   });
 
   it("keeps the running turn going after /use and delivers its answer with the session named", async () => {
@@ -221,7 +378,7 @@ describe("background Codex turns", () => {
 
     await bot.handleUpdate(textUpdate(10, "/use previous"));
     await waitFor(() => sent.some((text) => text.includes("keeps running")));
-    expect(sent.find((text) => text.includes("keeps running"))).toMatch(/^Background Codex, session \d+ /);
+    expect(sent.find((text) => text.includes("keeps running"))).toMatch(/^Background Codex, session 2 /);
     expect(runtimes).toHaveLength(2);
     expect(runtimes[1].threadId).toBe("thread-1");
 
@@ -247,6 +404,121 @@ describe("background Codex turns", () => {
     expect(runtimes).toHaveLength(1);
     holds.get("hold A")!();
     await waitFor(() => sent.includes("FINAL hold A"));
+  });
+
+  it("keeps the running session selected when /find then /use 1 cannot reopen the result", async () => {
+    const { bot, sent, registry } = createHarness();
+    await startHeldTurnInSecondSession(bot, sent);
+    const running = registry.get("123");
+    searchState.hits.push(searchHit("thread-1", "Receipt document"));
+    await bot.handleUpdate(textUpdate(9, "/find kwitantie"));
+    expect(searchState.queries).toEqual(["kwitantie"]);
+    expect(sent.at(-1)).toContain("1. Codex");
+    resumeFailures.set("thread-1", "thread/resume failed (-32600): thread thread-1 already has an active writer");
+
+    await bot.handleUpdate(textUpdate(10, "/use 1"));
+    expect(sent.at(-1)).toContain("Could not open");
+    expect(sent.at(-1)).toContain("already has an active writer");
+    expect(sent.at(-1)).toContain("previous session is still selected");
+    expect(registry.get("123")).toBe(running);
+    expect(running?.isProcessing()).toBe(true);
+    expect(runtimes[0].aborted).toBe(false);
+    expect(runtimes[0].dispose).not.toHaveBeenCalled();
+    expect(runtimes[1].dispose).toHaveBeenCalledOnce();
+    const state = JSON.parse(readFileSync(path.join(workspaceDir, ".telecode", "agent-sessions.json"), "utf8"));
+    const selected = state.sessions.find((session: { id: string }) => session.id === state.lanes[0].selectedSessionId);
+    expect(selected.providerSessionId).toBe("thread-2");
+    expect(selected.status).toBe("running");
+    expect(registry.listContexts()[0].threadId).toBe("thread-2");
+
+    holds.get("hold A")!();
+    await waitFor(() => sent.includes("FINAL hold A"));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await bot.handleUpdate(textUpdate(11, "quick next"));
+    await waitFor(() => sent.includes("FINAL quick next"));
+    expect(runtimes[0].threadId).toBe("thread-2");
+    expect(runtimes[0].prompts).toEqual(["quick one", "hold A", "quick next"]);
+  });
+
+  it("keeps an idle session selected when opening a search result fails", async () => {
+    const { bot, sent, registry } = createHarness();
+    await bot.handleUpdate(textUpdate(1, "quick one"));
+    await waitFor(() => sent.includes("FINAL quick one"));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    searchState.hits.push(searchHit("receipt-thread", "Receipt document"));
+    await bot.handleUpdate(textUpdate(2, "/find kwitantie"));
+    resumeFailures.set("receipt-thread", "receipt session is locked");
+    await bot.handleUpdate(textUpdate(3, "/use 1"));
+    expect(sent.at(-1)).toContain("Could not open");
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-1");
+    const state = JSON.parse(readFileSync(path.join(workspaceDir, ".telecode", "agent-sessions.json"), "utf8"));
+    expect(state.sessions.find((session: { id: string }) => session.id === state.lanes[0].selectedSessionId).providerSessionId)
+      .toBe("thread-1");
+    await bot.handleUpdate(textUpdate(4, "quick next"));
+    await waitFor(() => sent.includes("FINAL quick next"));
+    expect(runtimes).toHaveLength(1);
+  });
+
+  it("preserves search result numbers when a nonmatching running turn moves to the background", async () => {
+    const { bot, sent, registry } = createHarness();
+    await startHeldTurnInSecondSession(bot, sent);
+    searchState.hits.push(searchHit("thread-1", "Receipt document"), searchHit("other-receipt", "Another receipt"));
+    await bot.handleUpdate(textUpdate(9, "/find kwitantie"));
+    await bot.handleUpdate(textUpdate(10, "/use 1"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("thread-1");
+    expect(runtimes[0].processing).toBe(true);
+    await bot.handleUpdate(textUpdate(11, "/use 2"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("other-receipt");
+    holds.get("hold A")!();
+    await waitFor(() => sent.some((text) => text.includes("FINAL hold A")));
+  });
+
+  it("preserves search result numbers when a nonmatching background turn finishes", async () => {
+    const { bot, sent, registry } = createHarness();
+    await startHeldTurnInSecondSession(bot, sent);
+    await bot.handleUpdate(textUpdate(9, "/use previous"));
+    searchState.hits.push(searchHit("thread-1", "Receipt document"), searchHit("other-receipt", "Another receipt"));
+    await bot.handleUpdate(textUpdate(10, "/find kwitantie"));
+    holds.get("hold A")!();
+    await waitFor(() => sent.some((text) => text.includes("FINAL hold A")));
+    await bot.handleUpdate(textUpdate(11, "/use 2"));
+    expect(registry.get("123")?.getInfo().threadId).toBe("other-receipt");
+  });
+
+  it("identifies the selected running conversation in search results and reuses its runtime", async () => {
+    const { bot, sent, registry } = createHarness();
+    await bot.handleUpdate(textUpdate(1, "hold A"));
+    await waitFor(() => holds.has("hold A"));
+    searchState.hits.push(searchHit("thread-1", "Saxo recovery"));
+    await bot.handleUpdate(textUpdate(2, "/find saxo"));
+    expect(sent.at(-1)).toContain("1. Codex, selected, running");
+    await bot.handleUpdate(textUpdate(3, "/use 1"));
+    expect(runtimes).toHaveLength(1);
+    expect(registry.get("123")).toBe(runtimes[0]);
+    expect(runtimes[0].processing).toBe(true);
+    holds.get("hold A")!();
+    await waitFor(() => sent.includes("FINAL hold A"));
+  });
+
+  it("reconnects a search result to its running background process", async () => {
+    const { bot, sent, registry } = createHarness();
+    await startHeldTurnInSecondSession(bot, sent);
+    await bot.handleUpdate(textUpdate(10, "/use previous"));
+    searchState.hits.push(searchHit("thread-2", "Saxo recovery"));
+    await bot.handleUpdate(textUpdate(11, "/find saxo"));
+    expect(sent.at(-1)).toContain("1. Codex, running");
+    // A second writer would fail, so only adopting the existing runtime works.
+    resumeFailures.set("thread-2", "thread-2 already has an active writer");
+    await bot.handleUpdate(textUpdate(12, "/use 1"));
+    expect(sent.at(-1)).toContain("This session is still working");
+    expect(runtimes).toHaveLength(2);
+    expect(registry.get("123")).toBe(runtimes[0]);
+    expect(runtimes[0].processing).toBe(true);
+    expect(runtimes[0].dispose).not.toHaveBeenCalled();
+    expect(runtimes[1].dispose).toHaveBeenCalledOnce();
+    holds.get("hold A")!();
+    await waitFor(() => sent.includes("FINAL hold A"));
+    expect(sent.some((text) => text.includes("finished after"))).toBe(false);
   });
 
   it("keeps another Codex session's commentary and plan quiet until replay", async () => {
@@ -419,11 +691,30 @@ describe("background Codex turns", () => {
   });
 });
 
-function threadRecord(id: string, title: string): CodexThreadRecord {
+function threadRecord(id: string, title: string, createdAt = 1000, updatedAt = 2000): CodexThreadRecord {
   return {
     id, title, cwd: workspaceDir, model: "gpt-5.5",
-    createdAt: new Date(1000), updatedAt: new Date(2000), firstUserMessage: "Continue the DJ pro work",
+    createdAt: new Date(createdAt), updatedAt: new Date(updatedAt), firstUserMessage: "Continue the DJ pro work",
   };
+}
+
+function searchHit(sessionId: string, title: string): SessionSearchHit {
+  return {
+    provider: "codex", sessionId, title, workspace: workspaceDir,
+    filePath: path.join(workspaceDir, `${sessionId}.jsonl`),
+    updatedAt: Date.now(), snippet: "kwitantie, receipt document",
+  };
+}
+
+async function createThreeIdleSessions(bot: ReturnType<typeof createBot>, sent: string[]): Promise<void> {
+  for (const [index, word] of ["one", "two", "three"].entries()) {
+    if (index > 0) {
+      await bot.handleUpdate(textUpdate(index * 2, "/new"));
+    }
+    await bot.handleUpdate(textUpdate(index * 2 + 1, `quick ${word}`));
+    await waitFor(() => sent.includes(`FINAL quick ${word}`));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
 }
 
 /** Like startHeldTurnInSecondSession, but session 2 runs a goal that holds. */
