@@ -4,13 +4,13 @@
 
 Use the other provider for a focused second opinion when it helps the authorized task. The caller chooses the model, effort and absolute working directory on every call. Do not inherit another session's settings or ask Anthony to choose routine review parameters.
 
-Run `node "<this skill directory>/scripts/peer-review.mjs"` with a JSON request on stdin, or one temporary request-file path. On this machine the shared skill is at `C:\Users\Anthony\.claude\skills\peer-review`, also linked from `.codex\skills`. Use structured tool arguments or a literal PowerShell here-string, never interpolate prompt text into a shell command. Remove temporary request files afterward.
+Run `node "<this skill directory>/scripts/peer-review.mjs"` with a JSON request on stdin, or one temporary request-file path. Install it once and link that folder into both the Claude and Codex skill folders. Use structured tool arguments or a literal PowerShell here-string, never interpolate prompt text into a shell command. Remove temporary request files afterward.
 
 Request fields: `provider` (`codex` or `claude`), `model`, `effort`, `cwd`, `prompt`. Optional: `resume` (a session ID returned by this helper), `timeoutMs` (default 180000, maximum 1800000).
 
 Example request:
 ```json
-{"provider":"claude","model":"sonnet","effort":"high","cwd":"C:\\Users\\Anthony\\codetest\\tools\\TeleCode","prompt":"Independently review skills/peer-review/scripts/peer-review.mjs for process cleanup bugs. Cite file locations and evidence."}
+{"provider":"claude","model":"sonnet","effort":"high","cwd":"C:\\path\\to\\TeleCode","prompt":"Independently review skills/peer-review/scripts/peer-review.mjs for process cleanup bugs. Cite file locations and evidence."}
 ```
 
 Never guess a model name. Run `node "<this skill directory>/scripts/peer-review.mjs" --models` first: it reads Codex's account cache and queries the installed Claude CLI live for aliases, resolved model IDs and supported efforts. Claude discovery sends no inference prompt, has a 20-second deadline and never falls back to a fixed list. Each provider includes a `fetchedAt` or `error`; an unknown effort list is null, not verified support. When Anthony names a model loosely, such as "6.1 max", map it to the listed name (`gpt-6.1-sol`, effort `max`) and say which one you picked.
