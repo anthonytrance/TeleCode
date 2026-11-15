@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { AppServerSessionService } from "../dist/app-server-session.js";
 import { createDefaultLaunchProfile } from "../dist/codex-launch.js";
 
-const workspace = process.env.TELECODE_WORKSPACE ?? "C:\\Users\\Anthony\\codetest";
+const workspace = process.env.TELECODE_WORKSPACE ?? process.cwd();
 const model = process.argv[2] ?? "qwen3.8-max";
 
 if (!process.env.DASHSCOPE_API_KEY) {

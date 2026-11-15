@@ -82,15 +82,15 @@ describe("ClaudePty child environment", () => {
 describe("ClaudePty relocated configuration", () => {
   it("preserves the configured user home in strict-MCP mode", () => {
     const env = buildClaudePtyEnv({ bin: "claude", args: [], cwd: "C:\\workspace" }, {
-      CLAUDE_CONFIG_DIR: "C:\\Data\\claude",
+      CLAUDE_CONFIG_DIR: "D:\\agents\\claude",
     });
-    expect(env.CLAUDE_CONFIG_DIR).toBe("C:\\Data\\claude");
+    expect(env.CLAUDE_CONFIG_DIR).toBe("D:\\agents\\claude");
   });
 
   it("lets an explicit isolated home override the inherited user home", () => {
     const env = buildClaudePtyEnv({
       bin: "claude", args: [], cwd: "C:\\workspace", configDir: "C:\\isolated-claude",
-    }, { CLAUDE_CONFIG_DIR: "C:\\Data\\claude" });
+    }, { CLAUDE_CONFIG_DIR: "D:\\agents\\claude" });
     expect(env.CLAUDE_CONFIG_DIR).toBe("C:\\isolated-claude");
   });
 });
@@ -155,7 +155,7 @@ describe("ClaudePty prompt delivery", () => {
       const sending = expect(pty.sendPrompt(prompt)).rejects.toBeInstanceOf(PromptEchoMissingError);
       appendPtyText(
         pty,
-        "TeleCode 690046857 bypass permissions on (shift+tab to cycle) " +
+        "TeleCode 123456789 bypass permissions on (shift+tab to cycle) " +
           "Output files: write any files the user should receive to C:\\workspace\\turns\\abc\\out",
       );
       await vi.runAllTimersAsync();
