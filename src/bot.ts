@@ -9330,8 +9330,8 @@ ${message}`,
     if (fileSize && fileSize > config.maxFileSize) {
       const sizeMB = Math.round(fileSize / 1024 / 1024);
       const maxMB = Math.round(config.maxFileSize / 1024 / 1024);
-      await safeReply(ctx, `<b>File too large</b> (${sizeMB} MB, max ${maxMB} MB)`, {
-        fallbackText: `File too large (${sizeMB} MB, max ${maxMB} MB)`,
+      await safeReply(ctx, `<b>File too large</b> (${sizeMB} MB, max ${maxMB} MB). Send a download link instead, for example from Dropbox.`, {
+        fallbackText: `File too large (${sizeMB} MB, max ${maxMB} MB). Send a download link instead, for example from Dropbox.`,
       });
       return;
     }
@@ -9437,13 +9437,19 @@ ${message}`,
     });
   });
 
-  bot.on("message:document", async (ctx) => {
+  // Videos and round video notes are ordinary files to the providers. Without them
+  // here a video, caption included, was dropped without any reply. GIFs already
+  // arrive as documents.
+  bot.on(["message:document", "message:video", "message:video_note"], async (ctx) => {
     const rawContextKey = contextKeyFromCtx(ctx);
     if (!rawContextKey) {
       return;
     }
+    const doc = uploadedFileFromMessage(ctx.message);
+    if (!doc) {
+      return;
+    }
     if (isClaudeActive(rawContextKey)) {
-      const doc = ctx.message.document;
       await forwardUploadToClaude(
         ctx,
         rawContextKey,
@@ -9470,16 +9476,11 @@ ${message}`,
       return;
     }
 
-    const doc = ctx.message.document;
-    if (!doc) {
-      return;
-    }
-
     if (doc.file_size && doc.file_size > config.maxFileSize) {
       const sizeMB = Math.round(doc.file_size / 1024 / 1024);
       const maxMB = Math.round(config.maxFileSize / 1024 / 1024);
-      await safeReply(ctx, `<b>File too large</b> (${sizeMB} MB, max ${maxMB} MB)`, {
-        fallbackText: `File too large (${sizeMB} MB, max ${maxMB} MB)`,
+      await safeReply(ctx, `<b>File too large</b> (${sizeMB} MB, max ${maxMB} MB). Send a download link instead, for example from Dropbox.`, {
+        fallbackText: `File too large (${sizeMB} MB, max ${maxMB} MB). Send a download link instead, for example from Dropbox.`,
       });
       return;
     }
@@ -9556,6 +9557,21 @@ ${message}`,
         }
       },
     });
+  });
+
+  // Registered last, so it only sees messages no handler above took. Say so
+  // instead of staying silent, otherwise the user waits for an answer that never comes.
+  bot.on("message", async (ctx) => {
+    if (!contextKeyFromCtx(ctx)) {
+      return;
+    }
+    const kind = unsupportedMessageKind(ctx.message);
+    if (!kind) {
+      return;
+    }
+    bridgeLog("intake", `unsupported message kind=${kind}`);
+    const text = `TeleCode can't handle this kind of message (${kind}), so nothing was passed on. Send it as a file or a link instead.`;
+    await safeReply(ctx, escapeHTML(text), { fallbackText: text });
   });
 
   bot.catch((error) => {
@@ -11611,4 +11627,53 @@ function renderPromptFailure(accumulatedText: string, error: unknown): string {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+type IncomingMessage = NonNullable<Context["message"]>;
+
+interface UploadedFile {
+  file_id: string;
+  file_name: string;
+  mime_type: string;
+  file_size?: number;
+}
+
+/** The file a document, video or video note message carries, with the name and
+ * type filled in, because Telegram omits them for video notes and often for videos. */
+export function uploadedFileFromMessage(message: IncomingMessage): UploadedFile | undefined {
+  const stamp = Date.now();
+  if (message.document) {
+    const doc = message.document;
+    return {
+      file_id: doc.file_id,
+      file_name: doc.file_name ?? "document",
+      mime_type: doc.mime_type ?? "application/octet-stream",
+      file_size: doc.file_size,
+    };
+  }
+  if (message.video) {
+    const video = message.video;
+    return {
+      file_id: video.file_id,
+      file_name: video.file_name ?? `video-${stamp}.mp4`,
+      mime_type: video.mime_type ?? "video/mp4",
+      file_size: video.file_size,
+    };
+  }
+  if (message.video_note) {
+    const note = message.video_note;
+    return { file_id: note.file_id, file_name: `video-note-${stamp}.mp4`, mime_type: "video/mp4", file_size: note.file_size };
+  }
+  return undefined;
+}
+
+const UNSUPPORTED_MESSAGE_KINDS = [
+  "sticker", "location", "venue", "contact", "poll", "dice", "story", "game", "paid_media", "checklist", "invoice",
+] as const;
+
+/** Names a user-sent message no handler took. Service messages such as a topic
+ * being created stay unnamed, so they get no reply. */
+export function unsupportedMessageKind(message: IncomingMessage): string | undefined {
+  const fields = message as unknown as Record<string, unknown>;
+  return UNSUPPORTED_MESSAGE_KINDS.find((kind) => fields[kind] !== undefined)?.replace("_", " ");
 }

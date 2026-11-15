@@ -79,6 +79,22 @@ describe("ClaudePty child environment", () => {
   });
 });
 
+describe("ClaudePty relocated configuration", () => {
+  it("preserves the configured user home in strict-MCP mode", () => {
+    const env = buildClaudePtyEnv({ bin: "claude", args: [], cwd: "C:\\workspace" }, {
+      CLAUDE_CONFIG_DIR: "C:\\Data\\claude",
+    });
+    expect(env.CLAUDE_CONFIG_DIR).toBe("C:\\Data\\claude");
+  });
+
+  it("lets an explicit isolated home override the inherited user home", () => {
+    const env = buildClaudePtyEnv({
+      bin: "claude", args: [], cwd: "C:\\workspace", configDir: "C:\\isolated-claude",
+    }, { CLAUDE_CONFIG_DIR: "C:\\Data\\claude" });
+    expect(env.CLAUDE_CONFIG_DIR).toBe("C:\\isolated-claude");
+  });
+});
+
 describe("ClaudePty prompt delivery", () => {
   it("sends long single-line prompts via bracketed paste and holds Enter until the echo settles", async () => {
     const pty = new ClaudePty();

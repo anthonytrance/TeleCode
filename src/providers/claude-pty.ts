@@ -342,9 +342,9 @@ export function buildClaudePtyEnv(
   }
   if (options.configDir) {
     env.CLAUDE_CONFIG_DIR = options.configDir;
-  } else {
-    delete env.CLAUDE_CONFIG_DIR;
   }
+  // Respect a relocated user configuration home in normal/strict-MCP mode.
+  // An explicit isolated configDir above still takes precedence.
   for (const [key, value] of Object.entries(options.extraEnv ?? {})) {
     env[key] = value;
   }

@@ -151,7 +151,7 @@ async function transcribeWithOpenRouter(filePath: string): Promise<Transcription
     },
     body: JSON.stringify({
       model,
-      reasoning: { effort: "low" },
+      reasoning: { effort: "minimal" },
       messages: [{
         role: "user",
         content: [

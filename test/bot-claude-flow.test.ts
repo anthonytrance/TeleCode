@@ -431,7 +431,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
     async getContext() {
       return {
         usedTokens: 3,
-        contextWindow: mockClaude.getActiveModel() === "qwen3.8-max" ? 1_000_000 : 200_000,
+        contextWindow: ["qwen3.8-max", "qwen4-max-preview"].includes(mockClaude.getActiveModel()) ? 1_000_000 : 200_000,
         autoCompactWindow: 200_000,
       };
     }
@@ -618,12 +618,12 @@ describe("Claude bot flow", () => {
 
     expect(mockClaude.createSession).toHaveBeenCalledTimes(2);
     expect(mockClaude.createSession).toHaveBeenLastCalledWith(expect.objectContaining({
-      metadata: expect.objectContaining({ model: "qwen3.8-max" }),
+      metadata: expect.objectContaining({ model: "qwen4-max-preview" }),
     }));
     expect(mockClaude.dispose).toHaveBeenCalledWith("claude-provider-1");
     expect(mockClaude.prompts).toEqual(["original session"]);
     expect(sent.map((entry) => entry.text)).toContain(
-      "New Claude session on qwen3.8-max (QwenCloud Token Plan). The next normal message will use it.",
+      "New Claude session on qwen4-max-preview (QwenCloud Token Plan). The next normal message will use it.",
     );
   });
 

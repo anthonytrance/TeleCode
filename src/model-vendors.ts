@@ -61,6 +61,8 @@ export interface VendorModel {
   aliases: string[];
   /** Only set when the vendor documents it. Drives CLAUDE_CODE_MAX_CONTEXT_TOKENS. */
   contextWindow?: number;
+  /** Model-specific Claude output budget, including thinking on compatible APIs. */
+  claudeMaxOutputTokens?: number;
   /** False when this model cannot be driven by that agent CLI at all. */
   codex: boolean;
   claude: boolean;
@@ -121,9 +123,19 @@ const VENDORS: ModelVendor[] = [
  */
 const VENDOR_MODELS: VendorModel[] = [
   {
+    slug: "qwen4-max-preview",
+    vendorId: "modelstudio",
+    aliases: ["qwen", "qwenmax", "qwen4", "qwen4max", "qwen4preview", "qwen4.0-max-preview"],
+    contextWindow: 1_000_000,
+    // QwenCloud's Claude Code integration recommends 64K for this preview.
+    claudeMaxOutputTokens: 64_000,
+    codex: true,
+    claude: true,
+  },
+  {
     slug: "qwen3.8-max",
     vendorId: "modelstudio",
-    aliases: ["qwen", "qwenmax", "qwen38", "qwen38max", "qwen3.8max"],
+    aliases: ["qwen38", "qwen38max", "qwen3.8max"],
     contextWindow: 1_000_000,
     codex: true,
     claude: true,
@@ -348,6 +360,9 @@ export function buildVendorClaudeSettingsEnv(
     // Only claimed where the vendor documents it. Claude Code otherwise keeps
     // its 200K default, which every model here comfortably exceeds.
     ...(model.contextWindow ? { CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(model.contextWindow) } : {}),
+    ...(model.claudeMaxOutputTokens
+      ? { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(model.claudeMaxOutputTokens) }
+      : {}),
     ...(vendor.claude.env ?? {}),
   };
 }

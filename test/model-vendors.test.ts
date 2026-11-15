@@ -33,15 +33,29 @@ function withCredentialsDir(vendorId: string, key: string): string {
 }
 
 describe("model vendor resolution", () => {
+  it("routes Qwen4 preview aliases through both agents with its documented budgets", () => {
+    for (const name of ["qwen4-max-preview", "qwen", "qwenmax", " Qwen ", "qwen4", "qwen4max", "qwen4preview", "qwen4.0-max-preview"]) {
+      const resolved = requireResolved(name);
+      expect(resolved.model.slug).toBe("qwen4-max-preview");
+      expect(buildVendorCodexConfig(resolved).model_provider).toBe("modelstudio");
+      const env = buildVendorClaudeSettingsEnv(resolved);
+      expect(env.ANTHROPIC_MODEL).toBe("qwen4-max-preview");
+      expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("qwen4-max-preview");
+      expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("1000000");
+      expect(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe("64000");
+    }
+    expect(buildVendorClaudeSettingsEnv(requireResolved("qwen38")).CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBeUndefined();
+  });
+
   it("resolves a vendor model by slug and by every alias", () => {
-    for (const name of ["qwen3.8-max", "qwen", "qwenmax", "qwen38", "QWEN38MAX", " Qwen "]) {
+    for (const name of ["qwen3.8-max", "qwen38", "QWEN38MAX"]) {
       expect(resolveVendorModel(name)?.model.slug).toBe("qwen3.8-max");
     }
   });
 
   it("canonicalizes vendor aliases before they reach an API request", () => {
-    expect(canonicalizeVendorModel("qwen")).toBe("qwen3.8-max");
-    expect(canonicalizeVendorModel("qwenmax")).toBe("qwen3.8-max");
+    expect(canonicalizeVendorModel("qwen")).toBe("qwen4-max-preview");
+    expect(canonicalizeVendorModel("qwenmax")).toBe("qwen4-max-preview");
     expect(canonicalizeVendorModel("claude-opus-5")).toBe("claude-opus-5");
   });
 
@@ -61,7 +75,7 @@ describe("model vendor resolution", () => {
 
   it("describes a model with its vendor label", () => {
     expect(describeVendorModel(requireResolved("qwen"))).toBe(
-      "qwen3.8-max (QwenCloud Token Plan)",
+      "qwen4-max-preview (QwenCloud Token Plan)",
     );
   });
 });
@@ -128,9 +142,8 @@ describe("codex vendor wiring", () => {
     const catalogPath = buildVendorCodexConfig(requireResolved("qwen")).model_catalog_json;
     const efforts = vendorReasoningEffortsForModel("qwen");
     if (existsSync(catalogPath)) {
-      expect(efforts).toContain("max");
-      expect(efforts).toContain("xhigh");
-      expect(vendorReasoningEffortsForModel("qwen3.8-max")).toEqual(efforts);
+      expect(efforts).toEqual(["low", "medium", "xhigh"]);
+      expect(vendorReasoningEffortsForModel("qwen4-max-preview")).toEqual(efforts);
     } else {
       expect(efforts).toBeNull();
     }
@@ -169,7 +182,7 @@ describe("claude vendor wiring", () => {
       "ANTHROPIC_DEFAULT_SONNET_MODEL",
       "CLAUDE_CODE_SUBAGENT_MODEL",
     ]) {
-      expect(env[key]).toBe("qwen3.8-max");
+      expect(env[key]).toBe("qwen4-max-preview");
     }
     expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("1000000");
   });
