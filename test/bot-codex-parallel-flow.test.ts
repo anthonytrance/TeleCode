@@ -44,7 +44,7 @@ vi.mock("../src/session-search.js", () => ({
 const runtimes: FakeRuntime[] = [];
 vi.mock("../src/codex-backend.js", () => ({
   createCodexSession: async (_config: unknown, options?: { resumeThreadId?: string; workspace?: string; reasoningEffort?: string }) => {
-    const runtime = new FakeRuntime(options?.resumeThreadId ?? null, options?.reasoningEffort as CodexReasoningEffort | undefined);
+    const runtime = new FakeRuntime(options?.resumeThreadId ?? null, options?.reasoningEffort as CodexReasoningEffort | undefined, options?.workspace);
     runtimes.push(runtime);
     return runtime;
   },
@@ -73,12 +73,16 @@ class FakeRuntime {
   readonly promptEfforts: Array<CodexReasoningEffort | undefined> = [];
   callbacks?: CodexSessionCallbacks;
 
-  constructor(public threadId: string | null, public reasoningEffort?: CodexReasoningEffort) {}
+  constructor(
+    public threadId: string | null,
+    public reasoningEffort?: CodexReasoningEffort,
+    public workspace = workspaceDir,
+  ) {}
 
   getInfo(): CodexSessionInfo {
     return {
       threadId: this.threadId,
-      workspace: workspaceDir,
+      workspace: this.workspace,
       model: "gpt-5.5",
       reasoningEffort: this.reasoningEffort,
       launchProfileId: "default",
@@ -155,15 +159,17 @@ class FakeRuntime {
   }
 
   getCurrentWorkspace(): string {
-    return workspaceDir;
+    return this.workspace;
   }
 
-  async newThread(): Promise<CodexSessionInfo> {
+  async newThread(workspace?: string): Promise<CodexSessionInfo> {
+    this.workspace = workspace ?? this.workspace;
     this.threadId = `thread-${++threadCounter}`;
     return this.getInfo();
   }
 
-  prepareNewThread(): CodexSessionInfo {
+  prepareNewThread(workspace?: string): CodexSessionInfo {
+    this.workspace = workspace ?? this.workspace;
     this.threadId = null;
     return this.getInfo();
   }
@@ -636,6 +642,7 @@ describe("background Codex turns", () => {
     const { bot, sent } = createHarness();
     await bot.handleUpdate(textUpdate(1, "hold A"));
     await waitFor(() => holds.has("hold A"));
+    runtimes[0].workspace = path.join(workspaceDir, "old-project");
 
     await bot.handleUpdate(textUpdate(2, "/new"));
     await waitFor(() => sent.some((text) => text.includes("New Codex session ready")));
@@ -643,6 +650,8 @@ describe("background Codex turns", () => {
     expect(reply).toMatch(/^Background Codex, session \d+ .* keeps running/);
     expect(runtimes).toHaveLength(2);
     expect(runtimes[1].threadId).toBeNull();
+    expect(runtimes[1].getCurrentWorkspace()).toBe(workspaceDir);
+    expect(runtimes[0].getCurrentWorkspace()).toBe(path.join(workspaceDir, "old-project"));
 
     await bot.handleUpdate(textUpdate(3, "quick two"));
     await waitFor(() => sent.includes("FINAL quick two"));
@@ -651,6 +660,29 @@ describe("background Codex turns", () => {
 
     holds.get("hold A")!();
     await waitFor(() => sent.some((text) => /^Background Codex.*, finished after [\s\S]*FINAL hold A/.test(text)));
+  });
+
+  it.each(["/new", "/new codex"])("starts %s in the configured workspace after restoring an old project", async (command) => {
+    mkdirSync(path.join(workspaceDir, ".telecode"), { recursive: true });
+    writeFileSync(path.join(workspaceDir, ".telecode", "contexts.json"), JSON.stringify([{
+      contextKey: "123", threadId: "old-thread", workspace: path.join(workspaceDir, "old-project"), updatedAt: 1,
+    }]));
+    const { bot, registry } = createHarness();
+    await bot.handleUpdate(textUpdate(1, command));
+    expect(registry.get("123")?.getInfo()).toMatchObject({ threadId: null, workspace: workspaceDir });
+    expect(registry.listContexts()[0].workspace).toBe(workspaceDir);
+  });
+
+  it("keeps explicit workspace choices and /fork in the chosen workspace", async () => {
+    const { bot, registry } = createHarness();
+    const project = path.join(workspaceDir, "chosen-project");
+    mkdirSync(project);
+    await bot.handleUpdate(textUpdate(1, `/new ${project}`));
+    expect(registry.get("123")?.getCurrentWorkspace()).toBe(project);
+    await bot.handleUpdate(textUpdate(2, "/fork"));
+    expect(registry.get("123")?.getCurrentWorkspace()).toBe(project);
+    await bot.handleUpdate(textUpdate(3, "/new"));
+    expect(registry.get("123")?.getCurrentWorkspace()).toBe(workspaceDir);
   });
 
   it("isolates parallel efforts and inherits the selected runtime rather than the last background completion", async () => {

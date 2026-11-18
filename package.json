@@ -23,6 +23,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
+    "whatsapp": "node dist/whatsapp-cli.js",
     "test": "vitest run",
     "test:claude-smoke": "npm run build && node scripts/claude-provider-smoke.mjs",
     "test:claude-tool-smoke": "npm run build && node scripts/claude-tool-smoke.mjs",
@@ -37,12 +38,12 @@
     "@grammyjs/auto-retry": "^2.0.2",
     "@openai/codex-sdk": "0.169.0",
     "grammy": "^1.41.1",
-    "node-pty": "^1.1.0"
+    "node-pty": "^1.1.0",
+    "tsx": "^4.23.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^25.5.0",
-    "tsx": "^4.23.1",
     "typescript": "^5.9.3",
     "vitest": "^5.0.1"
   },
@@ -51,6 +52,6 @@
     "parakeet-coreml": "^2.2.0"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   }
 }

@@ -11,9 +11,11 @@ import {
   migrateLegacyStateDirectory,
 } from "./state-paths.js";
 import { assertTelegramPollingSafety, findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
+import { startWhatsApp } from "./whatsapp/runtime.js";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
+let whatsapp: Awaited<ReturnType<typeof startWhatsApp>>;
 
 try {
   const config = loadConfig();
@@ -36,8 +38,14 @@ try {
   const pollingSafety = assertTelegramPollingSafety({ token: config.telegramBotToken });
   registry = new SessionRegistry(config);
   bot = createBot(config, registry);
+  await bot.init();
   await registerCommands(bot);
   bot.startSessionSearchIndexing();
+  try {
+    whatsapp = await startWhatsApp(config, { bot, registry });
+  } catch (error) {
+    console.error("WhatsApp did not start; Telegram remains available:", error instanceof Error ? error.message : "unknown error");
+  }
 
   console.log("TeleCode running");
   console.log(
@@ -74,6 +82,7 @@ try {
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`Failed to start TeleCode: ${message}`);
+  await whatsapp?.close().catch(() => {});
   await bot?.disposeProviders().catch((disposeError) => {
     console.warn("Failed to dispose provider sessions during startup failure", disposeError);
   });
@@ -94,6 +103,7 @@ const shutdown = (signal: NodeJS.Signals) => {
   setTimeout(() => {
     void (async () => {
       try {
+        await whatsapp?.close().catch((error) => console.warn("Failed to stop WhatsApp cleanly", error));
         await bot?.disposeProviders();
       } catch (error) {
         console.warn("Failed to dispose provider sessions during shutdown", error);
@@ -137,6 +147,7 @@ async function startPolling(): Promise<void> {
     }
 
     console.error(`Fatal polling error: ${message}`);
+    await whatsapp?.close().catch(() => {});
     await bot?.disposeProviders().catch((disposeError) => {
       console.warn("Failed to dispose provider sessions after fatal polling error", disposeError);
     });

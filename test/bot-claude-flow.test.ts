@@ -9,6 +9,9 @@ import type { CodexSessionCallbacks } from "../src/codex-session.js";
 import type { TeleCodeConfig } from "../src/config.js";
 import { VENDOR_CREDENTIALS_FILENAME } from "../src/model-vendors.js";
 import { SessionRegistry } from "../src/session-registry.js";
+import type { ChannelPort } from "../src/channel-router.js";
+import { channelAddress } from "../src/channel-router.js";
+import type { HermesRuntime } from "../src/providers/hermes-runtime.js";
 
 const mockVendorUsage = vi.hoisted(() => ({
   read: vi.fn(async () => "Mock Qwen plan usage"),
@@ -499,6 +502,231 @@ import { createBot } from "../src/bot.js";
 
 describe("Claude bot flow", () => {
   let tempDir: string;
+
+  it("routes WhatsApp through the real TeleCode command/session handlers without Telegram sends", async () => {
+    const { bot, sent, registry } = await createTestBot(tempDir);
+    const output: string[] = [], documents: string[] = [];
+    let authorized = true, reactions = false;
+    const port: ChannelPort = {
+      kind: "whatsapp", account: "32470000001", chat: "32470000002@s.whatsapp.net", label: "WhatsApp", documentLimit: 2_000_000_000,
+      authorize: () => authorized, instructions: "CURRENT_CHANNEL_WHATSAPP",
+      sendText: async (text) => { output.push(text); return `WA-${output.length}`; },
+      sendDocument: async (file) => { documents.push(file); return "WA-DOCUMENT"; },
+      reactionsEnabled: () => reactions, setReactions: (enabled) => { reactions = enabled; },
+    };
+    try {
+      await bot.channels.dispatch(bot, port, "/help");
+      expect(output.join("\n")).toContain("/sessions");
+      await bot.channels.dispatch(bot, port, "/provider claude");
+      const lane = String(channelAddress(port.kind, port.account, port.chat));
+      expect(registry.getActiveProvider(lane)).toBe("claude");
+      expect(registry.getActiveProvider("123")).toBe("codex");
+      await bot.channels.dispatch(bot, port, "/new");
+      expect(output.at(-1)).toContain("New Claude session");
+      await bot.channels.dispatch(bot, port, "/reactions");
+      expect(output.at(-1)).toContain("off");
+      await bot.channels.dispatch(bot, port, "/reactions on");
+      expect(reactions).toBe(true);
+      const original = path.join(tempDir, "original.mp4"); writeFileSync(original, "original bytes");
+      await bot.channels.dispatch(bot, port, "inspect the original", { filePaths: [original] });
+      await waitFor(() => mockClaude.rawPrompts.some((text) => text.includes(JSON.stringify(original))));
+      await waitForAgentSessionsIdle(tempDir);
+      expect(mockClaude.rawPrompts.some((text) => text.includes("CURRENT_CHANNEL_WHATSAPP"))).toBe(true);
+      expect(sent).toEqual([]);
+      expect(output.some((text) => text.startsWith("TeleCode:\n"))).toBe(false);
+      authorized = false;
+      await expect(bot.channels.dispatch(bot, port, "/new")).rejects.toThrow(/Unauthorized/);
+      expect(documents).toEqual([]);
+    } finally { authorized = true; await bot.disposeProviders(); registry.disposeAll(); }
+  });
+
+  it("limits a WhatsApp guest to the agents in their grant, in their own folder", async () => {
+    let count = 0;
+    const created: Array<{ workspace: string; profile?: string }> = [];
+    const prompts: string[] = [];
+    const makeRuntime = (profile?: string) => ({
+      available: () => true,
+      create: vi.fn(async (workspace: string) => { created.push({ workspace, profile }); return { id: `native-${profile ?? "default"}-${++count}`, info: {} }; }),
+      resume: vi.fn(async () => {}),
+      command: vi.fn(async () => ({ type: "exec", output: "native" })),
+      prompt: vi.fn(async (_id: string, text: string, emit: (text: string, final: boolean) => Promise<void>) => { prompts.push(`${profile ?? "default"}|${text}`); await emit("Guest answer", true); }),
+      interrupt: vi.fn(async () => {}), dispose: vi.fn(async () => {}),
+    }) as unknown as HermesRuntime;
+    const runtimes = new Map<string, HermesRuntime>();
+    const config = { ...createConfig(tempDir) };
+    const registry = new SessionRegistry(config);
+    const bot = createBot(config, registry, { hermesProfiles: () => ["social", "team"], hermesRuntime: makeRuntime(), hermesRuntimeFor: (profile) => {
+      if (!runtimes.has(profile)) runtimes.set(profile, makeRuntime(profile));
+      return runtimes.get(profile)!;
+    } });
+    bot.botInfo = { id: 999, is_bot: true, first_name: "TeleCode", username: "TeleCodeBot", can_join_groups: true, can_read_all_group_messages: false, supports_inline_queries: false, can_connect_to_business: false, has_main_web_app: false } as any;
+    const ownerSent: string[] = [];
+    bot.api.config.use(async (previous, method, payload: any, signal) => {
+      if (Number(payload.chat_id) <= -8_000_000_000_000_000 || String(payload.callback_query_id ?? "").startsWith("telecode-channel:")) return previous(method, payload, signal);
+      if (method === "sendMessage") ownerSent.push(String(payload.text));
+      return { ok: true, result: method === "sendMessage" ? textMessage(1, String(payload.text)) : true } as any;
+    });
+    const home = path.join(tempDir, "guest-home"); mkdirSync(home);
+    const output: string[] = [];
+    const port: ChannelPort = {
+      kind: "whatsapp", account: "32470000001", chat: "32470000009@s.whatsapp.net", label: "WhatsApp", documentLimit: 1000,
+      authorize: () => true, instructions: "GUEST_RULES",
+      grant: { agents: ["hermes:social", "claude"], workspace: home, name: "Social team" },
+      sendText: async (text) => { output.push(text); return `WA-${output.length}`; },
+      sendDocument: async () => "WA-DOCUMENT",
+    };
+    const lane = String(channelAddress(port.kind, port.account, port.chat));
+    try {
+      await bot.channels.dispatch(bot, port, "/status");
+      expect(output.at(-1)).toBe("Agent: hermes:social. Available to you: hermes:social, claude.");
+      expect(created).toEqual([{ workspace: home, profile: "social" }]);
+      // The owner's commands, filtered: settings, workspaces and other agents are refused.
+      for (const blocked of ["/workspace C:\\", "/reactions on", "/typing off", "/model x", "/find secret", "/jobs", "/stop 2"]) {
+        await bot.channels.dispatch(bot, port, blocked);
+        expect(output.at(-1)).toBe("That command is not available to you. Send /help for what you can use.");
+      }
+      for (const [command, agent] of [["/provider codex", "codex"], ["/codex", "codex"], ["/provider hermes", "hermes"], ["/new codex", "codex"]]) {
+        await bot.channels.dispatch(bot, port, command);
+        expect(output.at(-1)).toBe(`${agent} is not available to you. Available: hermes:social, claude.`);
+      }
+      await bot.channels.dispatch(bot, port, "/hermes");
+      expect(output.at(-1)).toContain("Now using hermes:social");
+      await bot.channels.dispatch(bot, port, "/new C:\\");
+      expect(output.at(-1)).toContain("is not available to you");
+      await bot.channels.dispatch(bot, port, "/new");
+      expect(output.at(-1)).toBe("New hermes:social conversation started.");
+      expect(created.every((entry) => entry.workspace === home && entry.profile === "social")).toBe(true);
+      expect(registry.getActiveProvider(lane)).toBe("hermes");
+      await bot.channels.dispatch(bot, port, "write a caption");
+      await waitFor(() => output.includes("Guest answer"));
+      expect(prompts.at(-1)).toMatch(/^social\|GUEST_RULES\n\nGuest message:\nwrite a caption/);
+      await waitForAgentSessionsIdle(tempDir);
+      await bot.channels.dispatch(bot, port, "/claude");
+      expect(output.at(-1)).toContain("Now using claude");
+      expect(registry.getActiveProvider(lane)).toBe("claude");
+      expect(mockClaude.createSession).toHaveBeenCalledWith(expect.objectContaining({ workspace: home }));
+      await bot.channels.dispatch(bot, port, "/hermes social");
+      expect(output.at(-1)).toContain("Now using hermes:social");
+      expect(registry.getActiveProvider(lane)).toBe("hermes");
+      // The owner has sessions of their own; the guest never sees them.
+      await bot.handleUpdate(textUpdate(1, "/provider hermes"));
+      await bot.channels.dispatch(bot, port, "/sessions");
+      const list = output.at(-1)!;
+      expect(list).toContain("Recent provider sessions");
+      const lines = list.split("\n").filter((line) => /^\d+\./.test(line));
+      expect(lines.length).toBe(3);
+      expect(lines.every((line) => /Hermes|Claude/i.test(line))).toBe(true);
+      expect(list).not.toContain("native-default");
+      await bot.channels.dispatch(bot, port, "/use 3");
+      expect(output.at(-1)).toMatch(/selected/i);
+      // The owner's own lane can still pick any Hermes agent, with the same commands.
+      await bot.handleUpdate(textUpdate(2, "/provider hermes:social"));
+      expect(registry.getActiveProvider("123")).toBe("hermes");
+      expect(ownerSent.at(-1)).toContain("Hermes social selected");
+      await bot.handleUpdate(textUpdate(3, "/hermes team"));
+      expect(ownerSent.at(-1)).toContain("Hermes team selected");
+      await bot.handleUpdate(textUpdate(4, "/hermes default"));
+      expect(ownerSent.at(-1)).toMatch(/^Hermes selected/);
+    } finally { await bot.disposeProviders(); registry.disposeAll(); }
+  }, 30_000);
+
+  it("hands one Claude conversation over between Telegram and WhatsApp, one chat at a time", async () => {
+    const { bot, sent, registry } = await createTestBot(tempDir, { claudeStrictMcpConfig: false });
+    const output: string[] = [];
+    const port: ChannelPort = {
+      kind: "whatsapp", account: "32470000001", chat: "32470000002@s.whatsapp.net", label: "WhatsApp", documentLimit: 1000,
+      authorize: () => true, instructions: "OWNER_RULES",
+      sendText: async (text) => { output.push(text); return `WA-${output.length}`; },
+      sendDocument: async () => "WA-DOCUMENT",
+    };
+    try {
+      await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+      await waitForAgentSessionsIdle(tempDir);
+      const transcriptDir = path.join(tempDir, ".claude-config", "projects", "project");
+      mkdirSync(transcriptDir, { recursive: true });
+      writeFileSync(path.join(transcriptDir, "provider-session-1.jsonl"), [
+        JSON.stringify({ type: "user", cwd: tempDir, message: { content: "first turn" } }),
+        JSON.stringify({ type: "ai-title", aiTitle: "SHARED_TALK" }),
+      ].join("\n"));
+      await bot.channels.dispatch(bot, port, "/claude");
+      await bot.channels.dispatch(bot, port, "/sessions");
+      const number = output.at(-1)!.split("\n").find((line) => line.includes("SHARED_TALK"))?.match(/^(\d+)\./)?.[1];
+      expect(number).toBeDefined();
+      await bot.channels.dispatch(bot, port, `/use ${number}`);
+      const disposedBefore = mockClaude.dispose.mock.calls.length;
+      mockClaude.blockNextPrompt();
+      await bot.channels.dispatch(bot, port, "long job");
+      await waitFor(() => mockClaude.prompts.some((prompt) => prompt.includes("long job")));
+      await bot.handleUpdate(textUpdate(2, "meanwhile on Telegram"));
+      await waitFor(() => sent.some((entry) => entry.text?.includes("still working in your WhatsApp chat")));
+      expect(mockClaude.prompts.some((prompt) => prompt.includes("meanwhile on Telegram"))).toBe(false);
+      mockClaude.releaseBlockedPrompt();
+      await waitForAgentSessionsIdle(tempDir);
+      const resumedBefore = mockClaude.resumeSession.mock.calls.length;
+      await bot.handleUpdate(textUpdate(3, "back on Telegram"));
+      await waitFor(() => mockClaude.prompts.some((prompt) => prompt.includes("back on Telegram")));
+      // Both chats' copies were closed; Telegram reloaded the conversation from disk.
+      expect(mockClaude.dispose.mock.calls.length).toBeGreaterThanOrEqual(disposedBefore + 2);
+      expect(mockClaude.resumeSession.mock.calls.length).toBeGreaterThan(resumedBefore);
+      expect(mockClaude.createSession).toHaveBeenCalledTimes(1);
+    } finally { await bot.disposeProviders(); registry.disposeAll(); }
+  }, 30_000);
+
+  it("lists stored Hermes conversations in /sessions and opens them with /use", async () => {
+    const runtime = {
+      available: () => true,
+      create: vi.fn(async () => ({ id: "native-new", info: {} })),
+      resume: vi.fn(async () => {}),
+      listSessions: vi.fn(async () => [{ id: "native-stored-7", title: "HERMES_STORED_TALK", startedAt: Date.now() - 60_000 }]),
+      command: vi.fn(async () => ({ type: "exec", output: "native" })),
+      prompt: vi.fn(async () => {}), interrupt: vi.fn(async () => {}), dispose: vi.fn(async () => {}),
+    } as unknown as HermesRuntime;
+    const { bot, sent, registry } = await createTestBot(tempDir, {}, runtime);
+    try {
+      await bot.handleUpdate(textUpdate(1, "/provider hermes"));
+      await bot.handleUpdate(textUpdate(1, "/sessions"));
+      const list = sent.map((entry) => entry.text ?? "").at(-1)!;
+      const number = list.split("\n").find((line) => line.includes("HERMES_STORED_TALK"))?.match(/^(\d+)\./)?.[1];
+      expect(number).toBeDefined();
+      await bot.handleUpdate(textUpdate(2, `/use ${number}`));
+      expect(registry.getActiveProvider("123")).toBe("hermes");
+      expect(runtime.resume).toHaveBeenCalledWith("native-stored-7");
+    } finally { await bot.disposeProviders(); registry.disposeAll(); }
+  }, 30_000);
+
+  it("treats Hermes as a normal selectable provider, with native commands and /sessions /use", async () => {
+    let count = 0;
+    const commands: string[] = [];
+    const runtime = {
+      available: () => true,
+      create: vi.fn(async () => ({ id: `native-hermes-${++count}`, info: { model: "hermes-model" } })),
+      resume: vi.fn(async () => {}),
+      command: vi.fn(async (_id: string, command: string) => { commands.push(command); return { type: "exec", output: "Native model report" }; }),
+      prompt: vi.fn(async (_id: string, _text: string, emit: (text: string, final: boolean) => Promise<void>) => { await emit("Working", false); await emit("Finished", true); }),
+      interrupt: vi.fn(async () => {}), dispose: vi.fn(async () => {}),
+    } as unknown as HermesRuntime;
+    const { bot, sent, registry } = await createTestBot(tempDir, {}, runtime);
+    try {
+      await bot.handleUpdate(textUpdate(1, "/provider hermes"));
+      expect(registry.getActiveProvider("123")).toBe("hermes");
+      await bot.handleUpdate(textUpdate(2, "/model"));
+      expect(commands).toContain("/model");
+      await bot.handleUpdate(textUpdate(3, "do the task"));
+      await waitFor(() => sent.some((entry) => entry.text === "Finished"));
+      await waitForAgentSessionsIdle(tempDir);
+      await bot.handleUpdate(textUpdate(4, "/new"));
+      expect(count).toBe(2);
+      await bot.handleUpdate(textUpdate(5, "/codex"));
+      expect(registry.getActiveProvider("123")).toBe("codex");
+      await bot.handleUpdate(textUpdate(6, "/sessions"));
+      const list = sent.map((entry) => entry.text ?? "").filter((text) => text.includes("Recent provider sessions")).at(-1)!;
+      const number = list.split("\n").find((line) => /^\d+\./.test(line) && /hermes/i.test(line) && !line.includes(", selected"))?.match(/^(\d+)\./)?.[1];
+      expect(number).toBeDefined();
+      await bot.handleUpdate(textUpdate(7, `/use ${number}`));
+      expect(registry.getActiveProvider("123")).toBe("hermes");
+      expect(runtime.resume).toHaveBeenCalledWith("native-hermes-1");
+    } finally { await bot.disposeProviders(); registry.disposeAll(); }
+  }, 30_000);
 
   beforeEach(() => {
     tempDir = mkdtempSync(path.join(tmpdir(), "telecode-bot-claude-"));
@@ -2322,14 +2550,15 @@ describe("Claude bot flow", () => {
   });
 });
 
-async function createTestBot(workspace: string, overrides: Partial<TeleCodeConfig> = {}) {
+async function createTestBot(workspace: string, overrides: Partial<TeleCodeConfig> = {}, hermesRuntime?: HermesRuntime) {
   const config = { ...createConfig(workspace), ...overrides };
   const registry = new SessionRegistry(config);
-  const bot = createBot(config, registry);
+  const bot = createBot(config, registry, { hermesRuntime });
   const sent: Array<{ method: string; text?: string }> = [];
   let messageId = 1;
 
-  bot.api.config.use(async (_prev, method, payload: { text?: string }) => {
+  bot.api.config.use(async (_prev, method, payload: { text?: string; chat_id?: number; callback_query_id?: string }, signal) => {
+    if (Number(payload.chat_id) <= -8_000_000_000_000_000 || payload.callback_query_id?.startsWith("telecode-channel:")) return _prev(method, payload, signal);
     if (method === "sendMessage") {
       sent.push({ method, text: payload.text });
       return { ok: true, result: textMessage(messageId++, payload.text ?? "") };

@@ -84,6 +84,9 @@ import {
 } from "./codex-state.js";
 import type { CodexBackend, ClaudePermissionMode, ProgressDelivery, TeleCodeConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
+import { ChannelRouter, type ChannelGrant } from "./channel-router.js";
+import { HermesRuntime, type HermesSessionRow } from "./providers/hermes-runtime.js";
+import { HermesController, hermesAgentName, hermesProfile } from "./providers/hermes-controller.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { applyGoalModeConstraints, formatThreadGoal, parseGoalModeArgument } from "./goal-mode.js";
@@ -302,6 +305,17 @@ type ProviderSessionPick = {
       providerSessionId: string;
     }
   | {
+      kind: "hermes-session";
+      provider: "hermes";
+      title: string;
+      workspace: string;
+      updatedAt: number;
+      status: "old";
+      providerSessionId: string;
+      profile?: string;
+      model?: string;
+    }
+  | {
       kind: "claude-transcript";
       provider: "claude";
       title: string;
@@ -340,13 +354,16 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
 }
 
 export interface TeleCodeBot extends Bot<Context> {
+  channels: ChannelRouter;
   disposeProviders(): Promise<void>;
   /** Kick off the initial background build of the /find session search index. */
   startSessionSearchIndexing(): void;
 }
 
-export function createBot(config: TeleCodeConfig, registry: SessionRegistry): TeleCodeBot {
+export function createBot(config: TeleCodeConfig, registry: SessionRegistry, options: { hermesRuntime?: HermesRuntime; hermesRuntimeFor?: (profile: string) => HermesRuntime; hermesProfiles?: () => string[] } = {}): TeleCodeBot {
   const bot = new Bot<Context>(config.telegramBotToken) as TeleCodeBot;
+  bot.channels = new ChannelRouter();
+  bot.channels.install(bot);
   // Telegram answers a burst with retry_after values well above 10s; giving up
   // there dropped narration blocks on the floor with nothing in the log.
   bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 60 }));
@@ -447,6 +464,9 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     ? new ClaudeBackendPrefs(claudeBackendPrefsPath(config.workspace))
     : undefined;
   const claudeSessions = new Map<TelegramContextKey, AgentSessionDescriptor>();
+  // Guest chats (other people's numbers granted on a channel): the agents they may
+  // use and their own folder, where every fresh session of theirs starts.
+  const guestGrants = new Map<TelegramContextKey, ChannelGrant>();
   const sessionSearch = createSessionSearchIndex({
     indexPath: path.join(config.workspace, ".telecode", "session-index.sqlite"),
     claudeProjectsDir: config.enableClaudeProvider
@@ -784,6 +804,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
   const disposeProviderSessions = async (): Promise<void> => {
     bridgeLog("shutdown", "disposing provider sessions");
+    await hermes.dispose();
     if (!claudeAdapter) {
       return;
     }
@@ -945,6 +966,76 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   >();
 
   const maxParallelCodexTurns = Math.max(1, config.codexMaxParallelTurns ?? 3);
+
+  // One provider conversation can be reached from several chats (Telegram and
+  // WhatsApp, say). Handover rule: it runs in one chat at a time. A chat that
+  // takes it over while the other is idle reloads it from disk, so neither chat
+  // keeps a stale in-memory copy; while the other chat is working it is refused.
+  const lastTurnLaneBySession = new Map<string, TelegramContextKey>();
+  const chatLabelOf = (lane: TelegramContextKey): string => bot.channels.labelOf(parseContextKey(lane).chatId);
+  /** The chat (other than `lane`) whose turn is running in this conversation, if any. */
+  const sessionBusyElsewhere = (lane: TelegramContextKey, provider: "claude" | "codex", id: string | null | undefined): string | undefined => {
+    if (!id) return undefined;
+    if (provider === "claude") {
+      for (const [other, descriptor] of claudeSessions) {
+        if (other !== lane && descriptor.providerSessionId === id && (isProviderBusy(other, "claude") || claudeParkActiveSessions.has(descriptor.id))) return chatLabelOf(other);
+      }
+      for (const turn of backgroundClaudeTurns.values()) {
+        if (turn.contextKey !== lane && turn.descriptor.providerSessionId === id) return chatLabelOf(turn.contextKey);
+      }
+      return undefined;
+    }
+    for (const [other, runtime] of registry.entries()) {
+      if (other !== lane && isProviderBusy(other, "codex") && runtime.getInfo().threadId === id) return chatLabelOf(other);
+    }
+    for (const [runtime, turn] of backgroundCodexTurns) {
+      if (turn.contextKey !== lane && (turn.threadId ?? runtime.getInfo().threadId) === id) return chatLabelOf(turn.contextKey);
+    }
+    return undefined;
+  };
+  const sessionBusyElsewhereText = (where: string): string =>
+    `This conversation is still working in your ${where} chat. Wait until it finishes there, or stop it there with /stop, then try again.`;
+  /** Take a conversation over for `lane`: idle copies loaded in other chats are
+   * closed, and this chat's own copy reloads if another chat ran it since. */
+  const claimProviderSession = async (lane: TelegramContextKey, provider: "claude" | "codex", id: string | null | undefined): Promise<void> => {
+    if (!id) return;
+    const key = `${provider}:${id}`;
+    const previous = lastTurnLaneBySession.get(key);
+    lastTurnLaneBySession.set(key, lane);
+    if (provider === "claude") {
+      const own = claudeSessions.get(lane);
+      const ownHolds = own?.providerSessionId === id;
+      for (const [other, descriptor] of [...claudeSessions]) {
+        if (other === lane || descriptor.providerSessionId !== id || isProviderBusy(other, "claude") || claudeParkActiveSessions.has(descriptor.id)) continue;
+        claudeSessions.delete(other);
+        // Resumed copies share one runtime id; never close the one this chat is about to use.
+        if (!(ownHolds && descriptor.id === own.id)) {
+          await disposeClaudeDescriptor(descriptor).catch((error) => bridgeLog("handover", `claude release failed lane=${other}: ${friendlyErrorText(error)}`));
+        }
+        bridgeLog("handover", `claude session=${id} released lane=${other} for lane=${lane}`);
+      }
+      // Reload from disk when another chat ran this conversation since this chat
+      // loaded it, or closed this chat's copy while taking it over.
+      const stale = own ? ownHolds && previous !== undefined && previous !== lane && !claudeParkActiveSessions.has(own.id) : previous !== undefined && previous !== lane;
+      const record = stale ? agentSessions.listLaneSessions(lane).find((session) => session.provider === "claude" && session.providerSessionId === id) : undefined;
+      if (record) {
+        if (own) {
+          claudeSessions.delete(lane);
+          await disposeClaudeDescriptor(own).catch((error) => bridgeLog("handover", `claude reload failed lane=${lane}: ${friendlyErrorText(error)}`));
+        }
+        await resumeClaudeAgentSession(lane, record);
+        bridgeLog("handover", `claude session=${id} reloaded lane=${lane}`);
+      }
+      return;
+    }
+    for (const [other, runtime] of registry.entries()) {
+      if (runtime.getInfo().threadId !== id || isProviderBusy(other, "codex")) continue;
+      if (other === lane && (previous === undefined || previous === lane)) continue;
+      const detached = registry.detach(other);
+      if (detached) registry.disposeDetached(detached);
+      bridgeLog("handover", `codex thread=${id} released lane=${other} for lane=${lane}`);
+    }
+  };
 
   /**
    * Called when a turn moves to the background. Its Abort button targets the lane,
@@ -1483,7 +1574,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const model = options.model ?? registry.getClaudeDefaultModel();
     const previous = claudeSessions.get(contextKey);
     const descriptor = await claudeAdapter.createSession({
-      workspace: config.claudeWorkspace,
+      workspace: guestGrants.get(contextKey)?.workspace ?? config.claudeWorkspace,
       displayName: `TeleCode ${contextKey}`,
       metadata: {
         model,
@@ -1788,6 +1879,8 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       return null;
     }
 
+    const threadId = registry.storedThreadId(contextKey);
+    if (!sessionBusyElsewhere(contextKey, "codex", threadId)) await claimProviderSession(contextKey, "codex", threadId);
     const session = await registry.getOrCreate(contextKey, options);
     return { contextKey, session };
   };
@@ -1944,7 +2037,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   };
 
   const setReaction = async (ctx: Context, emoji: "👀" | "👍" | "❤" | "🔥" | "👏"): Promise<void> => {
-    if (!config.enableTelegramReactions) {
+    if (!(bot.channels.isChannel(ctx) ? bot.channels.reactionsEnabled(ctx) : config.enableTelegramReactions)) {
       return;
     }
 
@@ -1959,7 +2052,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   };
 
   const clearReaction = async (ctx: Context): Promise<void> => {
-    if (!config.enableTelegramReactions) {
+    if (!(bot.channels.isChannel(ctx) ? bot.channels.reactionsEnabled(ctx) : config.enableTelegramReactions)) {
       return;
     }
 
@@ -2106,6 +2199,12 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
+      return;
+    }
+    const codexElsewhere = sessionBusyElsewhere(contextKey, "codex", session.getInfo().threadId);
+    if (codexElsewhere) {
+      const message = sessionBusyElsewhereText(codexElsewhere);
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       return;
     }
 
@@ -3080,7 +3179,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       if (autoArtifactOutDir) {
         try {
           if (turnBackgrounded()) {
-            const { artifacts } = await collectArtifactReport(autoArtifactOutDir);
+            const { artifacts } = await collectArtifactReport(autoArtifactOutDir, bot.channels.limit(chatId));
             if (artifacts.length > 0) {
               await sendBackgroundTurnText(`${backgroundTurnLabel()} sent files:`);
             }
@@ -3088,7 +3187,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
           } else if (isCodexForeground()) {
             await deliverArtifacts(ctx, chatId, autoArtifactOutDir, messageThreadId);
           } else {
-            const { artifacts, skippedCount } = await collectArtifactReport(autoArtifactOutDir);
+            const { artifacts, skippedCount } = await collectArtifactReport(autoArtifactOutDir, bot.channels.limit(chatId));
             const summary = formatArtifactSummary(artifacts, skippedCount);
             if (summary) {
               bufferCodexOutput("status", summary, artifacts.length > 0 || skippedCount > 0);
@@ -3278,6 +3377,14 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         }
         return;
       }
+      const sharedClaudeId = claudeSessions.get(contextKey)?.providerSessionId ?? claudeState?.get(contextKey)?.sessionId;
+      const claudeElsewhere = sessionBusyElsewhere(contextKey, "claude", sharedClaudeId);
+      if (claudeElsewhere) {
+        const message = sessionBusyElsewhereText(claudeElsewhere);
+        await replyToClaudeRunSource(source, escapeHTML(message), { fallbackText: message, messageThreadId });
+        return;
+      }
+      await claimProviderSession(contextKey, "claude", sharedClaudeId);
       busyState.processing = true;
       markProviderBusy(contextKey, "claude", true);
       claimedBusy = true;
@@ -3411,7 +3518,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       if (!claudeArtifactOutDir) {
         return;
       }
-      const { artifacts, skippedCount } = await collectArtifactReport(claudeArtifactOutDir);
+      const { artifacts, skippedCount } = await collectArtifactReport(claudeArtifactOutDir, bot.channels.limit(source.chatId));
       if (artifacts.length === 0 && skippedCount === 0) {
         return;
       }
@@ -3439,7 +3546,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       let failedCount = 0;
       for (const artifact of artifacts) {
         try {
-          await bot.api.sendDocument(source.chatId, new InputFile(artifact.localPath, artifact.name), {
+          await bot.channels.sendDocument(bot.api, source.chatId, artifact.localPath, artifact.name, {
             ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
           });
         } catch (error) {
@@ -4133,7 +4240,7 @@ ${message}`,
     const artifactEvents = events.filter((event) => event.kind === "artifact" && event.artifactPath);
     for (const event of artifactEvents) {
       try {
-        await ctx.api.sendDocument(chatId, new InputFile(event.artifactPath!), {
+        await bot.channels.sendDocument(ctx.api, chatId, event.artifactPath!, undefined, {
           ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
         });
       } catch (error) {
@@ -4381,6 +4488,7 @@ ${message}`,
 
     if (commandName === "resume") {
       if (!argument) {
+        await refreshHermesSessionRows(contextKey);
         const plain = renderUnifiedSessions(contextKey);
         await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
         return;
@@ -4607,12 +4715,31 @@ ${message}`,
     });
   };
 
+  // Hermes keeps its conversations in its own gateway, so they are fetched when
+  // the list is shown; /use numbers then refer to that same list.
+  let hermesSessionRows: Array<HermesSessionRow & { profile?: string }> = [];
+  const refreshHermesSessionRows = async (contextKey: TelegramContextKey): Promise<void> => {
+    if (guestGrants.has(contextKey)) return;
+    hermesSessionRows = await hermes.listSessions(MAX_PROVIDER_SESSION_LIST_LIMIT).catch(() => hermesSessionRows);
+  };
+
   const buildRecentProviderSessionPicks = (
     contextKey: TelegramContextKey,
     limit: number,
   ): ProviderSessionPick[] => {
     const selectedSessionId = agentSessions.getLane(contextKey)?.selectedSessionId;
     const picksByKey = new Map<string, ProviderSessionPick>();
+    // A guest sees only the conversations of their own chat, with the agents
+    // they may use; never the owner's Codex threads, Claude transcripts or Hermes.
+    const guest = guestGrants.get(contextKey);
+    if (guest) {
+      return agentSessions.listLaneSessions(contextKey)
+        .filter((session) => guest.agents.includes(session.provider === "hermes" ? hermesAgentName(HermesController.profileOf(session)) : session.provider))
+        .map(providerSessionPickFromAgentSession)
+        .sort((left, right) => Number(providerSessionPickAgentId(right) === selectedSessionId) - Number(providerSessionPickAgentId(left) === selectedSessionId) ||
+          (right.lastSelectedAt ?? right.updatedAt) - (left.lastSelectedAt ?? left.updatedAt))
+        .slice(0, limit);
+    }
     const spawnedCodexThreadIds = new Set(listSpawnedThreadIds());
     const codexThreads = listThreads(MAX_PROVIDER_SESSION_LIST_LIMIT);
     const codexThreadsById = new Map(codexThreads.map((thread) => [thread.id, thread]));
@@ -4671,6 +4798,24 @@ ${message}`,
 
     for (const thread of codexThreads) {
       const pick = providerSessionPickFromCodexThread(thread);
+      if (!picksByKey.has(providerSessionPickKey(pick))) {
+        picksByKey.set(providerSessionPickKey(pick), pick);
+      }
+    }
+
+    for (const row of hermesSessionRows) {
+      const pick: ProviderSessionPick = {
+        kind: "hermes-session",
+        provider: "hermes",
+        title: cleanProviderSessionTitle(row.title || (row.profile ? `Hermes ${row.profile}` : "Hermes")),
+        workspace: config.workspace,
+        updatedAt: row.startedAt ?? 0,
+        createdAt: row.startedAt ?? 0,
+        status: "old",
+        providerSessionId: row.id,
+        ...(row.profile ? { profile: row.profile } : {}),
+        ...(row.model ? { model: row.model } : {}),
+      };
       if (!picksByKey.has(providerSessionPickKey(pick))) {
         picksByKey.set(providerSessionPickKey(pick), pick);
       }
@@ -4738,6 +4883,22 @@ ${message}`,
       });
     }
 
+    if (pick.kind === "hermes-session") {
+      return ensureAgentSessionRecord(contextKey, "hermes", {
+        workspace: pick.workspace,
+        displayName: pick.title,
+        providerSessionId: pick.providerSessionId,
+        select,
+        metadata: {
+          nativeProtocol: "hermes-gateway-v1",
+          importedFrom: "hermes-state",
+          providerCreatedAt: pick.createdAt,
+          ...(pick.model ? { model: pick.model } : {}),
+          ...(pick.profile ? { profile: pick.profile } : {}),
+        },
+      });
+    }
+
     return ensureAgentSessionRecord(contextKey, "claude", {
       workspace: pick.workspace,
       displayName: pick.title,
@@ -4753,7 +4914,9 @@ ${message}`,
     const limit = parseProviderSessionListLimit(rawArg);
     const picks = buildRecentProviderSessionPicks(contextKey, limit);
     if (picks.length === 0) {
-      return "No recent provider sessions found. Use /new codex or /new claude.";
+      return guestGrants.has(contextKey)
+        ? "No conversations yet. Just send a message, or use /new."
+        : "No recent provider sessions found. Use /new codex, /new claude or /new hermes.";
     }
 
     pendingAgentSessionPicks.set(contextKey, picks);
@@ -5077,6 +5240,18 @@ ${message}`,
     }
 
     const listNumber = targetPick ? picks.indexOf(targetPick) + 1 : undefined;
+    if (targetPick.provider === "hermes") {
+      try {
+        const target = await materializeProviderSessionPick(contextKey, targetPick, false);
+        await hermes.select(contextKey, target);
+        clearProviderSessionPicks(contextKey);
+        await safeReply(ctx, escapeHTML(`Hermes selected: ${target.displayName ?? target.id}.`), { fallbackText: `Hermes selected: ${target.displayName ?? target.id}.` });
+      } catch (error) {
+        const text = `Could not select Hermes: ${friendlyErrorText(error)}. Your previous provider remains selected.`;
+        await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      }
+      return true;
+    }
     if (targetPick.provider === "claude") {
       const currentClaude = claudeSessions.get(contextKey);
       const runningTargetId = await findBackgroundClaudeTurnId(contextKey, targetPick);
@@ -5223,7 +5398,7 @@ ${message}`,
     outDir: string,
     messageThreadId?: number,
   ): Promise<void> => {
-    const { artifacts, skippedCount } = await collectArtifactReport(outDir);
+    const { artifacts, skippedCount } = await collectArtifactReport(outDir, bot.channels.limit(chatId));
 
     if (artifacts.length === 0 && skippedCount === 0) {
       return;
@@ -5238,7 +5413,7 @@ ${message}`,
     let failedCount = 0;
     for (const artifact of artifacts) {
       try {
-        await ctx.api.sendDocument(chatId, new InputFile(artifact.localPath, artifact.name), {
+        await bot.channels.sendDocument(ctx.api, chatId, artifact.localPath, artifact.name, {
           ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
         });
       } catch (error) {
@@ -5253,9 +5428,22 @@ ${message}`,
     }
   };
 
+  const hermes = new HermesController({
+    config, registry, sessions: agentSessions, runtime: options.hermesRuntime ?? new HermesRuntime(), runtimeFor: options.hermesRuntimeFor, profiles: options.hermesProfiles,
+    persist: persistAgentSessionState,
+    reply: (ctx, text) => safeReply(ctx, formatTelegramHTML(text), { fallbackText: text }),
+    prompt: (ctx, text) => {
+      const input = bot.channels.prompt(ctx, text);
+      return typeof input === "string" ? input : [input.text, input.stagedFileInstructions].filter(Boolean).join("\n\n");
+    },
+    artifacts: (ctx, folder) => ctx.chat ? deliverArtifacts(ctx, ctx.chat.id, folder, ctx.message?.message_thread_id) : Promise.resolve(),
+    reaction: (ctx, state) => state === "failed" ? clearReaction(ctx) : setReaction(ctx, state === "working" ? "👀" : "👍"),
+    typing: async (ctx) => { if (ctx.chat) await ctx.api.sendChatAction(ctx.chat.id, "typing"); },
+  });
+
   bot.use(async (ctx, next) => {
     const fromId = ctx.from?.id;
-    if (!fromId || !config.telegramAllowedUserIdSet.has(fromId)) {
+    if (!bot.channels.authorized(ctx) && (!fromId || !config.telegramAllowedUserIdSet.has(fromId))) {
       if (ctx.callbackQuery) {
         await ctx.answerCallbackQuery({ text: "Unauthorized" }).catch(() => {});
       } else if (ctx.chat) {
@@ -5264,6 +5452,152 @@ ${message}`,
       return;
     }
 
+    await next();
+  });
+
+  // Guests (other people's numbers granted on a channel) use the same commands as
+  // the owner, filtered: only the agents in their grant, always in their own
+  // folder, only their own conversations. Settings, workspaces, search, jobs,
+  // menus and the owner's sessions are not reachable for them.
+  const guestAgent = (lane: TelegramContextKey): string =>
+    hermes.currentAgent(lane) ?? registry.getActiveProvider(lane);
+  /** "Hermes:Default" -> "hermes", "hermes:social" -> "hermes:social", "codex" -> "codex". */
+  const normalizeAgentName = (raw: string): string => {
+    const value = raw.trim().toLowerCase();
+    return value === "hermes:default" ? "hermes" : value;
+  };
+  const useGuestAgent = async (lane: TelegramContextKey, agent: string, home: string, fresh = false): Promise<void> => {
+    if (agent.startsWith("hermes")) {
+      const profile = hermesProfile(agent);
+      if (fresh) await hermes.fresh(lane, home, profile);
+      else await hermes.selectAgent(lane, profile, home);
+      return;
+    }
+    agentSessions.ensureLane(lane, { defaultProvider: agent as "codex" | "claude" });
+    const switching = registry.getActiveProvider(lane) !== agent;
+    if (agent === "claude") {
+      if (!config.enableClaudeProvider) throw new Error("Claude is not enabled on this computer.");
+      registry.setActiveProvider(lane, "claude");
+      const current = claudeSessions.get(lane);
+      const saved = claudeState?.get(lane);
+      const workspace = current?.workspace ?? saved?.workspace;
+      if (fresh || !workspace || path.resolve(workspace) !== path.resolve(home)) await createFreshClaudeSession(lane);
+    } else {
+      registry.setActiveProvider(lane, "codex");
+      const session = await registry.getOrCreate(lane, { deferThreadStart: true });
+      if (fresh || path.resolve(session.getCurrentWorkspace()) !== path.resolve(home)) {
+        session.prepareNewThread(home);
+        updateSessionMetadata(lane, session);
+      }
+    }
+    if (switching || fresh) {
+      clearSessionSelectionState(lane);
+      persistAgentSessionState();
+    }
+  };
+  const GUEST_PASSTHROUGH = new Set(["sessions", "switch", "use", "prev", "previous", "next"]);
+
+  bot.use(async (ctx, next) => {
+    const grant = bot.channels.grant(ctx);
+    if (!grant) { await next(); return; }
+    const lane = contextKeyFromCtx(ctx);
+    const say = (message: string) => safeReply(ctx, escapeHTML(message), { fallbackText: message });
+    // Numbered menu replies arrive as callbacks; guests get plain text lists only.
+    if (ctx.callbackQuery) { await ctx.answerCallbackQuery().catch(() => {}); return; }
+    if (!lane || !ctx.message) return;
+    guestGrants.set(lane, grant);
+    const text = ctx.message.text?.trim() ?? "";
+    const command = /^\/([\w-]+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(text);
+    const name = command?.[1].toLowerCase(), argument = command?.[2]?.trim() ?? "";
+    const list = grant.agents.join(", ");
+    const allowed = (agent: string) => grant.agents.includes(agent);
+    const refuse = (agent: string) => say(`${agent} is not available to you. Available: ${list}.`);
+    /** Run the rest of the message as a normal prompt through the shared pipeline. */
+    const promptWith = async (prompt: string) => {
+      const message = ctx.message as { text?: string; entities?: unknown };
+      message.text = prompt;
+      delete message.entities;
+      await next();
+    };
+    try {
+      const current = guestAgent(lane);
+      const agent = allowed(current) ? current : grant.agents[0];
+      if (name === "provider") {
+        if (!argument) { await say(`You are using ${agent}. Available to you: ${list}. Switch with /provider NAME.`); return; }
+        const wanted = normalizeAgentName(argument);
+        if (!allowed(wanted)) { await refuse(wanted); return; }
+        await useGuestAgent(lane, wanted, grant.workspace);
+        await say(`Now using ${wanted}. Your last conversation with it continues. Use /new for a fresh one.`);
+        return;
+      }
+      if (name === "codex" || name === "claude" || name === "hermes") {
+        // /hermes NAME picks a named Hermes agent; other text after the command is a prompt.
+        const word = argument.toLowerCase();
+        const named = name === "hermes" && /^[a-z0-9][a-z0-9_-]*$/.test(word) && (allowed(`hermes:${word}`) || word === "default");
+        const wanted = named ? normalizeAgentName(`hermes:${word}`) : name === "hermes" && !allowed("hermes")
+          ? grant.agents.find((entry) => entry.startsWith("hermes:")) ?? "hermes" : name;
+        if (!allowed(wanted)) { await refuse(wanted); return; }
+        await useGuestAgent(lane, wanted, grant.workspace);
+        if (argument && !named) { await promptWith(argument); return; }
+        await say(`Now using ${wanted}. Your last conversation with it continues. Use /new for a fresh one.`);
+        return;
+      }
+      if (name === "new") {
+        const words = argument.split(/\s+/).filter(Boolean);
+        const wanted = words[0] ? normalizeAgentName(words[0]) : agent;
+        if (!allowed(wanted)) { await refuse(wanted); return; }
+        await useGuestAgent(lane, wanted, grant.workspace, true);
+        await say(`New ${wanted} conversation started.${words.length > 1 ? " Your conversations always use your own folder." : ""}`);
+        return;
+      }
+      await useGuestAgent(lane, agent, grant.workspace);
+      if (name === "help" || name === "start") {
+        await say([`You are using ${agent}. Just send a message, voice note or file.`,
+          "/new starts a fresh conversation. /new NAME starts one with another agent.",
+          "/sessions lists your conversations. /use 2 switches to number 2.",
+          "/stop stops the current answer.", "/status shows which agent you are using.",
+          ...(grant.agents.length > 1 ? [`/provider NAME switches agent. Available: ${list}.`] : [])].join("\n"));
+        return;
+      }
+      if (name === "status") { await say(`Agent: ${agent}. Available to you: ${list}.`); return; }
+      if (name && !(GUEST_PASSTHROUGH.has(name) || (name === "stop" || name === "abort") && !argument)) {
+        await say("That command is not available to you. Send /help for what you can use.");
+        return;
+      }
+    } catch (error) {
+      await say(`Sorry, that did not work: ${friendlyErrorText(error)}`);
+      return;
+    }
+    await next();
+  });
+
+  bot.use(async (ctx, next) => {
+    const text = ctx.message?.text?.trim();
+    if (!text) { await next(); return; }
+    const typing = /^\/typing(?:@\w+)?(?:\s+(on|off))?$/i.exec(text);
+    if (typing && bot.channels.isChannel(ctx)) {
+      try {
+        const enabled = bot.channels.typingSetting(ctx, typing[1] ? typing[1].toLowerCase() === "on" : undefined);
+        const message = `Typing indicator is ${enabled ? "on" : "off"}. Use /typing on or /typing off.`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      } catch (error) { await safeReply(ctx, escapeHTML(friendlyErrorText(error))); }
+      return;
+    }
+    const reactions = /^\/reactions(?:@\w+)?(?:\s+(on|off))?$/i.exec(text);
+    if (reactions && bot.channels.isChannel(ctx)) {
+      try {
+        const enabled = bot.channels.reactionSetting(ctx, reactions[1] ? reactions[1].toLowerCase() === "on" : undefined);
+        const message = `Message reactions are ${enabled ? "on" : "off"}. Use /reactions on or /reactions off.`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      } catch (error) { await safeReply(ctx, escapeHTML(friendlyErrorText(error))); }
+      return;
+    }
+    try { if (await hermes.handle(ctx, text)) return; }
+    catch (error) {
+      const message = `Hermes: ${friendlyErrorText(error)} No automatic provider fallback.`;
+      await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      return;
+    }
     await next();
   });
 
@@ -5450,7 +5784,7 @@ ${message}`,
         `Selected provider: ${registry.getActiveProvider(contextKey)}`,
         `Default provider for new sessions: ${lane.defaultProvider}`,
         "",
-        "Use /provider codex or /provider claude.",
+        "Use /provider codex, /provider claude or /provider hermes.",
       ].join("\n");
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
@@ -5458,7 +5792,7 @@ ${message}`,
 
     const provider = parseProviderName(rawProvider);
     if (!provider || (provider !== "codex" && provider !== "claude")) {
-      const message = "Usage: /provider codex or /provider claude";
+      const message = "Usage: /provider codex, /provider claude or /provider hermes";
       await safeReply(ctx, escapeHTML(message), { fallbackText: message });
       return;
     }
@@ -5527,7 +5861,7 @@ ${message}`,
     }
     const message = isProviderBusy(contextKey, "claude")
       ? "Claude Code selected. A Claude turn is still running and future updates will be foreground here."
-      : "Claude Code selected for this Telegram context. The next normal message will start or resume Claude.";
+      : `Claude Code selected for this ${bot.channels.label(ctx)} context. The next normal message will start or resume Claude.`;
     await safeReply(ctx, escapeHTML(message), { fallbackText: message });
   });
 
@@ -5575,7 +5909,7 @@ ${message}`,
     }
     const message = isProviderBusy(contextKey, "codex")
       ? "Codex selected. A Codex turn is still running and future updates will be foreground here."
-      : "Codex selected for this Telegram context.";
+      : `Codex selected for this ${bot.channels.label(ctx)} context.`;
     await safeReply(ctx, escapeHTML(message), { fallbackText: message });
   });
 
@@ -5866,7 +6200,12 @@ ${message}`,
     }
 
     try {
-      const info = session.prepareNewThread(session.getCurrentWorkspace());
+      // Fresh conversations start at home even after visiting an old project.
+      // /fork keeps its existing current-workspace behavior.
+      const workspace = commandNameFromSlashLine(rawText) === "fork"
+        ? session.getCurrentWorkspace()
+        : config.workspace;
+      const info = session.prepareNewThread(workspace);
       updateSessionMetadata(contextKey, session);
       registry.setActiveProvider(contextKey, "codex");
       clearSessionSelectionState(contextKey);
@@ -5892,8 +6231,8 @@ ${message}`,
   ): Promise<void> => {
     const workspaces = session.listWorkspaces();
     if (workspaces.length === 0) {
-      await safeReply(ctx, escapeHTML("No known workspaces found. Use /new to start in the current workspace."), {
-        fallbackText: "No known workspaces found. Use /new to start in the current workspace.",
+      await safeReply(ctx, escapeHTML("No known workspaces found. Use /new to start in the configured workspace."), {
+        fallbackText: "No known workspaces found. Use /new to start in the configured workspace.",
       });
       return;
     }
@@ -7431,6 +7770,7 @@ ${message}`,
     const rawTextForAgent = ctx.message?.text ?? "";
     const agentArg = rawTextForAgent.replace(/^\/(?:sessions|switch|use)(?:@\w+)?\s*/, "").trim();
     if (commandNameFromText(rawTextForAgent) === "sessions") {
+      await refreshHermesSessionRows(contextKeyForAgent);
       const plain = renderUnifiedSessions(contextKeyForAgent, agentArg);
       await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
       return;
@@ -9190,10 +9530,12 @@ ${message}`,
       return;
     }
     clearProviderSessionPicks(rawContextKey);
+    const userInput = bot.channels.prompt(ctx, userText);
     if (isClaudeActive(rawContextKey)) {
-      lastPromptInput.set(rawContextKey, userText);
+      const claudeText = typeof userInput === "string" ? userInput : [userInput.text, userInput.stagedFileInstructions].filter(Boolean).join("\n\n");
+      lastPromptInput.set(rawContextKey, claudeText);
       await setReaction(ctx, "👀");
-      startClaudePrompt(ctx, rawContextKey, ctx.chat.id, userText);
+      startClaudePrompt(ctx, rawContextKey, ctx.chat.id, claudeText);
       return;
     }
 
@@ -9213,14 +9555,14 @@ ${message}`,
     }
 
     if (isBusy(contextKey)) {
-      lastPromptInput.set(contextKey, userText);
-      await queuePromptReply(ctx, contextKey, ctx.chat.id, session, userText);
+      lastPromptInput.set(contextKey, userInput);
+      await queuePromptReply(ctx, contextKey, ctx.chat.id, session, userInput);
       return;
     }
 
-    lastPromptInput.set(contextKey, userText);
+    lastPromptInput.set(contextKey, userInput);
     await setReaction(ctx, "👀");
-    startUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
+    startUserPrompt(ctx, contextKey, ctx.chat.id, session, userInput);
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
@@ -9631,11 +9973,12 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "health", description: "Bot health summary" },
     { command: "saxo_approve", description: "Approve one frozen Saxo SIM draft" },
     { command: "claude", description: "Switch this context to Claude Code" },
+    { command: "hermes", description: "Switch this context to Hermes" },
     { command: "codex", description: "Switch this context to Codex" },
     { command: "provider", description: "Show or set default provider" },
     { command: "jobs", description: "Show provider jobs in this lane" },
     { command: "alljobs", description: "Show provider jobs across lanes" },
-    { command: "new", description: "Start in current workspace" },
+    { command: "new", description: "Start in default workspace" },
     { command: "fork", description: "Start in current workspace" },
     { command: "workspaces", description: "Choose workspace for new thread" },
     { command: "newsummary", description: "Start a new thread from summary" },

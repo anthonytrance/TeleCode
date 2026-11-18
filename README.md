@@ -7,6 +7,8 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
 ## Features
 
 - **Codex and Claude Code** — switch providers per Telegram context while preserving each provider's conversation
+- **Hermes agents** — `/provider hermes` or `/hermes NAME` runs a Hermes agent through its own gateway; its stored conversations appear in `/sessions`
+- **WhatsApp** — the same bridge, commands and agents over a linked WhatsApp account, with guest numbers limited to chosen agents. See [docs/whatsapp.md](docs/whatsapp.md)
 - **Parallel provider sessions** — keep working in the foreground while another provider finishes in the background; background completions arrive with a provider heading, and `/replay` releases buffered commentary
 - **Per-context sessions** — each Telegram chat or forum topic gets independent provider sessions, models, and busy state
 - **Backend switching from Telegram** — Codex `sdk` / `app-server`, Claude `pty` (interactive terminal) / `sdk` (Agent SDK); choices persist per context across restarts
@@ -115,11 +117,11 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
 |---|---|
 | `/start` | Welcome & status (concise for returning users) |
 | `/help` | Grouped command reference |
-| `/new` | Start a fresh thread (workspace picker if multiple workspaces) |
+| `/new` | Start a fresh thread in the configured workspace |
 | `/new default` | Start a fresh thread in the configured workspace |
 | `/new claude [model]` | Start a fresh Claude session, optionally with a model |
 | `/newsummary` | Start a fresh thread from a handoff summary of the current thread |
-| `/fork` | Fork the current session (Claude: fork the conversation; Codex: alias of `/new`) |
+| `/fork` | Fork the current session (Claude: fork the conversation; Codex: fresh thread in the current workspace) |
 | `/forkthread [n]` | Fork the active Codex app-server thread; with `n`, omit that many recent turns from the fork |
 | `/renamethread <name>` | Rename the active app-server thread |
 | `/rollbackthread <n>` | Switch to a truncated fork without the last `n` turns; the original thread remains available and file changes are not reverted |

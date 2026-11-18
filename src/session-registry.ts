@@ -92,6 +92,16 @@ export class SessionRegistry {
     return session;
   }
 
+  /** Every lane's selected runtime, for handing a conversation over between chats. */
+  entries(): Array<[TelegramContextKey, CodexSessionRuntime]> {
+    return [...this.sessions.entries()];
+  }
+
+  /** The Codex thread the lane last used, even when its runtime is not loaded. */
+  storedThreadId(contextKey: TelegramContextKey): string | undefined {
+    return this.sessions.get(contextKey)?.getInfo().threadId ?? this.metadata.get(contextKey)?.threadId ?? undefined;
+  }
+
   get(contextKey: TelegramContextKey): CodexSessionRuntime | undefined {
     return this.sessions.get(contextKey);
   }

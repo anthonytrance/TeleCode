@@ -14,10 +14,12 @@ export function renderHelpMessage(): DualText {
       title: "🔀 Providers",
       commands: [
         ["/provider", "Show active provider for this context"],
-        ["/provider codex|claude", "Set the default provider"],
+        ["/provider codex|claude|hermes", "Set the default provider"],
         ["/claude", "Switch this context to Claude Code"],
         ["/claude <prompt>", "Run one Claude prompt (and switch)"],
         ["/codex", "Switch this context back to Codex"],
+        ["/hermes", "Switch this context to Hermes, then use its normal commands"],
+        ["/hermes <name>", "Switch to a named Hermes agent (profile), or default"],
         ["/jobs", "List running provider jobs in this context"],
         ["/alljobs", "List running jobs across all contexts"],
       ],
@@ -25,7 +27,7 @@ export function renderHelpMessage(): DualText {
     {
       title: "💬 Session",
       commands: [
-        ["/new", "Start in current workspace"],
+        ["/new", "Start in default workspace"],
         ["/new default", "Start in configured workspace"],
         ["/new <workspace>", "Start in another workspace"],
         ["/workspaces", "Choose workspace for new thread"],
@@ -68,6 +70,8 @@ export function renderHelpMessage(): DualText {
         ["/handback", "Hand thread back to Codex CLI"],
         ["/abort", "Cancel current operation"],
         ["/stop", "Alias for /abort"],
+        ["/reactions on|off", "Toggle WhatsApp reaction feedback, off by default"],
+        ["/typing on|off", "Toggle WhatsApp typing indicator while working, on by default"],
         ["/steer <text>", "Steer active app-server turn"],
         ["s", "Steer the message you just queued into the running turn (/qsteer)"],
         ["d", "Drop the message you just queued (/qdrop)"],
